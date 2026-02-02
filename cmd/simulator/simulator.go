@@ -132,7 +132,10 @@ func main() {
 		rpcport = globals.Arguments["--rpc-bind"].(string)
 	}
 	globals.Arguments["--rpc-bind"] = rpcport
-	globals.Arguments["--testnet"] = true
+	// Only set --testnet if user explicitly provided it, otherwise default to mainnet
+	if globals.Arguments["--testnet"] == nil {
+		globals.Arguments["--testnet"] = false
+	}
 	globals.Arguments["--simulator"] = true
 	globals.Arguments["--daemon-address"] = rpcport // feed it for wallets
 
