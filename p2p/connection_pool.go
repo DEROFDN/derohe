@@ -714,7 +714,6 @@ func trigger_sync() {
 
 					} else { // we need a state only sync, bootstrap without history but verified chain
 						connection.bootstrap_chain()
-						chain.Sync = true
 					}
 					break
 				}
