@@ -42,6 +42,11 @@ import "github.com/deroproject/derohe/cryptography/crypto"
 // if after bootstraping the chain can continousky sync for few minutes, this means we have got the job done
 // TODO if during bootstrap error occurs, then we must discard data and restart from scratch
 // resume may be implemented in future
+func (connection *Connection) bootstrap_fail(err error, msg string) {
+	connection.logger.V(1).Error(err, msg)
+	connection.exit()
+}
+
 func (connection *Connection) bootstrap_chain() {
 	defer handle_connection_panic(connection)
 	var request ChangeList
@@ -72,7 +77,7 @@ func (connection *Connection) bootstrap_chain() {
 
 	fill_common(&request.Common) // fill common info
 	if err := connection.Client.Call("Peer.ChangeSet", request, &response); err != nil {
-		connection.logger.V(1).Error(err, "Call failed ChangeSet")
+		connection.bootstrap_fail(err, "Call failed ChangeSet")
 		return
 	}
 	// we have a response, see if its valid and try to add to get the blocks
@@ -106,7 +111,7 @@ func (connection *Connection) bootstrap_chain() {
 			var ts_response Response_Tree_Section_Struct
 			fill_common(&ts_request.Common)
 			if err := connection.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
-				connection.logger.V(1).Error(err, "Call failed TreeSection")
+				connection.bootstrap_fail(err, "Call failed TreeSection")
 				return
 			} else {
 				// now we must write all the state changes to gravition
@@ -170,7 +175,7 @@ func (connection *Connection) bootstrap_chain() {
 			var ts_response Response_Tree_Section_Struct
 			fill_common(&ts_request.Common)
 			if err := connection.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
-				connection.logger.V(1).Error(err, "Call failed TreeSection")
+				connection.bootstrap_fail(err, "Call failed TreeSection")
 				return
 			} else {
 				// now we must write all the state changes to gravition
@@ -200,7 +205,7 @@ func (connection *Connection) bootstrap_chain() {
 					var sc_response Response_Tree_Section_Struct
 					fill_common(&sc_request.Common)
 					if err := connection.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
-						connection.logger.V(1).Error(err, "Call failed TreeSection")
+						connection.bootstrap_fail(err, "Call failed TreeSection")
 						return
 					} else {
 
@@ -232,7 +237,7 @@ func (connection *Connection) bootstrap_chain() {
 								var sc_ts_response Response_Tree_Section_Struct
 								fill_common(&sc_ts_request.Common)
 								if err := connection.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
-									connection.logger.V(1).Error(err, "Call failed TreeSection")
+									connection.bootstrap_fail(err, "Call failed TreeSection")
 									return
 								} else { // request was successfull
 
