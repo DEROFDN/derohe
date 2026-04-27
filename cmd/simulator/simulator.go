@@ -389,7 +389,7 @@ func main() {
 
 				chain.Regpool.Regpool_Delete_TX(hash)
 			} else {
-				logger.Error(fmt.Errorf("regpool_delete_tx  needs a single transaction id as argument"), "")
+				logger.Error(fmt.Errorf("regpool_delete_tx needs a single transaction id as argument"), "")
 			}
 
 		case command == "mempool_print":
@@ -410,7 +410,7 @@ func main() {
 
 				chain.Mempool.Mempool_Delete_TX(hash)
 			} else {
-				logger.Error(fmt.Errorf("mempool_delete_tx  needs a single transaction id as argument"), "")
+				logger.Error(fmt.Errorf("mempool_delete_tx needs a single transaction id as argument"), "")
 			}
 
 		case command == "version":

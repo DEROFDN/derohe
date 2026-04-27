@@ -147,7 +147,7 @@ func Dump_metrics_data_directly(logger logr.Logger, specificnamei interface{}) {
 		databuffer.Reset()
 		writePrometheusMetrics(databuffer)
 
-		resp, err := netClient.Post(metrics_url, "application/test", databuffer)
+		resp, err := netClient.Post(metrics_url, "text/plain", databuffer)
 		if err == nil {
 			resp.Body.Close()
 		} else {
