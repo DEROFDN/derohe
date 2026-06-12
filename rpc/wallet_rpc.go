@@ -82,7 +82,13 @@ type Entry struct {
 	Payload_RPC  Arguments `json:"payload_rpc,omitempty"`
 
 	// these fields are only valid based on payload type  and if payload could be successfully parsed and will by default be equal to zero values
-	Sender          string `json:"sender"`
+	Sender string `json:"sender"`
+	// SenderVerified is true ONLY when attribution is protocol-pinned (ring size 2,
+	// where the counterparty is necessarily the sender). For ring size > 2 the sender
+	// chose the unauthenticated attribution byte and entry.Sender MUST NOT be trusted.
+	SenderVerified bool `json:"sender_verified"`
+	// RingSize is the ring size of the payload this entry was decoded from (0 if unknown).
+	RingSize        uint64 `json:"ringsize"`
 	DestinationPort uint64 `json:"dstport"`
 	SourcePort      uint64 `json:"srcport"`
 }

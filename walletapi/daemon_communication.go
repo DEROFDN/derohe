@@ -1076,6 +1076,9 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 									addr.Mainnet = w.GetNetwork()
 									entry.Sender = addr.String()
 								}
+								entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+								// ring size 2 attribution is protocol-pinned (set above); larger rings are sender-chosen and unverified
+								entry.SenderVerified = uint(tx.Payloads[t].Statement.RingSize) == 2
 
 								entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
 								entry.Data = append(entry.Data, tx.Payloads[t].RPCPayload[:]...)
@@ -1115,6 +1118,9 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 									addr.Mainnet = w.GetNetwork()
 									entry.Sender = addr.String()
 								}
+								entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+								// ring size 2 attribution is protocol-pinned (set above); larger rings are sender-chosen and unverified
+								entry.SenderVerified = uint(tx.Payloads[t].Statement.RingSize) == 2
 
 								entry.Payload = append(entry.Payload, payload[1:]...)
 								entry.Data = append(entry.Data, payload...)
