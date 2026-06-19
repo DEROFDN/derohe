@@ -1,26 +1,40 @@
 package main
 
-// A2 — curated-ring finalization gate.
+// A2 — base-SCID curated-ring finalization gate.
 //
 // The curated-decoy engine (feat/curated-decoy-attribution: curatedRingCandidates +
-// TransferPayload0WithOptions) validates each preferred decoy is registered on the base
-// balance tree BEFORE signing, on the reasoning that a decoy which passes the wallet but is
-// not a real registered account would be rejected by the consensus verifier after the user
-// has already signed. That reasoning is sound by inspection — this test makes it PROVEN-RUN:
+// TransferPayload0WithOptions) places user-supplied PreferredDecoys into the ring, each
+// validated registered on the base balance tree before signing. This test makes the A2
+// claim PROVEN-RUN:
 //
-//   A transfer whose ring members are CURATED (user-supplied via RingPreference, not drawn
-//   from DERO.GetRandomAddress) and which also carries an action-less SCDATA body must build,
-//   be accepted into the pool, mine, and FINALIZE into a block — i.e. the curated ring is
-//   consensus-valid, not merely wallet-valid.
+//   A base-SCID transfer whose ring members are CURATED (user-supplied via RingPreference,
+//   not drawn from DERO.GetRandomAddress) and which carries an action-less SCDATA body builds,
+//   passes full non-coinbase consensus verification INCLUDING bulletproof verification
+//   (skip_proof=false — Verify_Transaction_NonCoinbase, transaction_verify.go:200-201), mines,
+//   and is persisted into a mined block — i.e. the curated ring is consensus-valid, not merely
+//   wallet-valid.
 //
 // This is the load-bearing precondition for the rotating-identity ("Gatling") design's
 // curated-disjoint-ring allocator: if a self-chosen ring did not finalize, the whole
-// disjoint-ring mitigation would be unbuildable. It does.
+// disjoint-ring mitigation would be unbuildable. It does. The companion negative-control test
+// (Test_CuratedRing_NegativeControls_A2) makes the registration-probe / fail-closed branches
+// PROVEN-RUN rather than EXPECTED-BY-INSPECTION.
 //
-// Scope honesty: single-node simulator. "FINALIZED" here means PERSISTED into a mined block
-// (Block_tx_store), proving consensus ACCEPTANCE of the curated ring + action-less carrier.
-// It is 0-conf on a difficulty-1 sim that bypasses PoW/miniblock verify and the low-fee floor;
-// multi-node fork-choice and fee-competition are out of scope (Gate-3 / the declined R1 probe).
+// Scope honesty (audit-tightened):
+//   - Single-node simulator. "FINALIZED" = PERSISTED into ONE mined block (Block_tx_store),
+//     0-conf on a difficulty-1 sim — NOT a multi-node finality claim. Multi-node fork-choice and
+//     fee competition are out of scope (Gate-3 / the declined R1 probe).
+//   - The sim bypasses ONLY PoW/miniblock verify (blockchain.go:580,682,1193) and the low-fee
+//     floor (blockchain.go:1271). Proof/ring verification is NOT bypassed — that is why
+//     "consensus-valid" is justified.
+//   - BASE-SCID ONLY. For a zero-SCID transfer the curation registration-probe
+//     (wallet_transfer.go:108) is REDUNDANT with the unconditional ring-assembly re-probe
+//     (wallet_transfer.go:429) and with the consensus base-tree check (no SCID-fallback fires,
+//     transaction_verify.go:374 gated on !SCID.IsZero()). The probe's necessity as the SOLE
+//     wallet-side defense is load-bearing only on the NON-zero-SCID path, which this test does
+//     NOT execute (EXPECTED-BY-INSPECTION, not run here).
+//   - Sender balance delta is display-only; the absolute fee is not mainnet-representative
+//     (fee floor bypassed in sim).
 
 import (
 	"bytes"
@@ -211,21 +225,40 @@ func Test_CuratedRing_Finalizes_A2(t *testing.T) {
 		t.Fatalf("A2 FINALIZATION: persisted curated carrier failed to deserialize: %s", err)
 	}
 
-	// PROVE THE RING WAS ACTUALLY CURATED (not random fallback): a ring of size `ring` has
-	// exactly `ring - 2` decoy slots (sender at witness_index[0], recipient at witness_index[1]
-	// are fixed). The curated-selection path places preferred decoys FIRST, so all `ring - 2`
-	// decoy slots must be filled from our preferred set — zero random fallback. We supply more
-	// preferred decoys (`ring`) than there are slots, so a fully-curated ring sees exactly
-	// `ring - 2` of them placed. Compare on the raw compressed public-key hex (HRP-independent).
-	_ = finalized_tx // finalization already proven by the successful ReadTX above
-	curatedSeen := 0
+	// BIND CURATION TO FINALIZATION (audit fix #5): the ring is read off the BUILT tx (`tx`),
+	// while finalization is proven off the PERSISTED tx (`finalized_tx`). Those are only the same
+	// transaction if their hashes match — the tx hash commits the serialized ring pointers, so
+	// equal hashes mean the keys we counted are the keys that finalized. Assert it explicitly
+	// rather than leaving it implicit.
+	if finalized_tx.GetHash() != txhash {
+		t.Fatalf("A2 BIND: persisted tx hash %x != built+submitted tx hash %x — the curated ring read off the built tx is not provably the ring that finalized", finalized_tx.GetHash(), txhash)
+	}
+
+	// PROVE THE RING WAS ACTUALLY CURATED (not random fallback), POSITIONALLY (audit fix #6):
+	// a ring of size `ring` has exactly `ring - 2` decoy slots; sender sits at witness_index[0]
+	// and recipient at witness_index[1] (PROVEN-SOURCE transaction_build.go:85,100). The
+	// curated-selection path places preferred decoys FIRST, so every decoy slot must hold a
+	// member of our preferred set — zero random fallback. We assert SUBSET-EQUALITY (every
+	// non-sender/non-recipient ring member is one of our preferred decoys, and all `ring - 2`
+	// slots are filled from them), not a bare count, so the proof survives a future ring-size or
+	// pool-size change. Compare on raw compressed public-key hex (HRP-independent).
+	senderKey := hex.EncodeToString(wsrc.GetAddress().PublicKey.EncodeCompressed())
+	recipientKey := hex.EncodeToString(wrecipient.GetAddress().PublicKey.EncodeCompressed())
+	preferredKeys := map[string]bool{}
 	for _, d := range preferred {
-		da, perr := rpc.NewAddress(d)
-		if perr != nil {
-			continue
+		if da, perr := rpc.NewAddress(d); perr == nil {
+			preferredKeys[hex.EncodeToString(da.PublicKey.EncodeCompressed())] = true
 		}
-		if builtRingKeys[hex.EncodeToString(da.PublicKey.EncodeCompressed())] {
-			curatedSeen++
+	}
+	curatedSeen := 0
+	for k := range builtRingKeys {
+		switch {
+		case k == senderKey || k == recipientKey:
+			// the two fixed slots — expected
+		case preferredKeys[k]:
+			curatedSeen++ // a curated decoy slot
+		default:
+			t.Fatalf("A2 CURATION: ring contains member %s that is neither sender, recipient, nor a preferred decoy — random fallback contaminated the curated ring", k)
 		}
 	}
 	wantCurated := ring - 2 // sender + recipient occupy the other two slots
@@ -244,8 +277,159 @@ func Test_CuratedRing_Finalizes_A2(t *testing.T) {
 	}
 
 	post_src, _ := wsrc.Get_Balance()
-	t.Log(fmt.Sprintf("A2 PROVEN-RUN: curated ring (size %d, %d/%d preferred decoys placed) + action-less SCDATA carrier "+
-		"FINALIZED into a block, consensus-accepted, body byte-equal readback; sender %d->%d (debit incl. Amount+fee). "+
-		"Scope: single-node sim persistence (0-conf, PoW/fee-floor bypassed); not a multi-node finality claim.",
-		ring, curatedSeen, len(preferred), pre_src, post_src))
+	t.Log(fmt.Sprintf("A2 PROVEN-RUN (base-SCID curated-ring finalization): curated ring (size %d, %d/%d decoy slots "+
+		"filled from the preferred set, zero random fallback) + action-less SCDATA carrier passed full non-coinbase "+
+		"consensus verification incl. bulletproof (skip_proof=false, transaction_verify.go:200-201), mined, and was "+
+		"persisted into a mined block (Block_tx_store); body byte-equal readback; built-ring hash == finalized-ring hash. "+
+		"sender %d->%d (delta display-only; fee floor bypassed in sim, absolute fee NOT mainnet-representative). "+
+		"Scope: single-node sim, FINALIZED = persisted into one mined block (0-conf), not multi-node finality; sim "+
+		"bypasses ONLY PoW/miniblock verify + low-fee floor — proof/ring verification is NOT bypassed.",
+		ring, curatedSeen, ring-2, pre_src, post_src))
+}
+
+// Test_CuratedRing_NegativeControls_A2 makes the registration-probe / fail-closed branches
+// PROVEN-RUN (audit fixes #3, #4) — the failures the curation guard exists to prevent:
+//
+//	(a) Strict:true + an UNREGISTERED preferred decoy → TransferPayload0WithOptions hard-errors
+//	    BEFORE signing (wallet_transfer.go:108-111), returning no tx.
+//	(b) Strict:false + an UNREGISTERED preferred decoy → the bad decoy is skipped, a random member
+//	    fills the slot, the build succeeds, and only the REGISTERED preferred decoys appear in the
+//	    ring (curatedSeen == registered count, < decoy slots).
+//	(c) A never-mined carrier → Block_tx_store.ReadTX returns not-found, proving the positive
+//	    test's finalization assertion is non-vacuous (ReadTX does not always succeed).
+//
+// Without these, the positive test's consensus-rejection and finalization branches are
+// EXPECTED-BY-INSPECTION; this test makes them demonstrably falsifiable.
+func Test_CuratedRing_NegativeControls_A2(t *testing.T) {
+	globals.Arguments["--testnet"] = true
+	globals.Arguments["--simulator"] = true
+
+	walletapi.Initialize_LookupTable(1, 1<<17)
+
+	const ring = 8
+
+	mkwallet := func(name, seedHex string) *walletapi.Wallet_Disk {
+		db := filepath.Join(os.TempDir(), "a2neg_"+name+".db")
+		os.Remove(db)
+		t.Cleanup(func() { os.Remove(db) })
+		seed, err := hex.DecodeString(seedHex)
+		if err != nil {
+			t.Fatalf("decode seed %s: %s", name, err)
+		}
+		w, err := walletapi.Create_Encrypted_Wallet(db, WALLET_PASSWORD, new(crypto.BNRed).SetBytes(seed))
+		if err != nil {
+			t.Fatalf("create wallet %s: %s", name, err)
+		}
+		return w
+	}
+
+	wgenesis := mkwallet("genesis", genesis_seed)
+	wsrc := mkwallet("src", wallets_seeds[0])
+	wrecipient := mkwallet("dst", wallets_seeds[1])
+	// Registered decoys: only ring-3 of them, so even a fully-curated ring needs ONE more slot
+	// than we have registered decoys — that slot is where the unregistered decoy (rejected) vs a
+	// random member (substituted) shows up.
+	var regDecoys []*walletapi.Wallet_Disk
+	for i := 0; i < ring-3 && 2+i < len(wallets_seeds); i++ {
+		regDecoys = append(regDecoys, mkwallet(fmt.Sprintf("rdecoy%d", i), wallets_seeds[2+i]))
+	}
+	// The unregistered decoy: created, NEVER registered on-chain.
+	wUnreg := mkwallet("unreg", wallets_seeds[len(wallets_seeds)-1])
+
+	genesis_tx := transaction.Transaction{Transaction_Prefix: transaction.Transaction_Prefix{Version: 1, Value: 2012345}}
+	copy(genesis_tx.MinerAddress[:], wgenesis.GetAddress().PublicKey.EncodeCompressed())
+	config.Testnet.Genesis_Tx = fmt.Sprintf("%x", genesis_tx.Serialize())
+	config.Mainnet.Genesis_Tx = fmt.Sprintf("%x", genesis_tx.Serialize())
+	genesis_block := blockchain.Generate_Genesis_Block()
+	config.Testnet.Genesis_Block_Hash = genesis_block.GetHash()
+	config.Mainnet.Genesis_Block_Hash = genesis_block.GetHash()
+
+	chain, rpcserver, _ := simulator_chain_start()
+	defer simulator_chain_stop(chain, rpcserver)
+	globals.Arguments["--daemon-address"] = rpcport_test
+	go walletapi.Keep_Connectivity()
+
+	// Register sender, recipient, and ONLY the registered decoys — wUnreg is deliberately left out.
+	toRegister := append([]*walletapi.Wallet_Disk{wsrc, wrecipient}, regDecoys...)
+	for _, w := range toRegister {
+		if err := chain.Add_TX_To_Pool(w.GetRegistrationTX()); err != nil {
+			t.Fatalf("regtx: %s", err)
+		}
+	}
+	simulator_chain_mineblock(chain, wgenesis.GetAddress(), t)
+	for _, w := range append(toRegister, wgenesis) {
+		w.SetDaemonAddress(rpcport)
+		w.SetOnlineMode()
+	}
+	for i := 0; i < 8; i++ {
+		simulator_chain_mineblock(chain, wsrc.GetAddress(), t)
+	}
+	time.Sleep(time.Second)
+	if err := wsrc.Sync_Wallet_Memory_With_Daemon(); err != nil {
+		t.Fatalf("src sync: %s", err)
+	}
+
+	recipient := wrecipient.GetAddress().String()
+	var regPreferred []string
+	for _, d := range regDecoys {
+		regPreferred = append(regPreferred, d.GetAddress().String())
+	}
+	// preferred set that INCLUDES the unregistered decoy.
+	preferredWithUnreg := append(append([]string{}, regPreferred...), wUnreg.GetAddress().String())
+
+	frame := make([]byte, 64)
+	if _, err := rand.Read(frame); err != nil {
+		t.Fatal(err)
+	}
+	scdata := buildActionlessSCDATABodyA2(frame)
+	wsrc.SetRingSize(ring)
+
+	// (a) STRICT + unregistered decoy → build MUST hard-error before signing, no tx.
+	strictTx, strictErr := wsrc.TransferPayload0WithOptions(
+		[]rpc.Transfer{{Destination: recipient, Amount: 1}}, ring, false, scdata, 0, false,
+		walletapi.TransferOptions{Ring: &walletapi.RingPreference{PreferredDecoys: preferredWithUnreg, Strict: true}})
+	if strictErr == nil || strictTx != nil {
+		t.Fatalf("NEG(a): Strict-mode build with an unregistered preferred decoy MUST hard-error before signing, got err=%v tx=%v", strictErr, strictTx != nil)
+	}
+	t.Logf("NEG(a) OK: Strict-mode unregistered decoy rejected before signing: %v", strictErr)
+
+	// (b) NON-STRICT + unregistered decoy → build SUCCEEDS, the unregistered decoy is dropped and a
+	// random member fills the slot. Only the REGISTERED preferred decoys appear in the ring.
+	lenientTx, lenientErr := wsrc.TransferPayload0WithOptions(
+		[]rpc.Transfer{{Destination: recipient, Amount: 1}}, ring, false, scdata, 0, false,
+		walletapi.TransferOptions{Ring: &walletapi.RingPreference{PreferredDecoys: preferredWithUnreg, Strict: false}})
+	if lenientErr != nil || lenientTx == nil {
+		t.Fatalf("NEG(b): non-Strict build with an unregistered decoy should SUCCEED (skip+substitute), got err=%v", lenientErr)
+	}
+	lenientRingKeys := map[string]bool{}
+	for _, pl := range lenientTx.Payloads {
+		for _, p := range pl.Statement.Publickeylist {
+			lenientRingKeys[hex.EncodeToString((*crypto.Point)(p).EncodeCompressed())] = true
+		}
+	}
+	if lenientRingKeys[hex.EncodeToString(wUnreg.GetAddress().PublicKey.EncodeCompressed())] {
+		t.Fatalf("NEG(b): the UNREGISTERED decoy appears in the non-Strict ring — it must have been dropped, not placed")
+	}
+	regSeen := 0
+	for _, d := range regPreferred {
+		da, _ := rpc.NewAddress(d)
+		if lenientRingKeys[hex.EncodeToString(da.PublicKey.EncodeCompressed())] {
+			regSeen++
+		}
+	}
+	if regSeen != len(regPreferred) {
+		t.Fatalf("NEG(b): expected all %d registered preferred decoys in the ring, saw %d", len(regPreferred), regSeen)
+	}
+	t.Logf("NEG(b) OK: non-Strict dropped the unregistered decoy, kept all %d registered preferred, random-filled the rest", regSeen)
+
+	// (c) NEVER-MINED control → the lenient tx was built but never submitted/mined; ReadTX MUST
+	// return not-found, proving the positive test's finalization assertion is non-vacuous.
+	var lenientD transaction.Transaction
+	if err := lenientD.Deserialize(lenientTx.Serialize()); err != nil {
+		t.Fatalf("deserialize lenient tx: %s", err)
+	}
+	if b, err := chain.Store.Block_tx_store.ReadTX(lenientD.GetHash()); err == nil && len(b) > 0 {
+		t.Fatalf("NEG(c): a never-mined tx was found in Block_tx_store — the finalization assertion is vacuous (ReadTX always succeeds)")
+	}
+	t.Logf("NEG(c) OK: a never-mined carrier is absent from Block_tx_store — finalization assertion is non-vacuous")
 }

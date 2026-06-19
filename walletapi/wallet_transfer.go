@@ -72,10 +72,14 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 //
 // A preferred decoy is validated to be parseable, not the wallet's own address, not a
 // duplicate, and registered on the BASE (zero-SCID) balance tree. The base tree is the
-// one the consensus verifier falls back to for ring membership, so probing it (rather
-// than the transfer's SCID tree) prevents a curated decoy that passes the wallet but
-// then rejects at consensus after the user has signed. In Strict mode a bad decoy is a
-// hard error; otherwise it is skipped and random members fill the slot.
+// PRIMARY tree the consensus verifier checks for a zero-SCID transfer's ring members, and
+// the FALLBACK tree it consults for a non-zero-SCID transfer's members not found in the SC
+// tree (transaction_verify.go). Probing the base tree (rather than the transfer's SCID tree)
+// therefore prevents a curated decoy that passes the wallet but rejects at consensus after
+// the user has signed. NOTE: for a zero-SCID transfer this probe is redundant with the
+// unconditional per-candidate re-probe in the ring-assembly loop; it is the SOLE wallet-side
+// defense only on the non-zero-SCID path. In Strict mode a bad decoy is a hard error;
+// otherwise it is skipped and random members fill the slot.
 func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, pref *RingPreference) (alist []string, err error) {
 	if pref == nil {
 		return w.Random_ring_members(scid), nil
