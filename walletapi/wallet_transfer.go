@@ -80,43 +80,64 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 // unconditional per-candidate re-probe in the ring-assembly loop; it is the SOLE wallet-side
 // defense only on the non-zero-SCID path. In Strict mode a bad decoy is a hard error;
 // otherwise it is skipped and random members fill the slot.
-func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, pref *RingPreference) (alist []string, err error) {
+func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientBase string, pref *RingPreference) (alist []string, err error) {
 	if pref == nil {
 		return w.Random_ring_members(scid), nil
 	}
 
 	var zeroscid crypto.Hash
-	self := w.GetAddress().String()
+	// A ring member is identified by its public key, not its address string. Integrated
+	// and payment-id encodings of the SAME account share one pubkey but differ as strings,
+	// so all distinctness checks here canonicalize to the BASE address. Without this, an
+	// alt-encoding of the sender, recipient, or an already-curated decoy slips every check
+	// and lands the same pubkey in the ring twice — which the wallet accepts but consensus
+	// rejects (transaction_verify.go) AFTER the user has signed.
+	self := w.GetAddress().BaseAddress().String()
+	// seed with sender AND recipient base keys: both are already in the ring, so an
+	// alt-encoding of either is a duplicate that must not be curated as a decoy.
 	seen := map[string]bool{self: true}
+	if recipientBase != "" {
+		seen[recipientBase] = true
+	}
 
 	for _, d := range pref.PreferredDecoys {
-		if _, e := rpc.NewAddress(d); e != nil { // must be a parseable address
+		addr, e := rpc.NewAddress(d)
+		if e != nil { // must be a parseable address
 			if pref.Strict {
 				return nil, fmt.Errorf("preferred decoy is not a valid address: %s", d)
 			}
 			continue
 		}
-		if d == self { // curating your own address collapses your anonymity set
+		// The canonical identity for distinctness is the PUBKEY, which is network-agnostic:
+		// consensus keys duplicate ring members on the raw 33-byte pubkey (transaction_verify.go),
+		// so a wrong-network HRP encoding (dero… on a deto wallet, or vice versa) of an in-ring
+		// pubkey is the SAME ring member even though BaseAddress() preserves the Mainnet flag and
+		// would render a different string. Pin the network to this wallet's before stringifying so
+		// the seen-map and self/recipient checks compare pubkeys, not network-tagged strings.
+		canon := addr.BaseAddress()
+		canon.Mainnet = w.GetNetwork()
+		base := canon.String() // canonical identity for distinctness
+		if base == self {                   // curating your own address collapses your anonymity set
 			if pref.Strict {
 				return nil, fmt.Errorf("preferred decoy cannot be your own address")
 			}
 			continue
 		}
-		if seen[d] { // distinctness (consensus rejects duplicate ring members)
+		if seen[base] { // distinctness (consensus rejects duplicate ring members)
 			if pref.Strict {
 				return nil, fmt.Errorf("duplicate preferred decoy: %s", d)
 			}
 			continue
 		}
 		// registration: probe the BASE balance tree, the tree consensus checks against.
-		if _, _, _, _, e := w.GetEncryptedBalanceAtTopoHeight(zeroscid, -1, d); e != nil {
+		if _, _, _, _, e := w.GetEncryptedBalanceAtTopoHeight(zeroscid, -1, base); e != nil {
 			if pref.Strict {
 				return nil, fmt.Errorf("preferred decoy is not registered: %s", d)
 			}
 			continue
 		}
-		seen[d] = true
-		alist = append(alist, d)
+		seen[base] = true
+		alist = append(alist, base) // ring carries the canonical base form
 	}
 
 	return append(alist, w.Random_ring_members(scid)...), nil
@@ -146,6 +167,15 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 			err = fmt.Errorf("ringsize out of range value %d", ringsize)
 			return
 		}
+	}
+
+	// fail closed on anonymous attribution at ring 2: there are no decoy slots
+	// (witness_index[2:] is empty), so the build would silently fall through to honest
+	// attribution and broadcast a verifiably-attributed transfer while the caller believes
+	// it is anonymized. ringsize is now the effective value (supplied or wallet default).
+	if opts.Attribution == AttributionAnonymous && ringsize < 3 {
+		err = fmt.Errorf("anonymous attribution requires ring size >= 4; ring size %d has no decoy slots", ringsize)
+		return
 	}
 
 	//ringsize = 2
@@ -392,6 +422,11 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 		}*/
 
 		receiver_without_payment_id := addr.BaseAddress()
+		// network-pin the recipient's distinctness key to this wallet's network, matching how
+		// curatedRingCandidates canonicalizes decoy keys: a ring member's identity is its pubkey,
+		// not its network-tagged string, so the seed handed to the curated check (and the
+		// deduplicator below) must be on the same network as the decoy keys it is compared against.
+		receiver_without_payment_id.Mainnet = w.GetNetwork()
 
 		//sending to self is not supported
 		if w.GetAddress().String() == receiver_without_payment_id.String() {
@@ -406,14 +441,14 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 		for ringsize != 2 {
 			// curated preferred decoys (if any) go first; random members top up. With no
 			// RingPreference this returns exactly Random_ring_members(transfers[t].SCID).
-			probable_members, cerr := w.curatedRingCandidates(transfers[t].SCID, opts.Ring)
+			probable_members, cerr := w.curatedRingCandidates(transfers[t].SCID, receiver_without_payment_id.String(), opts.Ring)
 			if cerr != nil {
 				err = cerr
 				return
 			}
 			if len(probable_members) <= 40 { // we do not have enough ring members for sure, extract ring members from base
 				var zeroscid crypto.Hash
-				base_members, berr := w.curatedRingCandidates(zeroscid, opts.Ring)
+				base_members, berr := w.curatedRingCandidates(zeroscid, receiver_without_payment_id.String(), opts.Ring)
 				if berr != nil {
 					err = berr
 					return

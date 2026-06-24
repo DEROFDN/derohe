@@ -985,6 +985,10 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
+										// this wallet authored the tx, so the sender (ourselves) is certain
+										// at any ring size; mark it verified so consumers do not distrust our own sends.
+										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+										entry.SenderVerified = true
 
 										entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
 										entry.Data = append(entry.Data, tx.Payloads[t].RPCPayload[:]...)
@@ -1010,6 +1014,10 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
+										// this wallet authored the tx, so the sender (ourselves) is certain
+										// at any ring size; mark it verified so consumers do not distrust our own sends.
+										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+										entry.SenderVerified = true
 
 										entry.Payload = append(entry.Payload, payload[1:]...)
 										entry.Data = append(entry.Data, payload...)
@@ -1080,8 +1088,20 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 								// ring size 2 attribution is structural — the only other ring member is the sender; larger rings are sender-chosen and unverified
 								entry.SenderVerified = uint(tx.Payloads[t].Statement.RingSize) == 2
 
+								// sanitized copy of the decrypted payload for the exported entry fields.
+								// for an unverified attribution (ring > 2, where payload[0] is sender-chosen
+								// and unauthenticated) the leading attribution slot byte must NOT be exported:
+								// it re-derives the claimed sender via the public Publickeylist even after
+								// entry.Sender is blanked. So we blank entry.Sender AND zero payload[0] in the
+								// copy that feeds entry.Data. The verified case (ring 2, structural) is untouched.
+								exported_payload := tx.Payloads[t].RPCPayload
+								if !entry.SenderVerified {
+									entry.Sender = ""
+									exported_payload = append([]byte{0x00}, tx.Payloads[t].RPCPayload[1:]...)
+								}
+
 								entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
-								entry.Data = append(entry.Data, tx.Payloads[t].RPCPayload[:]...)
+								entry.Data = append(entry.Data, exported_payload[:]...)
 
 								args, _ := entry.ProcessPayload()
 								_ = args
@@ -1122,8 +1142,20 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 								// ring size 2 attribution is structural — the only other ring member is the sender; larger rings are sender-chosen and unverified
 								entry.SenderVerified = uint(tx.Payloads[t].Statement.RingSize) == 2
 
+								// sanitized copy of the decrypted payload for the exported entry fields.
+								// for an unverified attribution (ring > 2, where payload[0] is sender-chosen
+								// and unauthenticated) the leading attribution slot byte must NOT be exported:
+								// it re-derives the claimed sender via the public Publickeylist even after
+								// entry.Sender is blanked. So we blank entry.Sender AND zero payload[0] in the
+								// copy that feeds entry.Data. The verified case (ring 2, structural) is untouched.
+								exported_payload := payload
+								if !entry.SenderVerified {
+									entry.Sender = ""
+									exported_payload = append([]byte{0x00}, payload[1:]...)
+								}
+
 								entry.Payload = append(entry.Payload, payload[1:]...)
-								entry.Data = append(entry.Data, payload...)
+								entry.Data = append(entry.Data, exported_payload...)
 
 								args, _ := entry.ProcessPayload()
 								_ = args
