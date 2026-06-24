@@ -30,10 +30,17 @@ import (
 	"github.com/deroproject/derohe/walletapi"
 )
 
-// session-scoped "extra sender privacy" flag. NOT persisted across wallet close/reopen
-// (would require an engine Account field, which is forbidden). Seeded by --anonymous at
-// startup; toggled in the Advanced Privacy Options menu or by "set anonymous on/off".
-var anonymize_default bool
+// session-scoped sender-attribution mode for the next transfer. NOT persisted across
+// wallet close/reopen (would require an engine Account field, which is forbidden). The
+// zero value is walletapi.AttributionHonest — the receiver-pointed DEFAULT — so an
+// untouched session reproduces today's behavior exactly (the no-op contract). Cycled in
+// the Transaction Build Options menu (Default -> Anonymous -> Self -> Default); --anonymous
+// seeds it to Anonymous at startup.
+//   - AttributionHonest    (default): receiver-pointed; sender hidden, nothing extra leaked.
+//   - AttributionAnonymous : sender hidden in a decoy ring slot (needs ring size >= 4).
+//   - AttributionSelf      : DELIBERATE self-doxx; writes the real sender slot. Advanced-only,
+//                            gated behind a mandatory loud warning; works at ANY ring size.
+var attribution_mode walletapi.AttributionMode
 
 // session-scoped user-chosen ring decoys, seeded by --decoys and edited in the
 // Transaction Build Options menu. Only ever addresses the user supplies — never auto-selected.
@@ -45,16 +52,16 @@ var decoys_default []string
 // wallet default until set from the opened wallet.
 var default_ringsize = 16
 
-// buildTransferOptions constructs opts honoring the no-op contract: when anonymize
-// is false AND members is empty, it returns a LITERAL zero value, so Ring stays nil
-// (the engine fast path) and Attribution stays AttributionHonest. opts.Ring is
-// assigned ONLY when len(members) > 0 — a non-nil empty Ring pointer would change
-// the engine code path and break byte-identity with today's behavior.
-func buildTransferOptions(anonymize bool, members []string) walletapi.TransferOptions {
+// buildTransferOptions constructs opts honoring the no-op contract: when mode is
+// AttributionHonest (the zero value) AND members is empty, it returns a LITERAL zero
+// value, so Ring stays nil (the engine fast path) and Attribution stays AttributionHonest.
+// opts.Ring is assigned ONLY when len(members) > 0 — a non-nil empty Ring pointer would
+// change the engine code path and break byte-identity with today's behavior. The mode is
+// carried through verbatim: Anonymous and Self are independently selectable and either may
+// be combined with curated decoys (they configure different fields).
+func buildTransferOptions(mode walletapi.AttributionMode, members []string) walletapi.TransferOptions {
 	opts := walletapi.TransferOptions{}
-	if anonymize {
-		opts.Attribution = walletapi.AttributionAnonymous
-	}
+	opts.Attribution = mode
 	if len(members) > 0 {
 		opts.Ring = &walletapi.RingPreference{PreferredDecoys: members, Strict: false}
 	}
@@ -83,23 +90,30 @@ func anonymizeEffectiveAtRingsize(ringsize int) bool {
 	return ringsize >= 4
 }
 
-// resolveAnonymizeOrDowngrade enforces the prompt's promise against the engine reality.
-// When the user asked to anonymize but the effective ringsize has no decoy slot, the
-// engine would ship an HONEST (verifiably-attributed) transfer (cli-head) or hard-error
-// (post-rebase). Either way the user's belief "I am hidden" is false. So the CLI
-// fails closed: it DOWNGRADES anonymize to false here and tells the user plainly, so
-// what is built, broadcast, and reported all agree (criterion 1). Returns the effective
-// anonymize flag the rest of the flow must use.
-func resolveAnonymizeOrDowngrade(anonymize bool) bool {
-	if anonymize && !anonymizeEffectiveAtRingsize(wallet.GetRingSize()) {
+// resolveModeOrDowngrade enforces the prompt's promise against the engine reality. ONLY
+// AttributionAnonymous depends on the ring being large enough: it needs a decoy slot
+// (witness_index[2:], i.e. ring size >= 4). When the user asked for Anonymous but the
+// effective ringsize has no decoy slot, the engine would ship an HONEST (verifiably-
+// attributed) transfer (cli-head) or hard-error (post-rebase). Either way the user's
+// belief "I am hidden" is false, so the CLI fails closed: it DOWNGRADES the mode to
+// Honest here and tells the user plainly, so what is built, broadcast, and reported all
+// agree (criterion 1).
+//
+// AttributionSelf and AttributionHonest pass through UNCHANGED: both write a slot that
+// always exists at any ring size (sender [0] / receiver [1]). Self in particular must NOT
+// be downgraded — it is a deliberate, valid choice at ring 2, and silently "fixing" it to
+// Honest would defeat the user's explicit intent to be attributable. Returns the effective
+// mode the rest of the flow must use.
+func resolveModeOrDowngrade(mode walletapi.AttributionMode) walletapi.AttributionMode {
+	if mode == walletapi.AttributionAnonymous && !anonymizeEffectiveAtRingsize(wallet.GetRingSize()) {
 		logger.Info(color_yellow +
 			"Anonymize CANCELLED: ringsize " + fmt.Sprintf("%d", wallet.GetRingSize()) +
 			" has no decoy slot (needs 4 or higher). This transfer will ship HONEST — " +
 			"your sender address IS visible to the receiver. Run 'set ringsize 16' and " +
 			"resend if you want to be anonymized." + color_normal)
-		return false
+		return walletapi.AttributionHonest
 	}
-	return anonymize
+	return mode
 }
 
 // canonBase reduces an address string to its canonical base (pubkey) form for
@@ -218,18 +232,21 @@ func collectDecoys(l *readline.Instance, defaults []string, recipient string) []
 // It still enforces the promise against engine reality: if the user enabled extra privacy
 // but the effective ringsize cannot host it, anonymize is downgraded to honest (with a
 // plain notice) so what is built, broadcast, and reported all agree.
-func applySessionPrivacy(recipient string) (opts walletapi.TransferOptions, anonymize bool, members []string) {
-	anonymize = resolveAnonymizeOrDowngrade(anonymize_default)
-	if anonymize {
-		// session decoys are already user-entered (Advanced menu / --decoys); re-validate
-		// them against THIS recipient (the recipient seed is per-send) and canonicalize.
+func applySessionPrivacy(recipient string) (opts walletapi.TransferOptions, mode walletapi.AttributionMode, members []string) {
+	mode = resolveModeOrDowngrade(attribution_mode)
+	// curated decoys are an independent knob: they may accompany ANY non-default mode
+	// (Anonymous OR Self — Azylem: mix freely). They are NOT collected for a plain default
+	// (Honest, no decoys) send, preserving the no-op fast path. session decoys are already
+	// user-entered (Advanced menu / --decoys); re-validate them against THIS recipient (the
+	// recipient seed is per-send) and canonicalize.
+	if len(decoys_default) > 0 {
 		c := newDecoyCollector(recipient)
 		for _, d := range decoys_default {
 			c.add(d)
 		}
 		members = c.members
 	}
-	return buildTransferOptions(anonymize, members), anonymize, members
+	return buildTransferOptions(mode, members), mode, members
 }
 
 // advancedSettingsActive reports whether any opt-in build setting is engaged (extra
@@ -237,17 +254,37 @@ func applySessionPrivacy(recipient string) (opts walletapi.TransferOptions, anon
 // enabled)" suffix on the Transfer menu label so the user always sees, before they
 // commit, that this tx will be built differently from the plain default path.
 func advancedSettingsActive() bool {
-	return anonymize_default || len(decoys_default) > 0
+	return attribution_mode != walletapi.AttributionHonest || len(decoys_default) > 0
+}
+
+// attributionModeLabel is the short, human label for a session attribution mode, used in
+// the menu readout and the advanced-settings suffix so the user always sees which of the
+// three modes the next tx will use. SELF is the one the user must consciously have chosen.
+func attributionModeLabel(mode walletapi.AttributionMode) string {
+	switch mode {
+	case walletapi.AttributionAnonymous:
+		return "ANONYMOUS"
+	case walletapi.AttributionSelf:
+		return "SELF"
+	default:
+		return "DEFAULT"
+	}
 }
 
 // transferLabelSuffix is appended to the Transfer (option 5) menu line so option 5 is a
 // live readout of how the next tx will be built: the plain default path reads
 // "(default, ringsize N)"; once extra privacy / curated decoys are engaged it reads
-// "(ringsize N) (advanced settings enabled)" with the advanced part in red.
+// "(ringsize N) (advanced settings enabled — <mode> attribution)" with the advanced part
+// in red, so a self-attribution build is loudly distinguished from an anonymous one.
 func transferLabelSuffix() string {
 	if advancedSettingsActive() {
+		detail := " (advanced settings enabled"
+		if attribution_mode != walletapi.AttributionHonest {
+			detail += " — " + strings.ToLower(attributionModeLabel(attribution_mode)) + " attribution"
+		}
+		detail += ")"
 		return fmt.Sprintf(" (ringsize %d)", wallet.GetRingSize()) +
-			color_red + " (advanced settings enabled)" + color_normal
+			color_red + detail + color_normal
 	}
 	return fmt.Sprintf(" (default, ringsize %d)", wallet.GetRingSize())
 }
@@ -257,9 +294,81 @@ func transferLabelSuffix() string {
 // configuration cannot silently persist into the next, unrelated send. Resets ALL three:
 // extra privacy OFF, chosen decoys cleared, and ring size back to the session default.
 func resetTransferBuildToDefaults() {
-	anonymize_default = false
+	attribution_mode = walletapi.AttributionHonest
 	decoys_default = nil
 	wallet.SetRingSize(default_ringsize)
+}
+
+// nextAttributionMode is the pure cycle transition for option 2:
+// DEFAULT(Honest) → ANONYMOUS → SELF → DEFAULT. It is readline-free so the cycle order
+// is unit-testable without a terminal. Landing on SELF is gated by the caller's warning,
+// not here — this only computes the next value.
+func nextAttributionMode(mode walletapi.AttributionMode) walletapi.AttributionMode {
+	switch mode {
+	case walletapi.AttributionHonest:
+		return walletapi.AttributionAnonymous
+	case walletapi.AttributionAnonymous:
+		return walletapi.AttributionSelf
+	default: // AttributionSelf (or any unexpected value) cycles back to the safe default
+		return walletapi.AttributionHonest
+	}
+}
+
+// selfAttributionWarning is the mandatory, loud confirmation shown when the cycle LANDS on
+// SELF. Self-attribution is a deliberate self-doxx: it writes the real sender slot into the
+// receiver-readable attribution byte, which the recipient — and anyone who ever decrypts
+// this transaction in the future (an old/non-scrubbing wallet, a third-party tool, a future
+// crypto-break) — can read to prove the sender. The #21 scrub blanks it for up-to-date
+// receiver wallets at ring>2, but does NOT make this "safe"; the raw byte is permanent.
+// Returns true only on an explicit "y"/"yes"; any other answer (incl. read error) declines.
+func selfAttributionWarning(l *readline.Instance) bool {
+	fmt.Fprintf(l.Stderr(), "\n%s⚠  SELF-ATTRIBUTION — DELIBERATE, PERMANENT SELF-DOXX%s\n", color_red, color_normal)
+	fmt.Fprintf(l.Stderr(), "%sThis writes YOUR real ring slot into the attribution field of this transaction,\n", color_yellow)
+	fmt.Fprintf(l.Stderr(), "permanently, on-chain. A CURRENT, up-to-date wallet still hides it on decode\n")
+	fmt.Fprintf(l.Stderr(), "(ring>2 is blanked, ring 2 is structural either way), so a modern recipient\n")
+	fmt.Fprintf(l.Stderr(), "gains nothing extra TODAY. The point is the permanent record: anyone who\n")
+	fmt.Fprintf(l.Stderr(), "decrypts this transfer with the recipient's view key — an OLD or non-blanking\n")
+	fmt.Fprintf(l.Stderr(), "wallet, a third-party tool, or a future crypto-break — can then prove YOU sent\n")
+	fmt.Fprintf(l.Stderr(), "it. This is irreversible once broadcast. Choose this ONLY to deliberately and\n")
+	fmt.Fprintf(l.Stderr(), "permanently stake that you are the sender.%s\n", color_normal)
+	ans, err := ReadString(l, "Enable SELF-attribution? (y/N)", "N")
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(ans)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// cycleAttributionMode advances the session attribution mode one step on the cycle and,
+// when the next mode is SELF, gates it behind the mandatory loud warning: declining leaves
+// the mode unchanged (it does NOT skip past SELF — the user stays where they were so a
+// careless extra press can't silently land them in DEFAULT having intended SELF). For the
+// non-SELF transitions it just applies, with a ring-size note when ANONYMOUS won't fit.
+func cycleAttributionMode(l *readline.Instance) {
+	next := nextAttributionMode(attribution_mode)
+	if next == walletapi.AttributionSelf {
+		if !selfAttributionWarning(l) {
+			logger.Info("Self-attribution NOT enabled; sender attribution unchanged (" + attributionModeLabel(attribution_mode) + ").")
+			return
+		}
+	}
+	attribution_mode = next
+	switch attribution_mode {
+	case walletapi.AttributionAnonymous:
+		if !anonymizeEffectiveAtRingsize(wallet.GetRingSize()) {
+			logger.Info(color_yellow + "Note: ring size is " + fmt.Sprintf("%d", wallet.GetRingSize()) +
+				"; anonymous attribution needs ring size 4+ to take effect. Set ring size (option 1) to 16." + color_normal)
+		}
+	case walletapi.AttributionSelf:
+		logger.Info(color_red + "SELF-attribution ENABLED — your sender slot is written permanently on-chain " +
+			"(a current wallet still hides it; an old/non-blanking/future reader can prove you sent it)." + color_normal)
+	default: // back to DEFAULT
+		logger.Info("Sender attribution back to DEFAULT (receiver-pointed; your sender is hidden).")
+	}
 }
 
 // handleTransactionBuildMenu is the opt-in, unified "Transaction Build Options" submenu.
@@ -270,10 +379,6 @@ func resetTransferBuildToDefaults() {
 // commands remain and set the same state.
 func handleTransactionBuildMenu(l *readline.Instance) {
 	for {
-		on := "OFF"
-		if anonymize_default {
-			on = "ON"
-		}
 		decoyState := "(none — uses random ring members)"
 		if len(decoys_default) > 0 {
 			decoyState = fmt.Sprintf("(%d chosen)", len(decoys_default))
@@ -282,8 +387,12 @@ func handleTransactionBuildMenu(l *readline.Instance) {
 		fmt.Fprintf(l.Stderr(), "%s DERO already hides your amount, sender, and receiver\n", color_normal)
 		fmt.Fprintf(l.Stderr(), " by default. Configure how your next transfer is built\n")
 		fmt.Fprintf(l.Stderr(), " (extra sender cover is for advanced users).%s\n\n", color_normal)
+		modeColor := color_yellow
+		if attribution_mode == walletapi.AttributionSelf {
+			modeColor = color_red // self attribution is a deliberate self-doxx — show it in red
+		}
 		fmt.Fprintf(l.Stderr(), "\t%s1%s\tRing size: %s%d%s\n", color_extra_white, color_normal, color_yellow, wallet.GetRingSize(), color_normal)
-		fmt.Fprintf(l.Stderr(), "\t%s2%s\tExtra sender privacy: %s%s%s\n", color_extra_white, color_normal, color_yellow, on, color_normal)
+		fmt.Fprintf(l.Stderr(), "\t%s2%s\tSender attribution: %s%s%s  (press 2 to cycle: DEFAULT → ANONYMOUS → SELF)\n", color_extra_white, color_normal, modeColor, attributionModeLabel(attribution_mode), color_normal)
 		fmt.Fprintf(l.Stderr(), "\t%s3%s\tYour chosen ring decoys: %s\n", color_extra_white, color_normal, decoyState)
 		fmt.Fprintf(l.Stderr(), "\t%s4%s\tClear chosen decoys\n", color_extra_white, color_normal)
 		fmt.Fprintf(l.Stderr(), "\t%s0%s\tBack\n", color_extra_white, color_normal)
@@ -310,11 +419,7 @@ func handleTransactionBuildMenu(l *readline.Instance) {
 				logger.Error(fmt.Errorf("invalid ring size"), "Ring size must be a power of 2 between 2 and 128; unchanged", "requested", n, "current", got)
 			}
 		case "2":
-			anonymize_default = !anonymize_default
-			if anonymize_default && !anonymizeEffectiveAtRingsize(wallet.GetRingSize()) {
-				logger.Info(color_yellow + "Note: ring size is " + fmt.Sprintf("%d", wallet.GetRingSize()) +
-					"; extra sender privacy needs ring size 4+ to take effect. Set ring size (option 1) to 16." + color_normal)
-			}
+			cycleAttributionMode(l)
 		case "3":
 			// decoys are collected from what the user TYPES; no recipient is known here
 			// (it is a per-send value), so seed the collector with the sender only. The
@@ -434,9 +539,33 @@ func reportAttribution(l *readline.Instance, opts walletapi.TransferOptions, dec
 // flag. Used both in the pre-send review and the post-send confirmation so the user can
 // always tell after the fact whether they were actually anonymized (criterion 1).
 func attributionResultLine(opts walletapi.TransferOptions) string {
-	if opts.Attribution == walletapi.AttributionAnonymous &&
-		anonymizeEffectiveAtRingsize(wallet.GetRingSize()) {
-		return "ANONYMOUS (sender hidden in the decoy ring)"
+	switch opts.Attribution {
+	case walletapi.AttributionSelf:
+		// self always WRITES — witness_index[0] exists at any ring size — so the build state
+		// is reported verbatim, never downgraded (this is the criterion-3 teeth: Self bypasses
+		// the ring-size gate and the renderer must agree with that build state). But be accurate
+		// about WHAT the written byte actually buys, which DIFFERS by ring size (O7):
+		//   ring > 2: decode reads the byte (daemon_communication.go:1073/:1127). The #21 scrub
+		//     blanks it for a current wallet (ring>2 ⇒ SenderVerified=false ⇒ Sender="" and
+		//     payload[0]→0x00, :1098/:1152), but the RAW on-chain byte = witness_index[0] is
+		//     permanent: a non-blanking/old/future reader recovers the real sender from it. So
+		//     here Self DOES create an incremental, provable record over Honest.
+		//   ring 2: decode HARD-OVERRIDES sender_idx from the recipient's own loop position and
+		//     NEVER reads the byte (:1075-1080/:1129-1134), and SenderVerified=true exports the
+		//     sender for Honest too (:1089/:1143). The true sender is provable from ring-2
+		//     STRUCTURE alone, identically for Honest and Self — so the written byte is inert and
+		//     Self adds NOTHING incremental. Don't claim Self "creates" the provable record here.
+		if uint64(wallet.GetRingSize()) == 2 {
+			return "SELF (ring 2 — your sender is already structurally provable; the written byte adds nothing over HONEST)"
+		}
+		return "SELF (your sender slot is written permanently on-chain — provable by a non-blanking/future reader)"
+	case walletapi.AttributionAnonymous:
+		if anonymizeEffectiveAtRingsize(wallet.GetRingSize()) {
+			return "ANONYMOUS (sender hidden in the decoy ring)"
+		}
+		// requested ANONYMOUS but ring too small — the engine ships honest; report the truth.
+		return "HONEST (your sender address is visible to the receiver)"
+	default:
+		return "HONEST (your sender address is visible to the receiver)"
 	}
-	return "HONEST (your sender address is visible to the receiver)"
 }

@@ -491,11 +491,7 @@ func handle_set_command(l *readline.Instance, line string) {
 		fmt.Fprintf(l.Stderr(), color_normal+"Priority: "+color_extra_white+"%0.2f\t"+color_normal+"eg. "+color_extra_white+"set priority 4.0\t"+color_normal+"Transaction priority on DERO network \n", wallet.GetFeeMultiplier())
 		fmt.Fprintf(l.Stderr(), "\t\tMinimum priority is 1.00. High priority = high fees\n")
 
-		anon := "off"
-		if anonymize_default {
-			anon = "on"
-		}
-		fmt.Fprintf(l.Stderr(), color_normal+"Extra sender privacy: "+color_extra_white+"%s\t"+color_normal+"set in the "+color_extra_white+"Transaction Build Options"+color_normal+" menu (option 7). Needs ring size >= 4.\n", anon)
+		fmt.Fprintf(l.Stderr(), color_normal+"Sender attribution: "+color_extra_white+"%s\t"+color_normal+"set in the "+color_extra_white+"Transaction Build Options"+color_normal+" menu (option 7). ANONYMOUS needs ring size >= 4.\n", attributionModeLabel(attribution_mode))
 
 	}
 }

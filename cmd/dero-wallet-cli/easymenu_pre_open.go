@@ -255,8 +255,10 @@ func common_processing(wallet *walletapi.Wallet_Disk) {
 	default_ringsize = wallet.GetRingSize()
 
 	if globals.Arguments["--anonymous"] != nil && globals.Arguments["--anonymous"].(bool) {
-		anonymize_default = true
+		attribution_mode = walletapi.AttributionAnonymous
 		// console-only (NOT the on-disk log): never persist anonymize-intent to disk (O3).
+		// --anonymous only seeds ANONYMOUS; SELF is never reachable from a flag (it is a
+		// deliberate, warned, in-session choice only).
 		fmt.Fprintf(os.Stderr, "Extra sender privacy ON for this session (configure in the Transaction Build Options menu)\n")
 	}
 	if globals.Arguments["--decoys"] != nil && globals.Arguments["--decoys"].(string) != "" {

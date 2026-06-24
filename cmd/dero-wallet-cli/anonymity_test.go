@@ -15,12 +15,13 @@ import (
 	"github.com/deroproject/derohe/walletapi"
 )
 
-// TestBuildTransferOptionsNoOp locks the backward-compat contract: with anonymize
-// off and no decoys, buildTransferOptions MUST return the literal zero value so the
-// engine reproduces today's behavior byte-for-byte (honest attribution, nil Ring →
-// random ring selection). A regression here would silently change every default send.
+// TestBuildTransferOptionsNoOp locks the backward-compat contract: with the DEFAULT
+// (AttributionHonest, the zero value) mode and no decoys, buildTransferOptions MUST return
+// the literal zero value so the engine reproduces today's behavior byte-for-byte (honest
+// attribution, nil Ring → random ring selection). A regression here would silently change
+// every default send.
 func TestBuildTransferOptionsNoOp(t *testing.T) {
-	opts := buildTransferOptions(false, nil)
+	opts := buildTransferOptions(walletapi.AttributionHonest, nil)
 
 	if opts != (walletapi.TransferOptions{}) {
 		t.Fatalf("expected zero-value TransferOptions, got %+v", opts)
@@ -33,15 +34,16 @@ func TestBuildTransferOptionsNoOp(t *testing.T) {
 	}
 
 	// an empty (non-nil) members slice must also stay a no-op (Ring must stay nil).
-	if got := buildTransferOptions(false, []string{}); got.Ring != nil {
+	if got := buildTransferOptions(walletapi.AttributionHonest, []string{}); got.Ring != nil {
 		t.Fatalf("empty members must not produce a non-nil Ring, got %+v", got.Ring)
 	}
 }
 
-// TestBuildTransferOptionsAnonymous verifies the opt-in paths flip exactly the
-// expected fields and nothing else.
-func TestBuildTransferOptionsAnonymous(t *testing.T) {
-	opts := buildTransferOptions(true, nil)
+// TestBuildTransferOptionsModes verifies each opt-in mode flips exactly the expected fields
+// and nothing else, and that curated decoys are an INDEPENDENT knob (they may accompany any
+// mode and never change the attribution).
+func TestBuildTransferOptionsModes(t *testing.T) {
+	opts := buildTransferOptions(walletapi.AttributionAnonymous, nil)
 	if opts.Attribution != walletapi.AttributionAnonymous {
 		t.Fatalf("expected AttributionAnonymous, got %v", opts.Attribution)
 	}
@@ -49,8 +51,17 @@ func TestBuildTransferOptionsAnonymous(t *testing.T) {
 		t.Fatalf("expected nil Ring with no decoys, got %+v", opts.Ring)
 	}
 
+	// SELF carries through verbatim with nil Ring when no decoys are supplied.
+	opts = buildTransferOptions(walletapi.AttributionSelf, nil)
+	if opts.Attribution != walletapi.AttributionSelf {
+		t.Fatalf("expected AttributionSelf, got %v", opts.Attribution)
+	}
+	if opts.Ring != nil {
+		t.Fatalf("self with no decoys must keep Ring nil, got %+v", opts.Ring)
+	}
+
 	members := []string{"dero1qyabc"}
-	opts = buildTransferOptions(false, members)
+	opts = buildTransferOptions(walletapi.AttributionHonest, members)
 	if opts.Attribution != walletapi.AttributionHonest {
 		t.Fatalf("decoys alone must not change attribution, got %v", opts.Attribution)
 	}
@@ -59,6 +70,26 @@ func TestBuildTransferOptionsAnonymous(t *testing.T) {
 	}
 	if opts.Ring.Strict {
 		t.Fatalf("Strict must default to false (forgiving skip + random-fill)")
+	}
+
+	// SELF + decoys mix freely (Azylem: independently optional).
+	opts = buildTransferOptions(walletapi.AttributionSelf, members)
+	if opts.Attribution != walletapi.AttributionSelf || opts.Ring == nil || len(opts.Ring.PreferredDecoys) != 1 {
+		t.Fatalf("self must coexist with curated decoys; got attr=%v ring=%+v", opts.Attribution, opts.Ring)
+	}
+}
+
+// TestNextAttributionMode locks the cycle order DEFAULT → ANONYMOUS → SELF → DEFAULT.
+// (Teeth: change any arm and the wheel either skips SELF or never returns to DEFAULT.)
+func TestNextAttributionMode(t *testing.T) {
+	if got := nextAttributionMode(walletapi.AttributionHonest); got != walletapi.AttributionAnonymous {
+		t.Fatalf("DEFAULT must cycle to ANONYMOUS, got %v", got)
+	}
+	if got := nextAttributionMode(walletapi.AttributionAnonymous); got != walletapi.AttributionSelf {
+		t.Fatalf("ANONYMOUS must cycle to SELF, got %v", got)
+	}
+	if got := nextAttributionMode(walletapi.AttributionSelf); got != walletapi.AttributionHonest {
+		t.Fatalf("SELF must cycle back to DEFAULT, got %v", got)
 	}
 }
 
@@ -100,26 +131,33 @@ func newTestWallet(t *testing.T) (cleanup func()) {
 	}
 }
 
-// TestResolveAnonymizeOrDowngrade is the O1 teeth: when the user asks to anonymize but
-// the ringsize cannot host anonymity, the CLI MUST downgrade the flag to false so the
-// built opts, the review line, and the post-send report all agree with the engine
-// (which ships HONEST at ring<4). A false return here is the false-anonymity bug.
-func TestResolveAnonymizeOrDowngrade(t *testing.T) {
+// TestResolveModeOrDowngrade is the O1 teeth: when the user asks for ANONYMOUS but the
+// ringsize cannot host it, the CLI MUST downgrade the mode to DEFAULT so the built opts,
+// the review line, and the post-send report all agree with the engine (which ships HONEST
+// at ring<4). It must also NEVER downgrade SELF — slot 0 always exists, so Self is valid
+// at any ring size and silently "fixing" it would defeat the user's explicit intent.
+func TestResolveModeOrDowngrade(t *testing.T) {
 	defer newTestWallet(t)()
 
-	// ring 2: anonymize must be CANCELLED (downgraded to honest).
+	// ring 2: ANONYMOUS must be CANCELLED (downgraded to DEFAULT/honest).
 	wallet.SetRingSize(2)
-	if resolveAnonymizeOrDowngrade(true) {
-		t.Fatalf("ring 2: anonymize must downgrade to false (engine ships honest); got true")
+	if got := resolveModeOrDowngrade(walletapi.AttributionAnonymous); got != walletapi.AttributionHonest {
+		t.Fatalf("ring 2: anonymous must downgrade to DEFAULT (engine ships honest); got %v", got)
 	}
-	// ring 4: anonymize survives.
+	// ring 4: ANONYMOUS survives.
 	wallet.SetRingSize(4)
-	if !resolveAnonymizeOrDowngrade(true) {
-		t.Fatalf("ring 4: anonymize must survive; got false")
+	if got := resolveModeOrDowngrade(walletapi.AttributionAnonymous); got != walletapi.AttributionAnonymous {
+		t.Fatalf("ring 4: anonymous must survive; got %v", got)
 	}
-	// honest request is never upgraded.
-	if resolveAnonymizeOrDowngrade(false) {
-		t.Fatalf("honest request must stay honest at any ringsize")
+	// DEFAULT request is never upgraded, at any ringsize.
+	if got := resolveModeOrDowngrade(walletapi.AttributionHonest); got != walletapi.AttributionHonest {
+		t.Fatalf("DEFAULT request must stay DEFAULT at any ringsize; got %v", got)
+	}
+	// SELF must NEVER be downgraded, even at ring 2 (slot 0 always exists). This is the
+	// teeth that Self bypasses the ring-size gate.
+	wallet.SetRingSize(2)
+	if got := resolveModeOrDowngrade(walletapi.AttributionSelf); got != walletapi.AttributionSelf {
+		t.Fatalf("ring 2: SELF must pass through (never downgraded); got %v", got)
 	}
 }
 
@@ -141,6 +179,40 @@ func TestAttributionResultLine(t *testing.T) {
 	// honest opts always report honest.
 	if got := attributionResultLine(walletapi.TransferOptions{}); got[0] != 'H' {
 		t.Fatalf("honest opts must report HONEST, got %q", got)
+	}
+
+	// SELF opts always report SELF, at ANY ring size (never downgraded — slot 0 always
+	// exists). This is the teeth that Self bypasses the ring-size gate.
+	selfOpts := walletapi.TransferOptions{Attribution: walletapi.AttributionSelf}
+	wallet.SetRingSize(2)
+	selfRing2 := attributionResultLine(selfOpts)
+	if selfRing2 == "" || selfRing2[0] != 'S' {
+		t.Fatalf("ring 2 self opts must report SELF (never downgraded), got %q", selfRing2)
+	}
+	wallet.SetRingSize(16)
+	selfRing16 := attributionResultLine(selfOpts)
+	if selfRing16 == "" || selfRing16[0] != 'S' {
+		t.Fatalf("ring 16 self opts must report SELF, got %q", selfRing16)
+	}
+
+	// O7 teeth: the renderer must be ring-2-AWARE, not a flat overstating string. At ring 2
+	// the written byte is inert (decode hard-overrides sender_idx from loop position and never
+	// reads it; SenderVerified=true exports the sender for HONEST too), so Self adds nothing
+	// incremental — the line must say so and must NOT claim the byte makes the sender provable.
+	// At ring>2 the byte IS the incremental permanent record. The two lines MUST differ.
+	// Mutation: revert the Self branch to the single flat string and both checks below go RED.
+	if selfRing2 == selfRing16 {
+		t.Fatalf("O7: ring-2 SELF line must differ from ring>2 (ring 2 byte is inert); both were %q", selfRing2)
+	}
+	if strings.Contains(selfRing2, "provable by a non-blanking") || strings.Contains(selfRing2, "future reader") {
+		t.Fatalf("O7: ring-2 SELF line must NOT claim the written byte creates a future-reader record; got %q", selfRing2)
+	}
+	if !strings.Contains(selfRing2, "HONEST") {
+		t.Fatalf("O7: ring-2 SELF line must convey it adds nothing over HONEST; got %q", selfRing2)
+	}
+	// ring>2 must still carry the permanent-record warning (the real incremental leak).
+	if !strings.Contains(selfRing16, "permanently") {
+		t.Fatalf("O7: ring>2 SELF line must warn of the permanent on-chain record; got %q", selfRing16)
 	}
 }
 
@@ -366,45 +438,54 @@ func TestCanonBase(t *testing.T) {
 }
 
 // TestApplySessionPrivacy locks the NEW silent send path (the Advanced Privacy menu
-// redesign): a send no longer prompts — it reads the session settings (anonymize_default,
+// redesign): a send no longer prompts — it reads the session settings (attribution_mode,
 // decoys_default) and builds opts silently. The contract:
-//   - privacy OFF  -> literal zero-value opts (no-op; engine fast path unchanged)
-//   - privacy ON, ring>=4 -> AttributionAnonymous; any user-chosen decoys carried
-//   - privacy ON, ring<4  -> fails closed: downgraded to honest (no false anonymity)
+//   - DEFAULT mode, no decoys -> literal zero-value opts (no-op; engine fast path unchanged)
+//   - ANONYMOUS, ring>=4 -> AttributionAnonymous; any user-chosen decoys carried
+//   - ANONYMOUS, ring<4  -> fails closed: downgraded to DEFAULT (no false anonymity)
+//   - SELF, ANY ring     -> AttributionSelf, NEVER downgraded (slot 0 always exists)
 //   - never auto-selects decoys (Azylem): Ring is nil unless the user supplied members
 func TestApplySessionPrivacy(t *testing.T) {
 	defer newTestWallet(t)()
 
 	// save+restore the package session globals this test mutates.
-	prevAnon, prevDecoys := anonymize_default, decoys_default
-	t.Cleanup(func() { anonymize_default, decoys_default = prevAnon, prevDecoys })
+	prevMode, prevDecoys := attribution_mode, decoys_default
+	t.Cleanup(func() { attribution_mode, decoys_default = prevMode, prevDecoys })
 
-	// ── case 1: privacy OFF -> exact no-op (zero value) ───────────────────────────────
-	anonymize_default, decoys_default = false, nil
+	// ── case 1: DEFAULT, no decoys -> exact no-op (zero value) ─────────────────────────
+	attribution_mode, decoys_default = walletapi.AttributionHonest, nil
 	wallet.SetRingSize(16)
-	opts, anon, members := applySessionPrivacy("")
-	if anon || members != nil || opts.Ring != nil || opts.Attribution != walletapi.AttributionHonest {
-		t.Fatalf("privacy OFF must be a literal no-op; got anon=%v members=%v ring=%v attr=%v",
-			anon, members, opts.Ring != nil, opts.Attribution)
+	opts, mode, members := applySessionPrivacy("")
+	if mode != walletapi.AttributionHonest || members != nil || opts.Ring != nil || opts.Attribution != walletapi.AttributionHonest {
+		t.Fatalf("DEFAULT must be a literal no-op; got mode=%v members=%v ring=%v attr=%v",
+			mode, members, opts.Ring != nil, opts.Attribution)
 	}
 
-	// ── case 2: privacy ON at ring>=4 -> anonymous, no decoys -> Ring stays nil ────────
-	anonymize_default, decoys_default = true, nil
+	// ── case 2: ANONYMOUS at ring>=4 -> anonymous, no decoys -> Ring stays nil ──────────
+	attribution_mode, decoys_default = walletapi.AttributionAnonymous, nil
 	wallet.SetRingSize(16)
-	opts, anon, members = applySessionPrivacy("")
-	if !anon || opts.Attribution != walletapi.AttributionAnonymous {
-		t.Fatalf("privacy ON ring16: expected anonymous, got anon=%v attr=%v", anon, opts.Attribution)
+	opts, mode, members = applySessionPrivacy("")
+	if mode != walletapi.AttributionAnonymous || opts.Attribution != walletapi.AttributionAnonymous {
+		t.Fatalf("ANONYMOUS ring16: expected anonymous, got mode=%v attr=%v", mode, opts.Attribution)
 	}
 	if opts.Ring != nil || len(members) != 0 {
 		t.Fatalf("no user decoys -> Ring must stay nil (never auto-selected); got ring=%v members=%v", opts.Ring != nil, members)
 	}
 
-	// ── case 3: privacy ON at ring<4 -> fails closed to honest ─────────────────────────
-	anonymize_default, decoys_default = true, nil
+	// ── case 3: ANONYMOUS at ring<4 -> fails closed to DEFAULT ──────────────────────────
+	attribution_mode, decoys_default = walletapi.AttributionAnonymous, nil
 	wallet.SetRingSize(2)
-	opts, anon, _ = applySessionPrivacy("")
-	if anon || opts.Attribution != walletapi.AttributionHonest {
-		t.Fatalf("privacy ON ring2 MUST downgrade to honest (no false anonymity); got anon=%v attr=%v", anon, opts.Attribution)
+	opts, mode, _ = applySessionPrivacy("")
+	if mode != walletapi.AttributionHonest || opts.Attribution != walletapi.AttributionHonest {
+		t.Fatalf("ANONYMOUS ring2 MUST downgrade to DEFAULT (no false anonymity); got mode=%v attr=%v", mode, opts.Attribution)
+	}
+
+	// ── case 4: SELF at ring<4 -> NOT downgraded (slot 0 always exists) ─────────────────
+	attribution_mode, decoys_default = walletapi.AttributionSelf, nil
+	wallet.SetRingSize(2)
+	opts, mode, _ = applySessionPrivacy("")
+	if mode != walletapi.AttributionSelf || opts.Attribution != walletapi.AttributionSelf {
+		t.Fatalf("SELF ring2 MUST pass through (never downgraded); got mode=%v attr=%v", mode, opts.Attribution)
 	}
 }
 
@@ -415,22 +496,23 @@ func TestApplySessionPrivacy(t *testing.T) {
 func TestResetTransferBuildToDefaults(t *testing.T) {
 	defer newTestWallet(t)()
 
-	prevAnon, prevDecoys, prevDef := anonymize_default, decoys_default, default_ringsize
-	t.Cleanup(func() { anonymize_default, decoys_default, default_ringsize = prevAnon, prevDecoys, prevDef })
+	prevMode, prevDecoys, prevDef := attribution_mode, decoys_default, default_ringsize
+	t.Cleanup(func() { attribution_mode, decoys_default, default_ringsize = prevMode, prevDecoys, prevDef })
 
 	// the session default the reset must restore to.
 	default_ringsize = 16
 	wallet.SetRingSize(16)
 
-	// simulate an advanced configuration for one tx.
-	anonymize_default = true
+	// simulate an advanced configuration for one tx — use SELF (the strongest non-default)
+	// to prove reset snaps even a self-doxx setting back to the safe default.
+	attribution_mode = walletapi.AttributionSelf
 	decoys_default = []string{"deto1aaa", "deto1bbb"}
 	wallet.SetRingSize(8) // a one-off ring size for this tx
 
 	resetTransferBuildToDefaults()
 
-	if anonymize_default {
-		t.Fatalf("reset must turn extra privacy OFF; still on")
+	if attribution_mode != walletapi.AttributionHonest {
+		t.Fatalf("reset must restore DEFAULT attribution; got %v", attribution_mode)
 	}
 	if decoys_default != nil {
 		t.Fatalf("reset must clear chosen decoys; got %v", decoys_default)
@@ -446,10 +528,10 @@ func TestResetTransferBuildToDefaults(t *testing.T) {
 // before committing, how the next tx will be built.
 func TestTransferLabelSuffix(t *testing.T) {
 	defer newTestWallet(t)()
-	prevAnon, prevDecoys := anonymize_default, decoys_default
-	t.Cleanup(func() { anonymize_default, decoys_default = prevAnon, prevDecoys })
+	prevMode, prevDecoys := attribution_mode, decoys_default
+	t.Cleanup(func() { attribution_mode, decoys_default = prevMode, prevDecoys })
 
-	anonymize_default, decoys_default = false, nil
+	attribution_mode, decoys_default = walletapi.AttributionHonest, nil
 	wallet.SetRingSize(16)
 	if s := transferLabelSuffix(); !strings.Contains(s, "default") || !strings.Contains(s, "ringsize 16") {
 		t.Fatalf("default path label must read (default, ringsize 16); got %q", s)
@@ -458,8 +540,17 @@ func TestTransferLabelSuffix(t *testing.T) {
 		t.Fatalf("default path must NOT show the advanced marker")
 	}
 
-	anonymize_default = true
-	if s := transferLabelSuffix(); !strings.Contains(s, "advanced settings enabled") || strings.Contains(s, "default") {
-		t.Fatalf("advanced path label must show the advanced marker and drop 'default'; got %q", s)
+	attribution_mode = walletapi.AttributionAnonymous
+	if s := transferLabelSuffix(); !strings.Contains(s, "advanced settings enabled") || strings.Contains(s, "(default,") {
+		t.Fatalf("advanced path label must show the advanced marker and drop '(default,'; got %q", s)
+	}
+	if s := transferLabelSuffix(); !strings.Contains(s, "anonymous attribution") {
+		t.Fatalf("anonymous path label must name the mode; got %q", s)
+	}
+
+	// SELF must be loudly named in the suffix so a self-doxx build is distinguishable.
+	attribution_mode = walletapi.AttributionSelf
+	if s := transferLabelSuffix(); !strings.Contains(s, "self attribution") {
+		t.Fatalf("self path label must name 'self attribution'; got %q", s)
 	}
 }
