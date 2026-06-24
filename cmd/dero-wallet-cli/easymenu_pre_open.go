@@ -250,10 +250,14 @@ func common_processing(wallet *walletapi.Wallet_Disk) {
 
 	wallet.SetNetwork(!globals.Arguments["--testnet"].(bool))
 
+	// capture the wallet's ring size as the post-send reset target ("set first, then fire":
+	// a one-off per-tx ring size set in the Transaction Build Options menu reverts here).
+	default_ringsize = wallet.GetRingSize()
+
 	if globals.Arguments["--anonymous"] != nil && globals.Arguments["--anonymous"].(bool) {
 		anonymize_default = true
 		// console-only (NOT the on-disk log): never persist anonymize-intent to disk (O3).
-		fmt.Fprintf(os.Stderr, "Anonymize sender default ON (per-send prompt may still override)\n")
+		fmt.Fprintf(os.Stderr, "Extra sender privacy ON for this session (configure in the Transaction Build Options menu)\n")
 	}
 	if globals.Arguments["--decoys"] != nil && globals.Arguments["--decoys"].(string) != "" {
 		for _, d := range strings.Split(globals.Arguments["--decoys"].(string), ",") {

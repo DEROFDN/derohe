@@ -56,23 +56,24 @@ func display_easymenu_post_open_command(l *readline.Instance) {
 		io.WriteString(w, "\n")
 	} else { // hide some commands, if view only wallet
 		io.WriteString(w, "\t\033[1m4\033[0m\tDisplay wallet pool\n")
-		io.WriteString(w, "\t\033[1m5\033[0m\tTransfer (send  DERO) to Another Wallet\n")
+		io.WriteString(w, "\t\033[1m5\033[0m\tTransfer (send  DERO) to Another Wallet"+transferLabelSuffix()+"\n")
 		io.WriteString(w, "\t\033[1m6\033[0m\tToken transfer to another wallet\n")
+		io.WriteString(w, "\t\033[1m7\033[0m\tAdvanced Privacy Options (extra sender cover)\n")
 		io.WriteString(w, "\n")
 	}
 
-	io.WriteString(w, "\t\033[1m7\033[0m\tChange wallet password\n")
-	io.WriteString(w, "\t\033[1m8\033[0m\tClose Wallet\n")
+	io.WriteString(w, "\t\033[1m8\033[0m\tChange wallet password\n")
+	io.WriteString(w, "\t\033[1m10\033[0m\tClose Wallet\n")
 	if wallet.IsRegistered() {
-		io.WriteString(w, "\t\033[1m12\033[0m\tTransfer all balance (send  DERO) To Another Wallet\n")
-		io.WriteString(w, "\t\033[1m13\033[0m\tShow transaction history\n")
-		io.WriteString(w, "\t\033[1m14\033[0m\tRescan transaction history\n")
-		io.WriteString(w, "\t\033[1m15\033[0m\tExport all transaction history in json format\n")
+		io.WriteString(w, "\t\033[1m11\033[0m\tTransfer all balance (send  DERO) To Another Wallet\n")
+		io.WriteString(w, "\t\033[1m12\033[0m\tShow transaction history\n")
+		io.WriteString(w, "\t\033[1m13\033[0m\tRescan transaction history\n")
+		io.WriteString(w, "\t\033[1m14\033[0m\tExport all transaction history in json format\n")
 		if xswd_server == nil {
-			io.WriteString(w, "\t\033[1m16\033[0m\tStart XSWD Server\n")
+			io.WriteString(w, "\t\033[1m15\033[0m\tStart XSWD Server\n")
 		} else {
-			io.WriteString(w, "\t\033[1m16\033[0m\tStop XSWD Server\n")
-			io.WriteString(w, "\t\033[1m17\033[0m\tList XSWD Applications\n")
+			io.WriteString(w, "\t\033[1m15\033[0m\tStop XSWD Server\n")
+			io.WriteString(w, "\t\033[1m16\033[0m\tList XSWD Applications\n")
 		}
 	}
 
@@ -216,17 +217,13 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			break // invalid amount provided, bail out
 		}
 
-		opts, _, members := promptAnonymizeAndDecoys(l, a.String())
+		opts, _, members := applySessionPrivacy(a.String())
 
 		logger.Info("Review token transfer",
 			"scid", scid.String(),
 			"to", a.String(),
 			"amount", globals.FormatMoney(amount_to_transfer),
 			"ringsize", wallet.GetRingSize())
-		// attribution + decoy intent are console-only (never tee'd to the on-disk log),
-		// so the disk artifact never binds this recipient to anonymize-intent (O3).
-		reportAttribution(l, opts, len(members), "requested")
-
 		if ConfirmYesNoDefaultNo(l, "Confirm Transaction (y/N)") {
 			tx, err := wallet.TransferPayload0WithOptions([]rpc.Transfer{{SCID: scid, Amount: amount_to_transfer, Destination: a.String()}}, 0, false, rpc.Arguments{}, 0, false, opts) // empty SCDATA
 
@@ -242,6 +239,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			// post-send count is read off the BUILT ring, not the prompt-time request:
 			// Strict:false drops unregistered curated decoys silently (O8).
 			reportAttribution(l, opts, curatedDecoysInTx(tx, members, a.String()), "landed in ring") // truthful post-send confirmation (O2/O9: count only the recipient-delivering payload's ring)
+			resetTransferBuildToDefaults()                                                           // set-first-then-fire: build settings do not persist into the next send
 		}
 
 	case "5":
@@ -392,16 +390,12 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			return
 		}
 
-		opts, _, members := promptAnonymizeAndDecoys(l, a.String())
+		opts, _, members := applySessionPrivacy(a.String())
 
 		logger.Info("Review transfer",
 			"to", a.String(),
 			"amount", globals.FormatMoney(amount_to_transfer),
 			"ringsize", wallet.GetRingSize())
-		// attribution + decoy intent are console-only (never tee'd to the on-disk log),
-		// so the disk artifact never binds this recipient to anonymize-intent (O3).
-		reportAttribution(l, opts, len(members), "requested")
-
 		if ConfirmYesNoDefaultNo(l, "Confirm Transaction (y/N)") {
 
 			//src_port := uint64(0xffffffffffffffff)
@@ -421,10 +415,11 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			// post-send count is read off the BUILT ring, not the prompt-time request:
 			// Strict:false drops unregistered curated decoys silently (O8).
 			reportAttribution(l, opts, curatedDecoysInTx(tx, members, a.String()), "landed in ring") // truthful post-send confirmation (O2/O9: count only the recipient-delivering payload's ring)
+			resetTransferBuildToDefaults()                                                           // set-first-then-fire: build settings do not persist into the next send
 			//fmt.Printf("queued tx err %s\n")
 		}
 
-	case "12":
+	case "11": // transfer all balance
 		if !valid_registration_or_display_error(l, wallet) {
 			break
 		}
@@ -465,7 +460,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 
 		//PressAnyKey(l, wallet) // wait for a key press
 
-	case "7": // change password
+	case "8": // change password
 		if ConfirmYesNoDefaultNo(l, "Change wallet password (y/N)") &&
 			ValidateCurrentPassword(l, wallet) {
 
@@ -478,7 +473,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			}
 		}
 
-	case "8": // close and discard user key
+	case "10": // close and discard user key
 
 		wallet.Close_Encrypted_Wallet()
 		prompt_mutex.Lock()
@@ -500,14 +495,14 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 		fmt.Fprintf(l.Stderr(), color_yellow+"Wallet closed"+color_white)
 		fmt.Fprintf(l.Stderr(), color_yellow+"Exiting"+color_white)
 
-	case "13":
+	case "12": // show transaction history
 		var zeroscid crypto.Hash
 		show_transfers(l, wallet, zeroscid, 100)
 
-	case "14":
+	case "13": // rescan transaction history
 		logger.Info("Rescanning wallet history")
 		rescan_bc(wallet)
-	case "15":
+	case "14": // export transaction history as json
 		if !ValidateCurrentPassword(l, wallet) {
 			logger.Error(fmt.Errorf("Invalid password"), "")
 			break
@@ -535,7 +530,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 				logger.Info("successfully exported history", "file", filename)
 			}
 		}
-	case "16": // start/stop xswd server
+	case "15": // start/stop xswd server
 		if xswd_server != nil {
 			xswd_server.Stop()
 			xswd_server = nil
@@ -554,7 +549,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 		if !xswd_server.IsRunning() {
 			xswd_server = nil
 		}
-	case "17":
+	case "16": // list xswd applications
 		if xswd_server == nil {
 			logger.Error(nil, "XSWD server is not running")
 			break
@@ -571,6 +566,13 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 				logger.Info(fmt.Sprintf("Subscribed %s", app.Name), string(event), sub)
 			}
 		}
+
+	case "7": // Advanced Privacy Options — opt-in extra sender cover
+		if !wallet.IsRegistered() {
+			logger.Error(nil, "Register the account first")
+			break
+		}
+		handleTransactionBuildMenu(l)
 
 	default:
 		processed = false // just loop

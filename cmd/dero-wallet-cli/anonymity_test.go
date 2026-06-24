@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/deroproject/derohe/config"
@@ -361,5 +362,104 @@ func TestCanonBase(t *testing.T) {
 	}
 	if canonBase("   ") != "" {
 		t.Fatalf("blank input must canonicalize to empty string")
+	}
+}
+
+// TestApplySessionPrivacy locks the NEW silent send path (the Advanced Privacy menu
+// redesign): a send no longer prompts — it reads the session settings (anonymize_default,
+// decoys_default) and builds opts silently. The contract:
+//   - privacy OFF  -> literal zero-value opts (no-op; engine fast path unchanged)
+//   - privacy ON, ring>=4 -> AttributionAnonymous; any user-chosen decoys carried
+//   - privacy ON, ring<4  -> fails closed: downgraded to honest (no false anonymity)
+//   - never auto-selects decoys (Azylem): Ring is nil unless the user supplied members
+func TestApplySessionPrivacy(t *testing.T) {
+	defer newTestWallet(t)()
+
+	// save+restore the package session globals this test mutates.
+	prevAnon, prevDecoys := anonymize_default, decoys_default
+	t.Cleanup(func() { anonymize_default, decoys_default = prevAnon, prevDecoys })
+
+	// ── case 1: privacy OFF -> exact no-op (zero value) ───────────────────────────────
+	anonymize_default, decoys_default = false, nil
+	wallet.SetRingSize(16)
+	opts, anon, members := applySessionPrivacy("")
+	if anon || members != nil || opts.Ring != nil || opts.Attribution != walletapi.AttributionHonest {
+		t.Fatalf("privacy OFF must be a literal no-op; got anon=%v members=%v ring=%v attr=%v",
+			anon, members, opts.Ring != nil, opts.Attribution)
+	}
+
+	// ── case 2: privacy ON at ring>=4 -> anonymous, no decoys -> Ring stays nil ────────
+	anonymize_default, decoys_default = true, nil
+	wallet.SetRingSize(16)
+	opts, anon, members = applySessionPrivacy("")
+	if !anon || opts.Attribution != walletapi.AttributionAnonymous {
+		t.Fatalf("privacy ON ring16: expected anonymous, got anon=%v attr=%v", anon, opts.Attribution)
+	}
+	if opts.Ring != nil || len(members) != 0 {
+		t.Fatalf("no user decoys -> Ring must stay nil (never auto-selected); got ring=%v members=%v", opts.Ring != nil, members)
+	}
+
+	// ── case 3: privacy ON at ring<4 -> fails closed to honest ─────────────────────────
+	anonymize_default, decoys_default = true, nil
+	wallet.SetRingSize(2)
+	opts, anon, _ = applySessionPrivacy("")
+	if anon || opts.Attribution != walletapi.AttributionHonest {
+		t.Fatalf("privacy ON ring2 MUST downgrade to honest (no false anonymity); got anon=%v attr=%v", anon, opts.Attribution)
+	}
+}
+
+// TestResetTransferBuildToDefaults locks the "set first, then fire" contract: after a
+// send, ALL per-tx build settings snap back to defaults — extra privacy OFF, decoys
+// cleared, and ring size back to the captured session default — so an advanced
+// configuration cannot silently persist into the next, unrelated transfer.
+func TestResetTransferBuildToDefaults(t *testing.T) {
+	defer newTestWallet(t)()
+
+	prevAnon, prevDecoys, prevDef := anonymize_default, decoys_default, default_ringsize
+	t.Cleanup(func() { anonymize_default, decoys_default, default_ringsize = prevAnon, prevDecoys, prevDef })
+
+	// the session default the reset must restore to.
+	default_ringsize = 16
+	wallet.SetRingSize(16)
+
+	// simulate an advanced configuration for one tx.
+	anonymize_default = true
+	decoys_default = []string{"deto1aaa", "deto1bbb"}
+	wallet.SetRingSize(8) // a one-off ring size for this tx
+
+	resetTransferBuildToDefaults()
+
+	if anonymize_default {
+		t.Fatalf("reset must turn extra privacy OFF; still on")
+	}
+	if decoys_default != nil {
+		t.Fatalf("reset must clear chosen decoys; got %v", decoys_default)
+	}
+	if wallet.GetRingSize() != 16 {
+		t.Fatalf("reset must restore ring size to the session default (16); got %d", wallet.GetRingSize())
+	}
+}
+
+// TestTransferLabelSuffix locks option 5's state readout: the plain default path reads
+// "(default, ringsize N)"; once any advanced setting is engaged it switches to
+// "(ringsize N)" plus the "(advanced settings enabled)" marker — so the user always sees,
+// before committing, how the next tx will be built.
+func TestTransferLabelSuffix(t *testing.T) {
+	defer newTestWallet(t)()
+	prevAnon, prevDecoys := anonymize_default, decoys_default
+	t.Cleanup(func() { anonymize_default, decoys_default = prevAnon, prevDecoys })
+
+	anonymize_default, decoys_default = false, nil
+	wallet.SetRingSize(16)
+	if s := transferLabelSuffix(); !strings.Contains(s, "default") || !strings.Contains(s, "ringsize 16") {
+		t.Fatalf("default path label must read (default, ringsize 16); got %q", s)
+	}
+	if strings.Contains(transferLabelSuffix(), "advanced settings enabled") {
+		t.Fatalf("default path must NOT show the advanced marker")
+	}
+
+	anonymize_default = true
+	if s := transferLabelSuffix(); !strings.Contains(s, "advanced settings enabled") || strings.Contains(s, "default") {
+		t.Fatalf("advanced path label must show the advanced marker and drop 'default'; got %q", s)
 	}
 }

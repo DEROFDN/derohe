@@ -19,6 +19,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/chzyer/readline"
@@ -29,13 +30,20 @@ import (
 	"github.com/deroproject/derohe/walletapi"
 )
 
-// session-scoped sticky default for "Anonymize sender?". NOT persisted across
-// wallet close/reopen (would require an engine Account field, which is forbidden).
-// Seeded by --anonymous at startup; toggled by "set anonymous on/off".
+// session-scoped "extra sender privacy" flag. NOT persisted across wallet close/reopen
+// (would require an engine Account field, which is forbidden). Seeded by --anonymous at
+// startup; toggled in the Advanced Privacy Options menu or by "set anonymous on/off".
 var anonymize_default bool
 
-// session-scoped preferred decoys seeded by --decoys; used as prompt defaults.
+// session-scoped user-chosen ring decoys, seeded by --decoys and edited in the
+// Transaction Build Options menu. Only ever addresses the user supplies — never auto-selected.
 var decoys_default []string
+
+// the ring size a post-send reset restores to (the "set first, then fire" contract:
+// each tx is configured fresh, then build settings snap back). Captured when the wallet
+// is opened so a one-off per-tx ring size never silently persists. Defaults to the DERO
+// wallet default until set from the opened wallet.
+var default_ringsize = 16
 
 // buildTransferOptions constructs opts honoring the no-op contract: when anonymize
 // is false AND members is empty, it returns a LITERAL zero value, so Ring stays nil
@@ -201,23 +209,126 @@ func collectDecoys(l *readline.Instance, defaults []string, recipient string) []
 	return c.members
 }
 
-// promptAnonymizeAndDecoys runs the full interactive flow: anonymize y/N (default
-// seeded from anonymize_default), ring-size warn, then decoy collection (only when
-// anonymize is yes). Returns the built opts plus the chosen flags for the summary.
-func promptAnonymizeAndDecoys(l *readline.Instance, recipient string) (opts walletapi.TransferOptions, anonymize bool, members []string) {
-	if anonymize_default {
-		anonymize = ConfirmYesNoDefaultYes(l, "Anonymize sender? (decoys hide you from the receiver) (Y/n) ")
-	} else {
-		anonymize = ConfirmYesNoDefaultNo(l, "Anonymize sender? (decoys hide you from the receiver) (y/N) ")
-	}
-	// Enforce the promise against engine reality BEFORE collecting decoys or building
-	// opts: if the ringsize cannot host anonymity, downgrade to honest now so every
-	// downstream artifact (built opts, review line, post-send report) tells the truth.
-	anonymize = resolveAnonymizeOrDowngrade(anonymize)
+// applySessionPrivacy builds the transfer options for a send SILENTLY from the session
+// privacy settings (set via the Advanced Privacy Options menu / --anonymous / --decoys).
+// The default send path asks NOTHING extra — DERO already hides amount, sender and
+// receiver by default, so a per-send "anonymize?" prompt would wrongly imply the default
+// is exposed. Extra sender cover is opt-in by visiting the Advanced menu, not by a prompt.
+//
+// It still enforces the promise against engine reality: if the user enabled extra privacy
+// but the effective ringsize cannot host it, anonymize is downgraded to honest (with a
+// plain notice) so what is built, broadcast, and reported all agree.
+func applySessionPrivacy(recipient string) (opts walletapi.TransferOptions, anonymize bool, members []string) {
+	anonymize = resolveAnonymizeOrDowngrade(anonymize_default)
 	if anonymize {
-		members = collectDecoys(l, decoys_default, recipient)
+		// session decoys are already user-entered (Advanced menu / --decoys); re-validate
+		// them against THIS recipient (the recipient seed is per-send) and canonicalize.
+		c := newDecoyCollector(recipient)
+		for _, d := range decoys_default {
+			c.add(d)
+		}
+		members = c.members
 	}
 	return buildTransferOptions(anonymize, members), anonymize, members
+}
+
+// advancedSettingsActive reports whether any opt-in build setting is engaged (extra
+// privacy on, or user-chosen decoys present). Drives the red "(advanced settings
+// enabled)" suffix on the Transfer menu label so the user always sees, before they
+// commit, that this tx will be built differently from the plain default path.
+func advancedSettingsActive() bool {
+	return anonymize_default || len(decoys_default) > 0
+}
+
+// transferLabelSuffix is appended to the Transfer (option 5) menu line so option 5 is a
+// live readout of how the next tx will be built: the plain default path reads
+// "(default, ringsize N)"; once extra privacy / curated decoys are engaged it reads
+// "(ringsize N) (advanced settings enabled)" with the advanced part in red.
+func transferLabelSuffix() string {
+	if advancedSettingsActive() {
+		return fmt.Sprintf(" (ringsize %d)", wallet.GetRingSize()) +
+			color_red + " (advanced settings enabled)" + color_normal
+	}
+	return fmt.Sprintf(" (default, ringsize %d)", wallet.GetRingSize())
+}
+
+// resetTransferBuildToDefaults restores the "set first, then fire" contract: after a
+// transfer is dispatched, the per-tx build settings snap back to defaults so an advanced
+// configuration cannot silently persist into the next, unrelated send. Resets ALL three:
+// extra privacy OFF, chosen decoys cleared, and ring size back to the session default.
+func resetTransferBuildToDefaults() {
+	anonymize_default = false
+	decoys_default = nil
+	wallet.SetRingSize(default_ringsize)
+}
+
+// handleTransactionBuildMenu is the opt-in, unified "Transaction Build Options" submenu.
+// It is the single place to configure how the NEXT transfer's ring is built — ring size,
+// extra sender privacy, and user-chosen decoys — so there is ONE consistent flow rather
+// than ringsize-by-command + privacy-by-menu. It NEVER auto-selects anything: decoys are
+// only addresses the user types (Azylem's rule). The typed `set ringsize` / `set anonymous`
+// commands remain and set the same state.
+func handleTransactionBuildMenu(l *readline.Instance) {
+	for {
+		on := "OFF"
+		if anonymize_default {
+			on = "ON"
+		}
+		decoyState := "(none — uses random ring members)"
+		if len(decoys_default) > 0 {
+			decoyState = fmt.Sprintf("(%d chosen)", len(decoys_default))
+		}
+		fmt.Fprintf(l.Stderr(), "\n%s── Transaction Build Options ─────────────────────%s\n", color_extra_white, color_normal)
+		fmt.Fprintf(l.Stderr(), "%s DERO already hides your amount, sender, and receiver\n", color_normal)
+		fmt.Fprintf(l.Stderr(), " by default. Configure how your next transfer is built\n")
+		fmt.Fprintf(l.Stderr(), " (extra sender cover is for advanced users).%s\n\n", color_normal)
+		fmt.Fprintf(l.Stderr(), "\t%s1%s\tRing size: %s%d%s\n", color_extra_white, color_normal, color_yellow, wallet.GetRingSize(), color_normal)
+		fmt.Fprintf(l.Stderr(), "\t%s2%s\tExtra sender privacy: %s%s%s\n", color_extra_white, color_normal, color_yellow, on, color_normal)
+		fmt.Fprintf(l.Stderr(), "\t%s3%s\tYour chosen ring decoys: %s\n", color_extra_white, color_normal, decoyState)
+		fmt.Fprintf(l.Stderr(), "\t%s4%s\tClear chosen decoys\n", color_extra_white, color_normal)
+		fmt.Fprintf(l.Stderr(), "\t%s0%s\tBack\n", color_extra_white, color_normal)
+		fmt.Fprintf(l.Stderr(), "%s──────────────────────────────────────────────────%s\n", color_extra_white, color_normal)
+
+		choice, err := ReadString(l, "choice", "0")
+		if err != nil {
+			return
+		}
+		switch strings.TrimSpace(choice) {
+		case "1":
+			v, e := ReadString(l, "ring size (power of 2, 2-128)", fmt.Sprintf("%d", wallet.GetRingSize()))
+			if e != nil {
+				break
+			}
+			n, perr := strconv.Atoi(strings.TrimSpace(v))
+			if perr != nil {
+				logger.Error(perr, "Not a number")
+				break
+			}
+			// SetRingSize self-validates (power of 2, 2..128) and returns the effective value;
+			// it silently ignores an invalid value, so compare to detect a rejected input.
+			if got := wallet.SetRingSize(n); got != n {
+				logger.Error(fmt.Errorf("invalid ring size"), "Ring size must be a power of 2 between 2 and 128; unchanged", "requested", n, "current", got)
+			}
+		case "2":
+			anonymize_default = !anonymize_default
+			if anonymize_default && !anonymizeEffectiveAtRingsize(wallet.GetRingSize()) {
+				logger.Info(color_yellow + "Note: ring size is " + fmt.Sprintf("%d", wallet.GetRingSize()) +
+					"; extra sender privacy needs ring size 4+ to take effect. Set ring size (option 1) to 16." + color_normal)
+			}
+		case "3":
+			// decoys are collected from what the user TYPES; no recipient is known here
+			// (it is a per-send value), so seed the collector with the sender only. The
+			// recipient is re-checked per send in applySessionPrivacy.
+			decoys_default = collectDecoys(l, decoys_default, "")
+		case "4":
+			decoys_default = nil
+			logger.Info("Chosen decoys cleared")
+		case "0", "":
+			return
+		default:
+			logger.Error(nil, "Unknown choice")
+		}
+	}
 }
 
 // curatedDecoysInTx counts how many of the user's curated decoy base-addresses
@@ -299,16 +410,21 @@ func curatedDecoysInTx(tx *transaction.Transaction, members []string, recipient 
 	return n
 }
 
-// reportAttribution prints the truthful attribution + decoy count to the CONSOLE ONLY
-// (l.Stderr()), bypassing logger.Info which tees to the on-disk wallet log. This gives
-// the user a clear pre-send and post-send statement of how the tx is actually attributed
-// (O2) WITHOUT writing an anonymize-intent/decoy forensic artifact to disk (O3).
+// reportAttribution prints the attribution + decoy count to the CONSOLE ONLY (l.Stderr()),
+// bypassing logger.Info which tees to the on-disk wallet log (O3). It only speaks when the
+// user engaged extra privacy / curated decoys — a plain default (honest) send prints
+// NOTHING, so a normal transfer is never burdened with a "your sender is visible" notice
+// the user didn't ask for. On an advanced send it confirms, pre- and post-send, exactly how
+// the tx was attributed (O2).
 //
 // `decoys` is the count to display and its `label` (e.g. "requested" pre-send, "landed
 // in ring" post-send) so the post-send line reflects what the engine ACTUALLY placed —
 // curated decoys are dropped silently under Strict:false, so an echoed prompt-time count
 // would over-report curation (O8).
 func reportAttribution(l *readline.Instance, opts walletapi.TransferOptions, decoys int, label string) {
+	if !advancedSettingsActive() {
+		return // default/honest send: stay silent, no unsolicited privacy notice
+	}
 	fmt.Fprintf(l.Stderr(), "%sAttribution: %s  (curated decoys %s: %d)%s\n",
 		color_extra_white, attributionResultLine(opts), label, decoys, color_normal)
 }

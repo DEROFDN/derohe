@@ -450,19 +450,9 @@ func handle_set_command(l *readline.Instance, line string) {
 	help := false
 	switch command {
 	case "help":
-	case "ringsize":
-		if len(line_parts) != 3 {
-			logger.Info("Wrong number of arguments, see help eg", "")
-			help = true
-			break
-		}
-		s, err := strconv.ParseUint(line_parts[2], 10, 64)
-		if err != nil {
-			logger.Error(err, "Error parsing ringsize")
-			return
-		}
-		wallet.SetRingSize(int(s))
-		logger.Info("New Ring size", "ringsize", wallet.GetRingSize())
+	// ring size is configured in the Transaction Build Options menu (option 7), the
+	// single consistent place to define how a transfer's ring is built. The old
+	// `set ringsize` command was removed to avoid a second, colliding config path.
 
 	case "priority":
 		if len(line_parts) != 3 {
@@ -482,24 +472,9 @@ func handle_set_command(l *readline.Instance, line string) {
 		language := choose_seed_language(l)
 		logger.Info("Setting seed language", "language", wallet.SetSeedLanguage(language))
 
-	case "anonymous":
-		if len(line_parts) != 3 {
-			logger.Info("Wrong number of arguments, see help eg")
-			help = true
-			break
-		}
-		switch strings.ToLower(line_parts[2]) {
-		case "on", "true", "yes", "1":
-			anonymize_default = true
-		case "off", "false", "no", "0":
-			anonymize_default = false
-		default:
-			logger.Info("Use 'set anonymous on' or 'set anonymous off'")
-			help = true
-			break
-		}
-		// console-only (NOT the on-disk log): never persist anonymize-intent to disk (O3).
-		fmt.Fprintf(l.Stderr(), "Anonymize sender default (session only): %v\n", anonymize_default)
+	// extra sender privacy is configured in the Transaction Build Options menu (option 7),
+	// the single consistent place to define a transfer's ring build. The old
+	// `set anonymous` command was removed to avoid a second, colliding config path.
 
 	default:
 		help = true
@@ -509,7 +484,7 @@ func handle_set_command(l *readline.Instance, line string) {
 
 		fmt.Fprintf(l.Stderr(), color_extra_white+"Current settings"+color_extra_white+"\n")
 		fmt.Fprintf(l.Stderr(), color_normal+"Seed Language: "+color_extra_white+"%s\t"+color_normal+"eg. "+color_extra_white+"set seed language\n"+color_normal, wallet.GetSeedLanguage())
-		fmt.Fprintf(l.Stderr(), color_normal+"Ringsize: "+color_extra_white+"%d\t"+color_normal+"eg. "+color_extra_white+"set ringsize 16\n"+color_normal, wallet.GetRingSize())
+		fmt.Fprintf(l.Stderr(), color_normal+"Ring size: "+color_extra_white+"%d\t"+color_normal+"set in the "+color_extra_white+"Transaction Build Options"+color_normal+" menu (option 7)\n"+color_normal, wallet.GetRingSize())
 		fmt.Fprintf(l.Stderr(), color_normal+"Save Every : "+color_extra_white+"%s \t"+color_normal+"eg. "+color_extra_white+"default value:0 (set using command line)\n"+color_normal, wallet.SetSaveDuration(-1))
 		fmt.Fprintf(l.Stderr(), color_normal+"Track Recent Blocks : "+color_extra_white+"%d \t"+color_normal+"eg. "+color_extra_white+"default value:0 means track all blocks (set using command line)\n"+color_normal, wallet.SetTrackRecentBlocks(-1))
 
@@ -520,7 +495,7 @@ func handle_set_command(l *readline.Instance, line string) {
 		if anonymize_default {
 			anon = "on"
 		}
-		fmt.Fprintf(l.Stderr(), color_normal+"Anonymize sender: "+color_extra_white+"%s\t"+color_normal+"eg. "+color_extra_white+"set anonymous on\t"+color_normal+"Session default; per-send prompt still decides. Needs ringsize >= 4.\n", anon)
+		fmt.Fprintf(l.Stderr(), color_normal+"Extra sender privacy: "+color_extra_white+"%s\t"+color_normal+"set in the "+color_extra_white+"Transaction Build Options"+color_normal+" menu (option 7). Needs ring size >= 4.\n", anon)
 
 	}
 }
