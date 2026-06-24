@@ -83,9 +83,17 @@ type Entry struct {
 
 	// these fields are only valid based on payload type  and if payload could be successfully parsed and will by default be equal to zero values
 	Sender string `json:"sender"`
-	// SenderVerified is true ONLY when attribution is protocol-pinned (ring size 2,
-	// where the counterparty is necessarily the sender). For ring size > 2 the sender
-	// chose the unauthenticated attribution byte and entry.Sender MUST NOT be trusted.
+	// SenderVerified is true when entry.Sender can be trusted: either attribution is
+	// protocol-pinned (ring size 2, where the counterparty is necessarily the sender)
+	// or this wallet authored the transaction (an outgoing/self send, certain at any
+	// ring size). For an incoming ring size > 2 transfer the sender chose the
+	// unauthenticated attribution byte and entry.Sender MUST NOT be trusted.
+	//
+	// Renderer truth table (RingSize, SenderVerified, Sender):
+	//   ring 2 / true  / addr      -> trusted counterparty; show it
+	//   self   / true  / own addr  -> our own send; show it
+	//   ring>2 / false / ""        -> withheld (scrubbed); show "unknown (unverifiable, ring N)"
+	//   any    / false / "" + PayloadError != "" -> decode failed (distinct from a scrub)
 	SenderVerified bool `json:"sender_verified"`
 	// RingSize is the ring size of the payload this entry was decoded from (0 if unknown).
 	RingSize        uint64 `json:"ringsize"`

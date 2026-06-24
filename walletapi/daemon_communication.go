@@ -985,6 +985,10 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
+										// this wallet authored the tx, so the sender (ourselves) is certain
+										// at any ring size; mark it verified so consumers do not distrust our own sends.
+										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+										entry.SenderVerified = true
 
 										entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
 										entry.Data = append(entry.Data, tx.Payloads[t].RPCPayload[:]...)
@@ -1010,6 +1014,10 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
+										// this wallet authored the tx, so the sender (ourselves) is certain
+										// at any ring size; mark it verified so consumers do not distrust our own sends.
+										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+										entry.SenderVerified = true
 
 										entry.Payload = append(entry.Payload, payload[1:]...)
 										entry.Data = append(entry.Data, payload...)
@@ -1093,7 +1101,7 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 								}
 
 								entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
-								entry.Data = append(entry.Data, exported_payload[:]...)
+								entry.Data = append(entry.Data, exported_payload...)
 
 								args, _ := entry.ProcessPayload()
 								_ = args
