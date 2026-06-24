@@ -32,14 +32,24 @@ const (
 	// and today's behavior. The receiver already knows it is the receiver, so this leaks
 	// nothing about the sender.
 	//
-	// GUARDRAIL: honest mode MUST write witness_index[1] and MUST NOT be changed to
-	// witness_index[0] (the real sender slot). Writing the sender slot would make the
-	// receiver-decryptable byte reveal the true sender on every transfer.
+	// GUARDRAIL: honest/default mode MUST write witness_index[1] and MUST NOT be changed to
+	// witness_index[0] (the real sender slot). The sender slot is reachable ONLY via the
+	// explicit AttributionSelf value below — never via honest. This keeps the guardrail
+	// against ACCIDENTAL/default self-pointing intact while allowing a deliberate, named opt-in.
 	AttributionHonest AttributionMode = iota
 	// AttributionAnonymous writes the slot index of a decoy ring member (drawn from the
 	// anonymity set, never the real sender or receiver). The receiver is reduced to the
 	// ring's 1-of-N anonymity instead of being handed the sender's slot directly.
 	AttributionAnonymous
+	// AttributionSelf writes witness_index[0] (the real sender's own slot) — an explicit,
+	// advanced-only, deliberately self-doxxing choice. It points the receiver-readable
+	// attribution byte at the true sender: the recipient (and anyone who ever decrypts this
+	// transaction in the future) can prove who sent it. This is the attribution field's
+	// ORIGINAL purpose; DERO's default hides it instead. It works at ANY ring size — the
+	// sender slot [0] always exists (unlike a decoy slot, which needs ring > 2). It is NEVER
+	// the default and is reachable only by naming this value (the CLI gates it behind a
+	// mandatory loud warning).
+	AttributionSelf
 	// A "point attribution at a specific named address" mode is intentionally NOT defined:
 	// that is targeted impersonation, not privacy.
 )
@@ -235,9 +245,11 @@ rebuild_tx:
 
 				shared_key := crypto.GenerateSharedSecret(ephemeral_scalar, publickeylist[i])
 
-				// honest attribution writes witness_index[1] (the receiver's own slot).
-				// GUARDRAIL: never witness_index[0] (the real sender) — that would reveal
-				// the true sender to the receiver on every transfer.
+				// honest/default attribution writes witness_index[1] (the receiver's own slot).
+				// GUARDRAIL: honest mode NEVER writes witness_index[0] (the real sender) — that
+				// would reveal the true sender to the receiver on every transfer. The sender slot
+				// is reachable ONLY via the explicit, named AttributionSelf branch below, never by
+				// the default path; so the guardrail against ACCIDENTAL self-pointing stands.
 				attrIndex := witness_index[1]
 				if opts.Attribution == AttributionAnonymous && len(witness_index) > 2 {
 					// witness_index[2:] are the anonymity-set (decoy) slots: real, registered
@@ -245,6 +257,11 @@ rebuild_tx:
 					// Pointing attribution at one reduces the receiver to 1-of-N ring anonymity.
 					decoyPos := 2 + crand.Intn(len(witness_index)-2)
 					attrIndex = witness_index[decoyPos]
+				} else if opts.Attribution == AttributionSelf {
+					// explicit, advanced-only, deliberate self-doxx: point the byte at the real
+					// sender's own slot. witness_index[0] is the logical sender and always exists,
+					// so this needs no ring-size guard (unlike a decoy slot).
+					attrIndex = witness_index[0]
 				}
 				payload := append([]byte{byte(uint(attrIndex))}, data...)
 				//fmt.Printf("buulding shared_key %x  index of receiver %d\n",shared_key,i)
