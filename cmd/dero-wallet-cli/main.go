@@ -82,6 +82,8 @@ Usage:
   --allow-rpc-password-change   RPC server will change password if you send "Pass" header with new password
   --scan-top-n-blocks=<100000>  Only scan top N blocks
   --save-every-x-seconds=<300>  Save wallet every x seconds
+  --anonymous   Default the per-send 'Anonymize sender?' prompt to yes (decoys hide you from the receiver)
+  --decoys=<csv>  Comma-separated base addresses to prefer as ring decoys (prompt defaults; bad entries skipped)
   `
 var menu_mode bool = true // default display menu mode
 // var account_valid bool = false                        // if an account has been opened, do not allow to create new account in this session

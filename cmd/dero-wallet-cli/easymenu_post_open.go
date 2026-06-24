@@ -216,8 +216,19 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			break // invalid amount provided, bail out
 		}
 
+		opts, _, members := promptAnonymizeAndDecoys(l, a.String())
+
+		logger.Info("Review token transfer",
+			"scid", scid.String(),
+			"to", a.String(),
+			"amount", globals.FormatMoney(amount_to_transfer),
+			"ringsize", wallet.GetRingSize())
+		// attribution + decoy intent are console-only (never tee'd to the on-disk log),
+		// so the disk artifact never binds this recipient to anonymize-intent (O3).
+		reportAttribution(l, opts, len(members), "requested")
+
 		if ConfirmYesNoDefaultNo(l, "Confirm Transaction (y/N)") {
-			tx, err := wallet.TransferPayload0([]rpc.Transfer{{SCID: scid, Amount: amount_to_transfer, Destination: a.String()}}, 0, false, rpc.Arguments{}, 0, false) // empty SCDATA
+			tx, err := wallet.TransferPayload0WithOptions([]rpc.Transfer{{SCID: scid, Amount: amount_to_transfer, Destination: a.String()}}, 0, false, rpc.Arguments{}, 0, false, opts) // empty SCDATA
 
 			if err != nil {
 				logger.Error(err, "Error while building Transaction")
@@ -228,6 +239,9 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 				break
 			}
 			logger.Info("Dispatched tx", "txid", tx.GetHash().String())
+			// post-send count is read off the BUILT ring, not the prompt-time request:
+			// Strict:false drops unregistered curated decoys silently (O8).
+			reportAttribution(l, opts, curatedDecoysInTx(tx, members, a.String()), "landed in ring") // truthful post-send confirmation (O2/O9: count only the recipient-delivering payload's ring)
 		}
 
 	case "5":
@@ -378,11 +392,21 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			return
 		}
 
+		opts, _, members := promptAnonymizeAndDecoys(l, a.String())
+
+		logger.Info("Review transfer",
+			"to", a.String(),
+			"amount", globals.FormatMoney(amount_to_transfer),
+			"ringsize", wallet.GetRingSize())
+		// attribution + decoy intent are console-only (never tee'd to the on-disk log),
+		// so the disk artifact never binds this recipient to anonymize-intent (O3).
+		reportAttribution(l, opts, len(members), "requested")
+
 		if ConfirmYesNoDefaultNo(l, "Confirm Transaction (y/N)") {
 
 			//src_port := uint64(0xffffffffffffffff)
 
-			tx, err := wallet.TransferPayload0([]rpc.Transfer{{Amount: amount_to_transfer, Destination: a.String(), Payload_RPC: arguments}}, 0, false, rpc.Arguments{}, 0, false) // empty SCDATA
+			tx, err := wallet.TransferPayload0WithOptions([]rpc.Transfer{{Amount: amount_to_transfer, Destination: a.String(), Payload_RPC: arguments}}, 0, false, rpc.Arguments{}, 0, false, opts) // empty SCDATA
 
 			if err != nil {
 				logger.Error(err, "Error while building Transaction")
@@ -394,6 +418,9 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 				break
 			}
 			logger.Info("Dispatched tx", "txid", tx.GetHash().String())
+			// post-send count is read off the BUILT ring, not the prompt-time request:
+			// Strict:false drops unregistered curated decoys silently (O8).
+			reportAttribution(l, opts, curatedDecoysInTx(tx, members, a.String()), "landed in ring") // truthful post-send confirmation (O2/O9: count only the recipient-delivering payload's ring)
 			//fmt.Printf("queued tx err %s\n")
 		}
 
@@ -406,6 +433,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			break
 		}
 
+		// note: transfer-all + curated TransferOptions is unsupported by the engine; do not wire opts here.
 		logger.Error(err, "Not supported ")
 
 		/*

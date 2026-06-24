@@ -482,6 +482,25 @@ func handle_set_command(l *readline.Instance, line string) {
 		language := choose_seed_language(l)
 		logger.Info("Setting seed language", "language", wallet.SetSeedLanguage(language))
 
+	case "anonymous":
+		if len(line_parts) != 3 {
+			logger.Info("Wrong number of arguments, see help eg")
+			help = true
+			break
+		}
+		switch strings.ToLower(line_parts[2]) {
+		case "on", "true", "yes", "1":
+			anonymize_default = true
+		case "off", "false", "no", "0":
+			anonymize_default = false
+		default:
+			logger.Info("Use 'set anonymous on' or 'set anonymous off'")
+			help = true
+			break
+		}
+		// console-only (NOT the on-disk log): never persist anonymize-intent to disk (O3).
+		fmt.Fprintf(l.Stderr(), "Anonymize sender default (session only): %v\n", anonymize_default)
+
 	default:
 		help = true
 	}
@@ -496,6 +515,12 @@ func handle_set_command(l *readline.Instance, line string) {
 
 		fmt.Fprintf(l.Stderr(), color_normal+"Priority: "+color_extra_white+"%0.2f\t"+color_normal+"eg. "+color_extra_white+"set priority 4.0\t"+color_normal+"Transaction priority on DERO network \n", wallet.GetFeeMultiplier())
 		fmt.Fprintf(l.Stderr(), "\t\tMinimum priority is 1.00. High priority = high fees\n")
+
+		anon := "off"
+		if anonymize_default {
+			anon = "on"
+		}
+		fmt.Fprintf(l.Stderr(), color_normal+"Anonymize sender: "+color_extra_white+"%s\t"+color_normal+"eg. "+color_extra_white+"set anonymous on\t"+color_normal+"Session default; per-send prompt still decides. Needs ringsize >= 4.\n", anon)
 
 	}
 }
@@ -1034,6 +1059,7 @@ var completer = readline.NewPrefixCompleter(
 		readline.PcItem("mixin"),
 		readline.PcItem("seed"),
 		readline.PcItem("priority"),
+		readline.PcItem("anonymous"),
 	),
 	readline.PcItem("show_transfers"),
 	readline.PcItem("spendkey"),
