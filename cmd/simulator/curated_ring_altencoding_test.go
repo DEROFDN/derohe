@@ -33,13 +33,18 @@ import (
 // signed it; consensus then rejected it at transaction_verify.go (duplicate ring member)
 // AFTER the user had signed.
 //
-// It exercises FOUR alt-encoding vectors as independent subtests, each supplying the
-// poisoned encoding as the FIRST curated decoy (with only one other real decoy, ring 8) so
+// It exercises SIX alt-encoding vectors as independent subtests, each supplying the
+// poisoned encoding as a leading curated decoy (with only one other real decoy, ring 8) so
 // the buggy path must consume and place it before random members fill the ring:
 //   - recipient-alt:               integrated encoding of the recipient
 //   - sender-alt:                  integrated encoding of the sender (self)
 //   - decoy-vs-decoy:              two integrated encodings of the SAME extra decoy
 //   - cross-network-recipient-alt: a wrong-network HRP encoding of the recipient pubkey
+//   - deroproof-recipient-alt:     a deroproof-HRP encoding of the recipient (defense-in-depth)
+//   - deroproof-decoy-alt:         deroproof + plain of the SAME extra decoy — THE deroproof
+//     teeth (#13); the only deroproof axis the caller-side
+//     line-482 backstop does NOT guard, so curatedRingCandidates'
+//     pubkey-keyed distinctness is the sole defense
 //
 // Each asserts the built ring has NO duplicate pubkey and exactly `ring` distinct members —
 // i.e. the alt-encoding was canonicalized away, not placed. With the canonicalization
@@ -255,5 +260,94 @@ func Test_CuratedRing_AltEncoding_NoDuplicate_A2(t *testing.T) {
 		}
 		tx := build(t, "cross-network-recipient-alt", preferred)
 		assertNoDup(t, "cross-network-recipient-alt", tx, map[string]string{"recipient": pubkeyHex(wrecipient)})
+	})
+
+	// deroproofOf returns a deroproof-HRP encoding (same pubkey, different string) of the given
+	// base address. MarshalText forces hrp="deroproof" whenever a.Proof is set (rpc/address.go:
+	// 53-54), OVERRIDING the dero/deto network HRP — so this is yet another DIFFERENT string for
+	// the SAME 33-byte pubkey (PublicKey is always encoded, :58). This axis is nastier than the
+	// integrated/cross-network ones: BaseAddress() PRESERVES Proof (Clone, :97), and a parsed
+	// deroproof address comes back with Proof=true (:168-169), so the PRE-#13 string fix
+	// (BaseAddress + pin Mainnet) STILL re-renders it as "deroproof..." (Proof never cleared) —
+	// a distinct string that slips a string-keyed seen-set.
+	//
+	// SOURCE NOTE: UnmarshalText unconditionally decodes Arguments for the deroproof HRP
+	// (rpc/address.go:174-177), and Arguments.UnmarshalBinary on an EMPTY byte slice returns EOF
+	// (rpc/rpc.go:226) — so a BARE-pubkey deroproof string does NOT round-trip. A real deroproof
+	// address always carries a proof argument, so we attach one (cleared again by BaseAddress in
+	// the wallet). This makes the poison stress BOTH the Proof axis AND the Arguments axis at once.
+	deroproofOf := func(t *testing.T, base rpc.Address, port uint64) string {
+		a := base.BaseAddress()
+		a.Proof = true
+		a.Arguments = rpc.Arguments{{Name: rpc.RPC_DESTINATION_PORT, DataType: rpc.DataUint64, Value: port}}
+		s := a.String()
+		if len(s) < 9 || s[:9] != "deroproof" {
+			t.Fatalf("expected a deroproof-prefixed string, got %q", s)
+		}
+		pa, err := rpc.NewAddress(s)
+		if err != nil {
+			t.Fatalf("deroproof encoding not parseable: %s", err)
+		}
+		if !pa.Proof {
+			t.Fatalf("parsed deroproof address did not carry Proof=true")
+		}
+		if pa.BaseAddress().String() == base.BaseAddress().String() {
+			t.Fatalf("deroproof encoding rendered the same string as the base; test premise broken")
+		}
+		if hex.EncodeToString(pa.PublicKey.EncodeCompressed()) != hex.EncodeToString(base.PublicKey.EncodeCompressed()) {
+			t.Fatalf("deroproof encoding does not carry the base pubkey")
+		}
+		return s
+	}
+
+	// VECTOR 5 — DEROPROOF recipient poison (defense-in-depth). A deroproof encoding of the
+	// recipient as the first curated decoy. The recipient is multiply-defended (the #13 pubkey
+	// seen-seed, canon.Proof=false making the emitted base collide with the recipient's clean
+	// string, AND the caller-side `k != receiver` backstop at wallet_transfer.go:474), so this
+	// is GREEN under the fix and stays GREEN even under partial reverts — it documents that the
+	// recipient deroproof axis is closed, but it is NOT the teeth (see VECTOR 6).
+	t.Run("deroproof-recipient-alt", func(t *testing.T) {
+		preferred := []string{deroproofOf(t, recipientBase, 0xC0FFEE)}
+		for _, d := range regDecoys {
+			preferred = append(preferred, d.GetAddress().String())
+		}
+		tx := build(t, "deroproof-recipient-alt", preferred)
+		assertNoDup(t, "deroproof-recipient-alt", tx, map[string]string{"recipient": pubkeyHex(wrecipient)})
+	})
+
+	// VECTOR 6 — DEROPROOF decoy canonicalizes & is PLACED (THE deroproof teeth, #13), asserted in
+	// STRICT mode so the regression is DETERMINISTIC. A deroproof encoding of an extra decoy
+	// (wdecoyDup) as the sole curated decoy. The fix that closes the deroproof axis is
+	// `canon.Proof = false` at wallet_transfer.go:140 — without it the emitted ring string stays
+	// "deroproof…", which the BASE-tree registration probe at :144 REJECTS (a deroproof HRP is not
+	// a usable ring entry — GetEncryptedBalanceAtTopoHeight cannot resolve it).
+	//
+	// ARCHITECTURAL NOTE (verified by mutation, see the re-review report): the deroproof axis
+	// canNOT be made to PLACE A DUPLICATE by reverting #13 in isolation — the caller-side string
+	// deduplicator at wallet_transfer.go:470-473 collapses any two same-pubkey entries, because
+	// canon.Proof=false makes BOTH emit the identical clean base string. So the meaningful
+	// regression a broken deroproof fix causes is a REJECTED/DROPPED decoy, not a duplicate. We
+	// assert it in STRICT mode: under the fix the deroproof decoy canonicalizes to the clean base,
+	// passes the probe, and the build SUCCEEDS with wdecoyDup placed exactly once; drop
+	// `canon.Proof=false` and Strict turns the failed registration probe into a HARD ERROR
+	// (wallet_transfer.go:145-147) — the build fails. Strict makes the RED unconditional (no
+	// dependence on whether a random top-up happens to re-draw the dropped decoy).
+	t.Run("deroproof-decoy-alt", func(t *testing.T) {
+		preferred := []string{deroproofOf(t, dupDecoyBase, 0x3333)} // deroproof encoding of wdecoyDup
+		frame := make([]byte, 64)
+		if _, err := rand.Read(frame); err != nil {
+			t.Fatal(err)
+		}
+		scdata := buildActionlessSCDATABodyA2(frame)
+		tx, err := wsrc.TransferPayload0WithOptions(
+			[]rpc.Transfer{{Destination: recipient, Amount: 1}}, ring, false, scdata, 0, false,
+			walletapi.TransferOptions{Ring: &walletapi.RingPreference{PreferredDecoys: preferred, Strict: true}})
+		if err != nil || tx == nil {
+			t.Fatalf("deroproof-decoy-alt: STRICT build with a deroproof decoy should SUCCEED "+
+				"(it must canonicalize Proof away to a registered base); got err=%v — this means "+
+				"canon.Proof=false is NOT applied and the deroproof axis is OPEN", err)
+		}
+		// corroborate: the deroproof decoy's pubkey landed in the ring exactly once (clean base).
+		assertNoDup(t, "deroproof-decoy-alt", tx, map[string]string{"deroproof-decoy": pubkeyHex(wdecoyDup)})
 	})
 }

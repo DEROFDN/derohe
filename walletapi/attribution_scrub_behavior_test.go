@@ -52,9 +52,11 @@ func Test_Attribution_Scrub_Behavior(t *testing.T) {
 
 	wsrc_temp_db := filepath.Join(os.TempDir(), "scrub_test_wallet_src.db")
 	wdst_temp_db := filepath.Join(os.TempDir(), "scrub_test_wallet_dst.db")
+	wgenesis_temp_db := filepath.Join(os.TempDir(), "scrub_test_wallet_genesis.db")
 
 	os.Remove(wsrc_temp_db)
 	os.Remove(wdst_temp_db)
+	os.Remove(wgenesis_temp_db)
 
 	wsrc, err := Create_Encrypted_Wallet_From_Recovery_Words(wsrc_temp_db, "QWER", "sequence atlas unveil summon pebbles tuesday beer rudely snake rockets different fuselage woven tagged bested dented vegan hover rapid fawns obvious muppet randomly seasons randomly")
 	if err != nil {
@@ -66,7 +68,7 @@ func Test_Attribution_Scrub_Behavior(t *testing.T) {
 		t.Fatalf("Cannot create encrypted wallet, err %s", err)
 	}
 
-	wgenesis, err := Create_Encrypted_Wallet_From_Recovery_Words(wdst_temp_db, "QWER", "perfil lujo faja puma favor pedir detalle doble carbón neón paella cuarto ánimo cuento conga correr dental moneda león donar entero logro realidad acceso doble")
+	wgenesis, err := Create_Encrypted_Wallet_From_Recovery_Words(wgenesis_temp_db, "QWER", "perfil lujo faja puma favor pedir detalle doble carbón neón paella cuarto ánimo cuento conga correr dental moneda león donar entero logro realidad acceso doble")
 	if err != nil {
 		t.Fatalf("Cannot create encrypted wallet, err %s", err)
 	}
@@ -89,8 +91,10 @@ func Test_Attribution_Scrub_Behavior(t *testing.T) {
 		simulator_chain_stop(chain, rpcserver)
 		wsrc.Close_Encrypted_Wallet()
 		wdst.Close_Encrypted_Wallet()
+		wgenesis.Close_Encrypted_Wallet()
 		os.Remove(wsrc_temp_db)
 		os.Remove(wdst_temp_db)
+		os.Remove(wgenesis_temp_db)
 	}()
 
 	globals.Arguments["--daemon-address"] = rpcport

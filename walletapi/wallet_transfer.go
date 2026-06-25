@@ -80,24 +80,35 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 // unconditional per-candidate re-probe in the ring-assembly loop; it is the SOLE wallet-side
 // defense only on the non-zero-SCID path. In Strict mode a bad decoy is a hard error;
 // otherwise it is skipped and random members fill the slot.
-func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientBase string, pref *RingPreference) (alist []string, err error) {
+//
+// recipientAddr is the transfer's recipient address string (any HRP/network/integrated
+// encoding); its pubkey seeds the distinctness set so an alt-encoding of the recipient is
+// rejected as a duplicate. Empty means "no recipient seed".
+func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr string, pref *RingPreference) (alist []string, err error) {
 	if pref == nil {
 		return w.Random_ring_members(scid), nil
 	}
 
 	var zeroscid crypto.Hash
-	// A ring member is identified by its public key, not its address string. Integrated
-	// and payment-id encodings of the SAME account share one pubkey but differ as strings,
-	// so all distinctness checks here canonicalize to the BASE address. Without this, an
-	// alt-encoding of the sender, recipient, or an already-curated decoy slips every check
-	// and lands the same pubkey in the ring twice — which the wallet accepts but consensus
-	// rejects (transaction_verify.go) AFTER the user has signed.
-	self := w.GetAddress().BaseAddress().String()
-	// seed with sender AND recipient base keys: both are already in the ring, so an
-	// alt-encoding of either is a duplicate that must not be curated as a decoy.
+	// A ring member is identified by its public key, not its address string. The seen-set
+	// is therefore keyed on the raw 33-byte compressed pubkey, NOT a stringified address.
+	// Address strings vary along several axes that all encode the SAME pubkey — network HRP
+	// (dero/deto), the deroproof HRP (rpc/address.go MarshalText overrides the network HRP
+	// whenever Proof is set), and the integrated "i" HRP/Arguments — so a string key lets an
+	// alt-encoding of the sender, recipient, or an already-curated decoy slip every check and
+	// land the same pubkey in the ring twice, which the wallet accepts but consensus rejects
+	// (transaction_verify.go) AFTER the user has signed. A pubkey key collapses every such
+	// axis (including any future HRP axis) into one identity.
+	pkKey := func(a *rpc.Address) string { return hex.EncodeToString(a.PublicKey.EncodeCompressed()) }
+	selfAddr := w.GetAddress()
+	self := pkKey(&selfAddr)
+	// seed with sender AND recipient pubkeys: both are already in the ring, so an alt-encoding
+	// of either is a duplicate that must not be curated as a decoy.
 	seen := map[string]bool{self: true}
-	if recipientBase != "" {
-		seen[recipientBase] = true
+	if recipientAddr != "" {
+		if ra, e := rpc.NewAddress(recipientAddr); e == nil {
+			seen[pkKey(ra)] = true
+		}
 	}
 
 	for _, d := range pref.PreferredDecoys {
@@ -108,27 +119,27 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientBase st
 			}
 			continue
 		}
-		// The canonical identity for distinctness is the PUBKEY, which is network-agnostic:
-		// consensus keys duplicate ring members on the raw 33-byte pubkey (transaction_verify.go),
-		// so a wrong-network HRP encoding (dero… on a deto wallet, or vice versa) of an in-ring
-		// pubkey is the SAME ring member even though BaseAddress() preserves the Mainnet flag and
-		// would render a different string. Pin the network to this wallet's before stringifying so
-		// the seen-map and self/recipient checks compare pubkeys, not network-tagged strings.
-		canon := addr.BaseAddress()
-		canon.Mainnet = w.GetNetwork()
-		base := canon.String() // canonical identity for distinctness
-		if base == self {                   // curating your own address collapses your anonymity set
+		key := pkKey(addr) // pubkey is the network-/proof-/integrated-agnostic identity
+		if key == self {   // curating your own address collapses your anonymity set
 			if pref.Strict {
 				return nil, fmt.Errorf("preferred decoy cannot be your own address")
 			}
 			continue
 		}
-		if seen[base] { // distinctness (consensus rejects duplicate ring members)
+		if seen[key] { // distinctness (consensus rejects duplicate ring members)
 			if pref.Strict {
 				return nil, fmt.Errorf("duplicate preferred decoy: %s", d)
 			}
 			continue
 		}
+		// The ring carries a normal BASE address (Arguments cleared, Proof cleared, network
+		// pinned to this wallet's) — a deroproof or integrated encoding is not a usable ring
+		// entry. The seen-set is keyed on the pubkey above, so this stringification only has
+		// to produce a resolvable address; its HRP axes no longer affect distinctness.
+		canon := addr.BaseAddress()
+		canon.Proof = false
+		canon.Mainnet = w.GetNetwork()
+		base := canon.String()
 		// registration: probe the BASE balance tree, the tree consensus checks against.
 		if _, _, _, _, e := w.GetEncryptedBalanceAtTopoHeight(zeroscid, -1, base); e != nil {
 			if pref.Strict {
@@ -136,7 +147,7 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientBase st
 			}
 			continue
 		}
-		seen[base] = true
+		seen[key] = true
 		alist = append(alist, base) // ring carries the canonical base form
 	}
 
@@ -422,11 +433,11 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 		}*/
 
 		receiver_without_payment_id := addr.BaseAddress()
-		// network-pin the recipient's distinctness key to this wallet's network, matching how
-		// curatedRingCandidates canonicalizes decoy keys: a ring member's identity is its pubkey,
-		// not its network-tagged string, so the seed handed to the curated check (and the
-		// deduplicator below) must be on the same network as the decoy keys it is compared against.
-		receiver_without_payment_id.Mainnet = w.GetNetwork()
+		// curatedRingCandidates now keys distinctness on the recipient's raw pubkey (it parses
+		// the address string we hand it), so the recipient seed no longer has to be network-pinned
+		// to stay in lockstep with the decoy keys. Leaving it on the recipient's native network
+		// keeps the caller-side deduplicator below consistent with the recipient ring member added
+		// above (also native-network), so a duplicate is caught on the same string form.
 
 		//sending to self is not supported
 		if w.GetAddress().String() == receiver_without_payment_id.String() {

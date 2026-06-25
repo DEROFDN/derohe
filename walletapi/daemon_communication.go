@@ -59,6 +59,35 @@ import (
 // this global variable should be within wallet structure
 var Connected bool = false
 
+// scrubExportedPayload returns the copy of the decrypted payload that is safe to
+// expose via the exported entry fields (entry.Data). For an unverified attribution
+// (ring > 2, where payload[0] is the sender-chosen, unauthenticated attribution slot
+// byte) the leading byte must NOT be exported: it re-derives the claimed sender via
+// the public Publickeylist even after entry.Sender is blanked. So it blanks
+// entry.Sender AND zeroes payload[0] in the returned copy. The verified case
+// (ring 2, structural) is returned untouched.
+//
+// This is the single source of truth for the #3 attribution scrub; both the CBOR
+// and CBOR_V2 receive arms call it so a one-arm edit cannot silently reopen the leak.
+func scrubExportedPayload(entry *rpc.Entry, payload []byte) []byte {
+	exported_payload := payload
+	if !entry.SenderVerified {
+		entry.Sender = ""
+		exported_payload = append([]byte{0x00}, payload[1:]...)
+	}
+	return exported_payload
+}
+
+// markSelfAuthored records that this wallet authored the tx, so the sender (ourselves)
+// is certain at any ring size; it is marked verified so consumers do not distrust our
+// own sends. This is the single source of truth for the self-trust block; both
+// self-send arms (CBOR and CBOR_V2) call it so the trust polarity cannot drift between
+// the two arms.
+func markSelfAuthored(entry *rpc.Entry, ringsize uint64) {
+	entry.RingSize = ringsize
+	entry.SenderVerified = true
+}
+
 var daemon_height int64
 var daemon_topoheight int64
 var last_event_topoheight_tracked int64
@@ -985,10 +1014,7 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
-										// this wallet authored the tx, so the sender (ourselves) is certain
-										// at any ring size; mark it verified so consumers do not distrust our own sends.
-										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
-										entry.SenderVerified = true
+										markSelfAuthored(&entry, tx.Payloads[t].Statement.RingSize)
 
 										entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
 										entry.Data = append(entry.Data, tx.Payloads[t].RPCPayload[:]...)
@@ -1014,10 +1040,7 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
-										// this wallet authored the tx, so the sender (ourselves) is certain
-										// at any ring size; mark it verified so consumers do not distrust our own sends.
-										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
-										entry.SenderVerified = true
+										markSelfAuthored(&entry, tx.Payloads[t].Statement.RingSize)
 
 										entry.Payload = append(entry.Payload, payload[1:]...)
 										entry.Data = append(entry.Data, payload...)
@@ -1088,17 +1111,9 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 								// ring size 2 attribution is structural — the only other ring member is the sender; larger rings are sender-chosen and unverified
 								entry.SenderVerified = uint(tx.Payloads[t].Statement.RingSize) == 2
 
-								// sanitized copy of the decrypted payload for the exported entry fields.
-								// for an unverified attribution (ring > 2, where payload[0] is sender-chosen
-								// and unauthenticated) the leading attribution slot byte must NOT be exported:
-								// it re-derives the claimed sender via the public Publickeylist even after
-								// entry.Sender is blanked. So we blank entry.Sender AND zero payload[0] in the
-								// copy that feeds entry.Data. The verified case (ring 2, structural) is untouched.
-								exported_payload := tx.Payloads[t].RPCPayload
-								if !entry.SenderVerified {
-									entry.Sender = ""
-									exported_payload = append([]byte{0x00}, tx.Payloads[t].RPCPayload[1:]...)
-								}
+								// scrub the unverified attribution slot byte before it reaches the
+								// exported entry fields (see scrubExportedPayload).
+								exported_payload := scrubExportedPayload(&entry, tx.Payloads[t].RPCPayload)
 
 								entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
 								entry.Data = append(entry.Data, exported_payload[:]...)
@@ -1142,17 +1157,9 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 								// ring size 2 attribution is structural — the only other ring member is the sender; larger rings are sender-chosen and unverified
 								entry.SenderVerified = uint(tx.Payloads[t].Statement.RingSize) == 2
 
-								// sanitized copy of the decrypted payload for the exported entry fields.
-								// for an unverified attribution (ring > 2, where payload[0] is sender-chosen
-								// and unauthenticated) the leading attribution slot byte must NOT be exported:
-								// it re-derives the claimed sender via the public Publickeylist even after
-								// entry.Sender is blanked. So we blank entry.Sender AND zero payload[0] in the
-								// copy that feeds entry.Data. The verified case (ring 2, structural) is untouched.
-								exported_payload := payload
-								if !entry.SenderVerified {
-									entry.Sender = ""
-									exported_payload = append([]byte{0x00}, payload[1:]...)
-								}
+								// scrub the unverified attribution slot byte before it reaches the
+								// exported entry fields (see scrubExportedPayload).
+								exported_payload := scrubExportedPayload(&entry, payload)
 
 								entry.Payload = append(entry.Payload, payload[1:]...)
 								entry.Data = append(entry.Data, exported_payload...)
