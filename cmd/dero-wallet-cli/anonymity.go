@@ -441,7 +441,9 @@ func handleTransactionBuildMenu(l *readline.Instance) {
 // echoing the prompt-time request count. The engine (curatedRingCandidates) runs under
 // Strict:false, so a curated decoy that is unparseable / unregistered /
 // deregistered-since-prompt is SILENTLY skipped and a random member fills the slot —
-// len(members) would then over-report curation. The authoritative record of what
+// len(members) would then over-report curation. (Since review #3 the silent skip covers
+// only the daemon's unregistered VERDICT; a probe that FAILS — daemon/transport fault,
+// no verdict — hard-errors the build even under Strict:false, so it never reaches here.) The authoritative record of what
 // finalized is the freshly built tx's Statement.Publickeylist (the serialized wire form
 // keeps only index pointers, so this must read the in-memory built tx, exactly as the
 // curated-ring finalization test does).
@@ -525,7 +527,8 @@ func curatedDecoysInTx(tx *transaction.Transaction, members []string, recipient 
 // `decoys` is the count to display and its `label` (e.g. "requested" pre-send, "landed
 // in ring" post-send) so the post-send line reflects what the engine ACTUALLY placed —
 // curated decoys are dropped silently under Strict:false, so an echoed prompt-time count
-// would over-report curation (O8).
+// would over-report curation (O8). (Drops cover unregistered verdicts only — a FAILED
+// probe hard-errors the build even under Strict:false since review #3.)
 func reportAttribution(l *readline.Instance, opts walletapi.TransferOptions, decoys int, label string) {
 	if !advancedSettingsActive() {
 		return // default/honest send: stay silent, no unsolicited privacy notice
