@@ -62,6 +62,14 @@ type RingPreference struct {
 	// random members top up to ringsize. Each is validated registered on the base balance
 	// tree before use. Addresses the user controls must NOT be supplied here — curating
 	// your own addresses collapses your anonymity set.
+	//
+	// Ring composition on a scarce tree: when the transfer SCID's own tree cannot supply
+	// enough random members (its random tail is <= 40), assembly falls back to base-tree
+	// members exactly as it does without curation — for a non-zero SCID those fill token
+	// slots with synthesized zero balances. Curated decoys do not widen this behavior and
+	// do not count toward the scarcity measurement. If even the fallback cannot fill the
+	// ring, assembly fails with an explicit pool-exhaustion error instead of retrying
+	// forever (Strict only governs per-decoy validation, never composition).
 	PreferredDecoys []string
 	// Strict: if true, a bad preferred decoy (unparseable / self / duplicate / unregistered)
 	// is a hard error. If false (default), it is skipped and random selection fills the slot.

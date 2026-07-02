@@ -251,6 +251,42 @@ func (cli *Client) Call(method string, params interface{}, result interface{}) e
 	return cli.RPC.CallResult(context.Background(), method, params, result)
 }
 
+// walletDaemonCallTimeout bounds each daemon RPC issued on the transfer path (ring
+// candidates, balance/registration probes, name resolution): those calls run under transfer_mutex, and a
+// daemon that accepts the websocket but never answers would otherwise park the build
+// inside a deadline-free CallResult holding the mutex forever (PR #22 re-review O10).
+// Sized orders of magnitude above honest daemon latency for these lookups (sub-second,
+// even over high-RTT links) so it can only fire on a hung or hostile peer. A var so
+// tests can shrink it.
+var walletDaemonCallTimeout = 45 * time.Second
+
+// walletDaemonWriteTimeout bounds every websocket WRITE on the wallet's daemon client
+// (armed per write by rwc.NewWithWriteTimeout in Connect). The call-context deadline
+// below cannot bound the transmit phase: the vendored jrpc2 client serializes send()
+// and context-deadline delivery on one client-wide mutex (client.go — send holds c.mu
+// ACROSS the socket write; waitComplete must take c.mu to deliver a timeout), so a
+// single write blocked on a half-open peer — notably the deadline-free background
+// test_connectivity Echo/GetInfo issued every ~5s — would freeze every concurrent
+// call's transmit AND its timeout delivery until the kernel TCP retransmit timeout
+// (~15+ min on Linux), including transfer-path calls holding transfer_mutex (PR #22
+// re-review O14). On expiry the write errors, the connection is poisoned, pending
+// calls fail, and Keep_Connectivity reconnects. A var so tests can shrink it.
+var walletDaemonWriteTimeout = 45 * time.Second
+
+// CallWithTimeout is Call with a hard per-call deadline: the vendored jrpc2 client
+// completes the pending call with the context error when the deadline passes, even if
+// the daemon never replies (client.go waitComplete). The deadline covers the
+// await-response phase; the transmit phase — including transmit stalls induced by a
+// CONCURRENT writer on the shared client, which also block this deadline's delivery —
+// is bounded separately by the per-write deadline on the connection
+// (walletDaemonWriteTimeout above), so one call is bounded by (concurrent writer's
+// write deadline) + (own write deadline) + (response deadline).
+func (cli *Client) CallWithTimeout(timeout time.Duration, method string, params interface{}, result interface{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return cli.RPC.CallResult(ctx, method, params, result)
+}
+
 // returns whether wallet was online some time ago
 func (w *Wallet_Memory) IsDaemonOnlineCached() bool {
 	return Connected
@@ -345,8 +381,12 @@ func (w *Wallet_Memory) NameToAddress(name string) (addr string, err error) {
 		return
 	}
 
+	// Deadline-bounded: TransferPayload0WithOptions resolves name destinations under
+	// transfer_mutex BEFORE ring assembly (even at ring 2, where the assembly loop never
+	// runs), so a deadline-free call here would park the build on a hung daemon with
+	// every ring-assembly bound bypassed (see walletDaemonCallTimeout).
 	var result rpc.NameToAddress_Result
-	if err = rpc_client.Call("DERO.NameToAddress", rpc.NameToAddress_Params{Name: name, TopoHeight: -1}, &result); err != nil {
+	if err = rpc_client.CallWithTimeout(walletDaemonCallTimeout, "DERO.NameToAddress", rpc.NameToAddress_Params{Name: name, TopoHeight: -1}, &result); err != nil {
 		return
 	}
 
@@ -404,7 +444,9 @@ func (w *Wallet_Memory) GetSelfEncryptedBalanceAtTopoHeight(scid crypto.Hash, to
 		}
 	}()
 
-	err = rpc_client.Call("DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: w.GetAddress().String(), TopoHeight: topoheight}, &r)
+	// deadline-bounded: called under transfer_mutex on the transfer path (see
+	// walletDaemonCallTimeout).
+	err = rpc_client.CallWithTimeout(walletDaemonCallTimeout, "DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: w.GetAddress().String(), TopoHeight: topoheight}, &r)
 	return
 }
 
@@ -435,8 +477,11 @@ func (w *Wallet_Memory) GetEncryptedBalanceAtTopoHeight(scid crypto.Hash, topohe
 	//var params rpc.GetEncryptedBalance_Params
 	var result rpc.GetEncryptedBalance_Result
 
-	// Issue a call with a response.
-	if err = rpc_client.Call("DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: accountaddr, TopoHeight: topoheight}, &result); err != nil {
+	// Issue a call with a response. Deadline-bounded: this is the per-member balance
+	// fetch and decoy registration probe of ring assembly, issued under transfer_mutex
+	// (see walletDaemonCallTimeout). A deadline error is a transport failure, not an
+	// unregistered verdict, so it classifies as "could not verify" on the probe path.
+	if err = rpc_client.CallWithTimeout(walletDaemonCallTimeout, "DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: accountaddr, TopoHeight: topoheight}, &result); err != nil {
 		logger.Error(err, "DERO.GetEncryptedBalance Call failed:")
 
 		if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(errormsg.ErrAccountUnregistered.Error())) && accountaddr == w.GetAddress().String() && scid.IsZero() {
@@ -546,8 +591,9 @@ func (w *Wallet_Memory) Random_ring_members(scid crypto.Hash) (alist []string) {
 
 	//fmt.Printf("getting ring members %s  %s\n",scid.String(), debug.Stack())
 
-	// Issue a call with a response.
-	if err := rpc_client.Call("DERO.GetRandomAddress", rpc.GetRandomAddress_Params{SCID: scid}, &result); err != nil {
+	// Issue a call with a response. Deadline-bounded: ring assembly calls this once per
+	// pass under transfer_mutex (see walletDaemonCallTimeout).
+	if err := rpc_client.CallWithTimeout(walletDaemonCallTimeout, "DERO.GetRandomAddress", rpc.GetRandomAddress_Params{SCID: scid}, &result); err != nil {
 		logger.V(1).Error(err, "DERO.GetRandomAddress Call failed:")
 		return
 	}

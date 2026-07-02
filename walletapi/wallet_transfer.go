@@ -19,6 +19,7 @@ package walletapi
 import (
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/deroproject/derohe/config"
 	"github.com/deroproject/derohe/cryptography/bn256"
@@ -84,9 +85,13 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 // recipientAddr is the transfer's recipient address string (any HRP/network/integrated
 // encoding); its pubkey seeds the distinctness set so an alt-encoding of the recipient is
 // rejected as a duplicate. Empty means "no recipient seed".
-func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr string, pref *RingPreference) (alist []string, err error) {
+//
+// curated reports how many validated preferred decoys lead alist, so the caller can
+// measure candidate scarcity on the random tail alone (the count varies per call in
+// non-Strict mode: a failed registration probe silently drops a decoy for that call).
+func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr string, pref *RingPreference) (alist []string, curated int, err error) {
 	if pref == nil {
-		return w.Random_ring_members(scid), nil
+		return w.Random_ring_members(scid), 0, nil
 	}
 
 	var zeroscid crypto.Hash
@@ -115,20 +120,20 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr st
 		addr, e := rpc.NewAddress(d)
 		if e != nil { // must be a parseable address
 			if pref.Strict {
-				return nil, fmt.Errorf("preferred decoy is not a valid address: %s", d)
+				return nil, 0, fmt.Errorf("preferred decoy is not a valid address: %s", d)
 			}
 			continue
 		}
 		key := pkKey(addr) // pubkey is the network-/proof-/integrated-agnostic identity
 		if key == self {   // curating your own address collapses your anonymity set
 			if pref.Strict {
-				return nil, fmt.Errorf("preferred decoy cannot be your own address")
+				return nil, 0, fmt.Errorf("preferred decoy cannot be your own address")
 			}
 			continue
 		}
 		if seen[key] { // distinctness (consensus rejects duplicate ring members)
 			if pref.Strict {
-				return nil, fmt.Errorf("duplicate preferred decoy: %s", d)
+				return nil, 0, fmt.Errorf("duplicate preferred decoy: %s", d)
 			}
 			continue
 		}
@@ -143,7 +148,7 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr st
 		// registration: probe the BASE balance tree, the tree consensus checks against.
 		if _, _, _, _, e := w.GetEncryptedBalanceAtTopoHeight(zeroscid, -1, base); e != nil {
 			if pref.Strict {
-				return nil, fmt.Errorf("preferred decoy is not registered: %s", d)
+				return nil, 0, fmt.Errorf("preferred decoy is not registered: %s", d)
 			}
 			continue
 		}
@@ -151,7 +156,112 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr st
 		alist = append(alist, base) // ring carries the canonical base form
 	}
 
-	return append(alist, w.Random_ring_members(scid)...), nil
+	curated = len(alist) // count captured before the random tail is appended
+	return append(alist, w.Random_ring_members(scid)...), curated, nil
+}
+
+// Ring-assembly termination bounds (review #1). A pass over the candidate list that adds
+// no new distinct candidate to the deduplicator is "barren": the daemon's sample was fully
+// saturated. Without bounds a candidate pool smaller than the ring spins forever holding
+// transfer_mutex: the per-member balance probe cannot error on a non-zero SCID
+// (unregistered accounts get synthesized zero balances with err=nil), success needs a full
+// ring, and the candidate stream stops yielding new members.
+//
+// Two recovery layers run BEFORE the exhaustion error:
+//
+//  1. Stall rescue: after ringStallRescueAfter consecutive barren passes the loop
+//     permanently switches to base-tree candidates for the remaining slots — the same
+//     fill the <=40 scarcity fast-path uses, just triggered by observed starvation
+//     instead of a size heuristic. This covers the band the heuristic cannot see: a
+//     token tree with more than 40 members but fewer than ringsize (the daemon's
+//     5-block recent-activity filter can also push a larger tree into this band).
+//  2. Barren backoff: consecutive barren passes sleep with exponential backoff (250ms
+//     doubling to a 4s cap). The sleeps that can actually occur before the cap fires
+//     (barren 1..maxBarrenRingPasses-1) total ~112s — longer than the daemon's
+//     recent-activity filter window (5 blocks × 18s = 90s,
+//     rpc_dero_getrandomaddress.go / config.BLOCK_TIME), so a BASE pool transiently
+//     thinned by the filter can roll past it before exhaustion is declared. The
+//     schedule sum is pinned against the filter window by Test_BarrenBackoff_Spans_Filter.
+//
+// The pool is declared exhausted only after maxBarrenRingPasses CONSECUTIVE barren passes
+// with the rescue already armed, or maxTotalRingPassesFactor × ringsize total passes
+// (bounding adversarial trickle progress: the deduplicator is monotone, so even a daemon
+// feeding one fresh member per pass terminates).
+//
+// Pass counts alone do not bound WALL CLOCK: barren_passes resets on any deduplicator
+// growth, so a daemon trickling one fresh member per ~31 passes could re-arm the full
+// backoff window once per trickle inside the total-pass cap (~32 windows at ring 128).
+// maxRingBuildStallBudget therefore caps the CUMULATIVE backoff sleep PER TRANSFER,
+// regardless of trickle pattern. It is scoped per transfer, not per build: barren/rescue
+// state resets per transfer, so each transfer owns a full consecutive-barren window
+// (~112s) and the honest filter-recovery path is never cut short — even when an earlier
+// transfer in the array already consumed its own window (a shared budget would convert
+// the second recovery into a false "stall budget exhausted" error). The resulting
+// mutex-held sleep bound is len(transfers) × the budget, and len(transfers) is itself
+// capped wallet-side at MaxTransfersPerBuild BEFORE any mutex-held RPC or sleep. That
+// cap is what makes the multiplier a constant: the consensus tx-size limit
+// (STARGATE_HE_MAX_TX_SIZE = 300KB) is enforced only at verification/broadcast — AFTER
+// the whole assembly loop has run — so it bounds what can broadcast, never how long
+// assembly holds the mutex. The wallet cap is a necessary condition of that limit
+// (every payload serializes to more than STARGATE_HE_MAX_TX_SIZE/MaxTransfersPerBuild
+// bytes even at the ring-2 minimum — statement ring keys + CT proof; pinned on a real
+// built transaction by Test_Ring2PayloadFloor_JustifiesTransferCap), so it can never
+// reject an array that could have broadcast. Exceeding the
+// budget means the daemon is starving assembly and the build errors. The remaining
+// hold term is RPC latency — bounded in COUNT by the pass caps and in TIME by the
+// per-call deadline on every daemon RPC the transfer path issues
+// (walletDaemonCallTimeout, daemon_communication.go): a daemon that accepts the
+// connection but never answers no longer parks the build inside a deadline-free
+// CallResult holding transfer_mutex forever; the first hung call errors the build at
+// the deadline. RPC_COUNT_BOUND covers the whole body, not just ring assembly:
+// per BUILD, ≤2 fee/SC-call random-member fetches (each may append one 0-amount
+// transfer, so the loops below run over an EFFECTIVE transfer count ≤ len(transfers)+1
+// — the appends are mutually exclusive: the SC-call append creates the base transfer
+// the fee append checks for); per EFFECTIVE transfer, 1 balance probe, ≤20
+// empty-destination resolver fetches, ≤1 NameToAddress resolution, then the
+// pass-capped assembly RPCs (≤8×ringsize member fetches + ≤maxPreferredDecoys
+// memoized probes + ringsize member-balance fetches). The full worst-case hold is
+// therefore (min(len(transfers), MaxTransfersPerBuild)+1) × (150s sleep +
+// RPC_COUNT_BOUND × per-RPC time bound) — an absolute constant, astronomical only
+// against a daemon stalling EVERY reply just under the deadline (visible, and strictly
+// narrower than the unbounded pre-fix hold), and ~one deadline for the common
+// hung-daemon case. The per-RPC time bound covers the transmit side too: every
+// websocket WRITE on the wallet's daemon client carries a write deadline
+// (rwc.NewWithWriteTimeout in Connect; walletDaemonWriteTimeout). The call-context
+// deadline alone cannot bound a blocked write — the vendored jrpc2 client serializes
+// send() and deadline delivery on one client-wide mutex, so one write blocked on a
+// half-open peer (including the deadline-free background test_connectivity Echo/GetInfo)
+// would otherwise freeze every concurrent call's transmit AND its timeout delivery for
+// the kernel TCP retransmit timeout (~15+ min), not 45s. With the write deadline the
+// blocked write errors and poisons the connection, so one transfer-path RPC is bounded
+// by (concurrent writer's write deadline) + (own write deadline) + (response deadline)
+// ≤ 3 × 45s.
+const maxBarrenRingPasses = 32
+const maxTotalRingPassesFactor = 8
+const ringStallRescueAfter = 2
+const maxRingBuildStallBudget = 150 * time.Second
+
+// MaxTransfersPerBuild caps the transfer array accepted by a single build, checked
+// before any mutex-held RPC or sleep (see the bounds comment above: it is what turns
+// the per-transfer hold bound into an absolute one). 256 is a NECESSARY condition of
+// the consensus 300KB tx-size limit: a single payload — statement ring keys, per-member
+// commitments and the CT proof — serializes to well over 300*1024/256 = 1200 bytes even
+// at ring 2 (Test_Ring2PayloadFloor_JustifiesTransferCap pins this on a real built tx),
+// so any array longer than 256 could never have broadcast anyway and the cap rejects no
+// previously-usable input. Exported: it is part of the build API contract.
+const MaxTransfersPerBuild = 256
+
+// barrenRingSleep is the backoff before retrying after the barren-th consecutive
+// fruitless pass: 250ms, 500ms, 1s, 2s, then 4s flat (see the bounds comment above).
+func barrenRingSleep(barren int) time.Duration {
+	d := 250 * time.Millisecond
+	for i := 1; i < barren && d < 4*time.Second; i++ {
+		d *= 2
+	}
+	if d > 4*time.Second {
+		d = 4 * time.Second
+	}
+	return d
 }
 
 // TransferPayload0WithOptions is the additive variant carrying opt-in transfer
@@ -166,6 +276,15 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 	//if len(transfers) == 0 {
 	//	return nil,  fmt.Error("transfers is nil, cannot send.")
 	//}
+
+	// request-size validation before ANY daemon RPC or sleep: assembly cost — and the
+	// transfer_mutex hold — scales linearly in the transfer count, and the consensus
+	// 300KB tx-size limit only fires at broadcast, after that cost is already paid.
+	// See MaxTransfersPerBuild.
+	if len(transfers) > MaxTransfersPerBuild {
+		err = fmt.Errorf("too many transfers in one build: %d (maximum %d; a transaction this large could not broadcast under the %d-byte consensus limit) — split the batch", len(transfers), MaxTransfersPerBuild, config.STARGATE_HE_MAX_TX_SIZE)
+		return
+	}
 
 	if ringsize == 0 {
 		ringsize = uint64(w.account.Ringsize) // use wallet ringsize, if ringsize not provided
@@ -449,23 +568,53 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 		deduplicator[receiver_without_payment_id.String()] = true
 		deduplicator[w.GetAddress().String()] = true
 
+		// Termination guarantee: deduplicator growth is monotone and bounded by the finite
+		// candidate universe (curated decoys + tree leaves), so requiring growth at least
+		// once every maxBarrenRingPasses passes bounds the loop; the absolute cap bounds
+		// even adversarial trickle progress. See the consts' comment (review #1).
+		barren_passes := 0
+		total_passes := 0
+		base_rescue := false // armed on stall or the <=40 fast path; sticky for the rest of this transfer
+		// per-TRANSFER stall budget, matching the per-transfer barren/rescue state above:
+		// caps this transfer's cumulative barren-backoff sleep under transfer_mutex while
+		// guaranteeing each transfer a full filter-recovery window (see the bounds comment
+		// on maxRingBuildStallBudget).
+		ring_stall_budget := maxRingBuildStallBudget
 		for ringsize != 2 {
 			// curated preferred decoys (if any) go first; random members top up. With no
-			// RingPreference this returns exactly Random_ring_members(transfers[t].SCID).
-			probable_members, cerr := w.curatedRingCandidates(transfers[t].SCID, receiver_without_payment_id.String(), opts.Ring)
-			if cerr != nil {
-				err = cerr
-				return
+			// RingPreference this returns exactly Random_ring_members(scid). base_rescue is
+			// sticky: once assembly has switched to base-tree fill, a per-pass SCID fetch
+			// would be discarded unread, so rescue passes fetch the base tree ONLY — one
+			// random-member RPC per pass, not two. Curated decoys still lead the base list
+			// (curatedRingCandidates prepends them regardless of tree).
+			var probable_members []string
+			if !base_rescue {
+				members, curated, cerr := w.curatedRingCandidates(transfers[t].SCID, receiver_without_payment_id.String(), opts.Ring)
+				if cerr != nil {
+					err = cerr
+					return
+				}
+				probable_members = members
+				// Scarcity is measured on the RANDOM TAIL alone — upstream's own measure (its
+				// list had no curated head). Counting curated decoys here lets them mask a
+				// scarce tree, the base-tree rescue never fires, and the loop starves (review #1).
+				// The <=40 size check is only the fast path: base_rescue also arms on OBSERVED
+				// starvation (consecutive barren passes) to catch trees the heuristic
+				// cannot — more than 40 members but fewer than the ring needs.
+				if len(probable_members)-curated <= 40 { // we do not have enough ring members for sure, extract ring members from base
+					base_rescue = true
+				}
 			}
-			if len(probable_members) <= 40 { // we do not have enough ring members for sure, extract ring members from base
+			if base_rescue {
 				var zeroscid crypto.Hash
-				base_members, berr := w.curatedRingCandidates(zeroscid, receiver_without_payment_id.String(), opts.Ring)
+				base_members, _, berr := w.curatedRingCandidates(zeroscid, receiver_without_payment_id.String(), opts.Ring)
 				if berr != nil {
 					err = berr
 					return
 				}
 				probable_members = base_members
 			}
+			seen_before := len(deduplicator)
 			for _, k := range probable_members {
 				if _, collision := deduplicator[k]; collision {
 					continue
@@ -495,6 +644,44 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 				}
 			}
 
+			total_passes++
+			if len(deduplicator) > seen_before {
+				barren_passes = 0
+			} else {
+				barren_passes++
+				if !base_rescue && barren_passes >= ringStallRescueAfter {
+					// The SCID tree stopped yielding new members with the ring unfilled:
+					// switch to base-tree fill (the same fill the <=40 fast path uses)
+					// and give the base pool its own full barren budget.
+					base_rescue = true
+					barren_passes = 0
+				}
+			}
+			if barren_passes >= maxBarrenRingPasses || total_passes >= maxTotalRingPassesFactor*int(ringsize) {
+				if len(probable_members) == 0 {
+					// Random_ring_members swallows RPC failures into an empty list — an
+					// empty final fetch means a degraded daemon, not a small pool.
+					err = fmt.Errorf("cannot assemble ring for scid %s: daemon returned no ring candidates after %d attempts — check the daemon connection", transfers[t].SCID, total_passes)
+				} else {
+					err = fmt.Errorf("cannot assemble ring for scid %s: candidate pool exhausted after %d passes without progress (have %d of %d members, %d distinct candidates seen) — retry later or lower the ringsize", transfers[t].SCID, barren_passes, len(ring_balances), ringsize, len(deduplicator)-2)
+				}
+				return
+			}
+			if barren_passes > 0 {
+				// exponential backoff so the full barren window outlasts the daemon's
+				// 5-block recent-activity filter (see the bounds comment on the consts).
+				// Every sleep draws on this transfer's stall budget: barren_passes resets on
+				// any progress, so without the budget a trickling daemon could re-arm the
+				// backoff window repeatedly and hold transfer_mutex for the product of the
+				// windows instead of one.
+				d := barrenRingSleep(barren_passes)
+				if d > ring_stall_budget {
+					err = fmt.Errorf("cannot assemble ring for scid %s: stall budget exhausted after %d passes (have %d of %d members, %d distinct candidates seen) — the daemon is starving ring assembly; retry later or lower the ringsize", transfers[t].SCID, total_passes, len(ring_balances), ringsize, len(deduplicator)-2)
+					return
+				}
+				ring_stall_budget -= d
+				time.Sleep(d)
+			}
 		}
 	ring_members_collected:
 
