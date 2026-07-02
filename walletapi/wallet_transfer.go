@@ -87,9 +87,39 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 // rejected as a duplicate. Empty means "no recipient seed".
 //
 // curated reports how many validated preferred decoys lead alist, so the caller can
-// measure candidate scarcity on the random tail alone (the count varies per call in
-// non-Strict mode: a failed registration probe silently drops a decoy for that call).
-func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr string, pref *RingPreference) (alist []string, curated int, err error) {
+// measure candidate scarcity on the random tail alone. The count is measured from the
+// validated list, not derived from len(PreferredDecoys): in non-Strict mode a decoy is
+// dropped when it is unparseable, the wallet's own address, a duplicate, or judged
+// unregistered by the daemon — EVERY drop, whatever the reason, is recorded in drops and
+// logged (a lenient build whose curation shrank must never look identical to one whose
+// curation fully applied; review #3 / re-review O7). A probe that FAILS — as opposed to
+// returning an unregistered verdict — errors in both modes; it never silently shrinks
+// the curation (review #3).
+//
+// verdicts, if non-nil, memoizes registration verdicts (key: canonical base address,
+// value: registered) across calls within ONE transfer build, so a pass costs O(1) probes
+// after the first instead of O(len(PreferredDecoys)) — the assembly loop may run up to
+// maxTotalRingPassesFactor×ringsize passes, and registration probes are sequential
+// RPCs issued under
+// transfer_mutex. Memoizing is sound within a build: registration is permanent, and an
+// unregistered verdict going stale for the few seconds of one build only means the decoy
+// is picked up on the NEXT send. Pass nil to force fresh probes.
+//
+// drops, if non-nil, accumulates lenient drops across calls within one build (key: the
+// supplied decoy string, value: the reason) — the caller derives its pre-signing
+// "reduced curation" summary from it, and it doubles as the once-per-build log
+// deduplicator (the assembly loop re-validates decoys every pass; only the first drop
+// of each decoy is logged). With drops == nil every drop is logged on every call.
+// Strict mode never records a drop: it hard-errors on the first bad decoy instead.
+//
+// slots is the ring's decoy capacity (ringsize-2: the sender and the recipient hold the
+// other two positions). Validation stops accepting decoys once slots are filled: the
+// assembly loop places the curated head in order and stops at a full ring, so a decoy
+// past the capacity would be validated (one RPC) and then silently never placed — a
+// curation shortfall with no signal (re-review O9). Overflow is a hard error in Strict
+// mode (also pre-checked by TransferPayload0WithOptions against the supplied count) and
+// a recorded, logged drop in lenient mode.
+func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr string, pref *RingPreference, slots int, verdicts map[string]bool, drops map[string]string) (alist []string, curated int, err error) {
 	if pref == nil {
 		return w.Random_ring_members(scid), 0, nil
 	}
@@ -116,12 +146,35 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr st
 		}
 	}
 
+	// recordDecoyDrop is the single funnel for LENIENT drops: every rejected decoy is
+	// logged and (when the caller keeps a drops record) accumulated for the pre-signing
+	// summary, whatever the rejection reason — wallet-side validation (parse/self/dup)
+	// and the daemon's unregistered verdict alike. A drop that only some reasons report
+	// recreates the silent-degradation bug for the unreported reasons (re-review O7).
+	recordDecoyDrop := func(d, reason string) {
+		if drops != nil {
+			if _, already := drops[d]; already {
+				return // logged on first sight; the loop re-validates every pass
+			}
+			drops[d] = reason
+		}
+		logger.V(1).Info("preferred decoy dropped", "decoy", d, "reason", reason)
+	}
+
 	for _, d := range pref.PreferredDecoys {
+		if len(alist) >= slots { // every decoy slot is spoken for: anything further cannot ride
+			if pref.Strict { // defense in depth: the caller pre-checks the supplied count
+				return nil, 0, fmt.Errorf("too many preferred decoys: only %d decoy slots at this ring size", slots)
+			}
+			recordDecoyDrop(d, fmt.Sprintf("no decoy slot left (this ring holds %d decoys)", slots))
+			continue
+		}
 		addr, e := rpc.NewAddress(d)
 		if e != nil { // must be a parseable address
 			if pref.Strict {
 				return nil, 0, fmt.Errorf("preferred decoy is not a valid address: %s", d)
 			}
+			recordDecoyDrop(d, "not a parseable address")
 			continue
 		}
 		key := pkKey(addr) // pubkey is the network-/proof-/integrated-agnostic identity
@@ -129,12 +182,14 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr st
 			if pref.Strict {
 				return nil, 0, fmt.Errorf("preferred decoy cannot be your own address")
 			}
+			recordDecoyDrop(d, "own address")
 			continue
 		}
 		if seen[key] { // distinctness (consensus rejects duplicate ring members)
 			if pref.Strict {
 				return nil, 0, fmt.Errorf("duplicate preferred decoy: %s", d)
 			}
+			recordDecoyDrop(d, "duplicate of the sender, recipient, or another decoy")
 			continue
 		}
 		// The ring carries a normal BASE address (Arguments cleared, Proof cleared, network
@@ -146,11 +201,41 @@ func (w *Wallet_Memory) curatedRingCandidates(scid crypto.Hash, recipientAddr st
 		canon.Mainnet = w.GetNetwork()
 		base := canon.String()
 		// registration: probe the BASE balance tree, the tree consensus checks against.
-		if _, _, _, _, e := w.GetEncryptedBalanceAtTopoHeight(zeroscid, -1, base); e != nil {
+		// The probe error is CLASSIFIED: only the daemon's explicit unregistered verdict is
+		// a judgment on the decoy (Strict: hard error; lenient: skip). Any other failure —
+		// offline, transport, daemon fault — is an unknown verdict and errors in BOTH modes:
+		// treating it as "invalid decoy" would let a transient blip silently strip every
+		// curated decoy and ship a fully random ring the user believes is curated.
+		if reg, cached := verdicts[base]; cached {
+			if !reg {
+				if pref.Strict {
+					return nil, 0, fmt.Errorf("preferred decoy is not registered: %s", d)
+				}
+				// recorded again because drops is keyed on the SUPPLIED string: the same
+				// unregistered pubkey under a second encoding shares the verdict memo but
+				// is a distinct supplied decoy the summary must count.
+				recordDecoyDrop(d, "daemon reports it unregistered")
+				continue
+			}
+		} else if _, _, _, _, e := w.GetEncryptedBalanceAtTopoHeight(zeroscid, -1, base); e != nil {
+			if !isUnregisteredError(e) {
+				return nil, 0, fmt.Errorf("could not verify preferred decoy %s: %s — retry the send", d, e)
+			}
+			if verdicts != nil {
+				verdicts[base] = false
+			}
 			if pref.Strict {
 				return nil, 0, fmt.Errorf("preferred decoy is not registered: %s", d)
 			}
+			// The unregistered verdict comes solely from the daemon — the wallet has no
+			// independent view of the tree — so a lenient drop must never be silent: a
+			// daemon falsely vetoing curated decoys would otherwise strip curation with
+			// zero signal. Recorded per decoy (logged once per build via drops) and
+			// summarized at default verbosity by the caller.
+			recordDecoyDrop(d, "daemon reports it unregistered")
 			continue
+		} else if verdicts != nil {
+			verdicts[base] = true
 		}
 		seen[key] = true
 		alist = append(alist, base) // ring carries the canonical base form
@@ -251,6 +336,13 @@ const maxRingBuildStallBudget = 150 * time.Second
 // previously-usable input. Exported: it is part of the build API contract.
 const MaxTransfersPerBuild = 256
 
+// maxPreferredDecoys bounds request size: preferred decoys are validated with sequential
+// registration RPCs under transfer_mutex, so the list length is a cost dimension the
+// caller controls. 256 = 2× the maximum legal ringsize — far above any usable curation
+// (decoy slots max out at ringsize-2 = 126) while cutting off degenerate inputs. Exceeding
+// it is request validation, not decoy quality, so it errors in BOTH modes.
+const maxPreferredDecoys = 256
+
 // barrenRingSleep is the backoff before retrying after the barren-th consecutive
 // fruitless pass: 250ms, 500ms, 1s, 2s, then 4s flat (see the bounds comment above).
 func barrenRingSleep(barren int) time.Duration {
@@ -305,6 +397,58 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 	// it is anonymized. ringsize is now the effective value (supplied or wallet default).
 	if opts.Attribution == AttributionAnonymous && ringsize < 3 {
 		err = fmt.Errorf("anonymous attribution requires ring size >= 4; ring size %d has no decoy slots", ringsize)
+		return
+	}
+
+	// request-size validation, both modes: see maxPreferredDecoys.
+	if opts.Ring != nil && len(opts.Ring.PreferredDecoys) > maxPreferredDecoys {
+		err = fmt.Errorf("too many preferred decoys: %d (maximum %d; a ring holds at most %d decoys)", len(opts.Ring.PreferredDecoys), maxPreferredDecoys, config.MAX_RINGSIZE-2)
+		return
+	}
+
+	// per-build registration-verdict memo for curated decoys (see curatedRingCandidates):
+	// caps validation cost at one probe per distinct decoy per build. decoy_drops is the
+	// per-build record of EVERY lenient drop with its reason — wallet-side rejections
+	// (unparseable/self/duplicate/no free slot) and daemon unregistered verdicts alike —
+	// feeding the pre-signing summary log after ring assembly (re-review O7). decoy_slots
+	// is the ring's decoy capacity: sender and recipient hold the other two positions.
+	var decoy_verdicts map[string]bool
+	var decoy_drops map[string]string
+	decoy_slots := int(ringsize) - 2
+	if opts.Ring != nil && len(opts.Ring.PreferredDecoys) > 0 {
+		decoy_verdicts = map[string]bool{}
+		decoy_drops = map[string]string{}
+	}
+
+	// fail closed on Strict decoy curation at ring 2: the assembly loop ("for ringsize != 2")
+	// never runs, so curatedRingCandidates — the only decoy validator — is never invoked and
+	// Strict's hard-error contract would be silently void (garbage decoys build and broadcast
+	// at ring 2 while the identical input at ring 4 hard-errors). Lenient curation stays
+	// permitted: its documented contract is silent drop, which a ring with no decoy slots
+	// satisfies — every decoy is recorded dropped so the pre-signing reduced-curation
+	// summary fires at default verbosity (re-review O9 closed the log-only gap).
+	if opts.Ring != nil && len(opts.Ring.PreferredDecoys) > 0 && ringsize < 3 {
+		if opts.Ring.Strict {
+			err = fmt.Errorf("strict decoy curation requires ring size >= 4; ring size %d has no decoy slots", ringsize)
+			return
+		}
+		for _, d := range opts.Ring.PreferredDecoys {
+			if _, already := decoy_drops[d]; !already {
+				decoy_drops[d] = "no decoy slot left (ring size 2 holds no decoys)"
+				logger.V(1).Info("preferred decoy dropped", "decoy", d, "reason", "ring size 2 holds no decoys")
+			}
+		}
+	}
+
+	// fail closed on Strict over-supply at ANY ring size: a ring places at most
+	// decoy_slots curated decoys; the surplus would be validated and then silently
+	// never placed — the caller asked for a curation the ring cannot physically honor
+	// (re-review O9). Checked on the SUPPLIED count, which for a Strict list that can
+	// build at all equals the validated count (duplicates/garbage already hard-error).
+	// Lenient over-supply proceeds: the surplus is dropped with a per-decoy record and
+	// the pre-signing reduced-curation summary.
+	if opts.Ring != nil && opts.Ring.Strict && ringsize >= 3 && len(opts.Ring.PreferredDecoys) > decoy_slots {
+		err = fmt.Errorf("too many preferred decoys for ring size %d: %d supplied but only %d decoy slots (sender and recipient hold the other two) — raise the ring size or trim the list", ringsize, len(opts.Ring.PreferredDecoys), decoy_slots)
 		return
 	}
 
@@ -589,7 +733,7 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 			// (curatedRingCandidates prepends them regardless of tree).
 			var probable_members []string
 			if !base_rescue {
-				members, curated, cerr := w.curatedRingCandidates(transfers[t].SCID, receiver_without_payment_id.String(), opts.Ring)
+				members, curated, cerr := w.curatedRingCandidates(transfers[t].SCID, receiver_without_payment_id.String(), opts.Ring, decoy_slots, decoy_verdicts, decoy_drops)
 				if cerr != nil {
 					err = cerr
 					return
@@ -607,7 +751,7 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 			}
 			if base_rescue {
 				var zeroscid crypto.Hash
-				base_members, _, berr := w.curatedRingCandidates(zeroscid, receiver_without_payment_id.String(), opts.Ring)
+				base_members, _, berr := w.curatedRingCandidates(zeroscid, receiver_without_payment_id.String(), opts.Ring, decoy_slots, decoy_verdicts, decoy_drops)
 				if berr != nil {
 					err = berr
 					return
@@ -696,6 +840,21 @@ func (w *Wallet_Memory) TransferPayload0WithOptions(transfers []rpc.Transfer, ri
 		}
 		max_bits_array = append(max_bits_array, max_bits)
 	}
+
+	// Lenient curation signal (Strict never reaches here with a drop — it errors): if ANY
+	// curated decoy was dropped — unparseable, self, duplicate, or daemon-judged
+	// unregistered — say so at default verbosity BEFORE the transaction is signed. A build
+	// whose curation was reduced must never look identical to one whose curation fully
+	// applied, whatever the drop reason: an all-dropped lenient list otherwise signs a
+	// fully random ring the caller believes curated (re-review O7).
+	if len(decoy_drops) > 0 {
+		reasons := map[string]int{}
+		for _, r := range decoy_drops {
+			reasons[r]++
+		}
+		logger.Info("some preferred decoys were dropped — ring built with reduced curation", "dropped", len(decoy_drops), "supplied", len(opts.Ring.PreferredDecoys), "reasons", fmt.Sprintf("%v", reasons))
+	}
+
 	max_bits := 0
 	for i := range max_bits_array {
 		if max_bits < max_bits_array[i] {

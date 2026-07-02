@@ -6,6 +6,7 @@ package walletapi
 
 import (
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,8 @@ func Test_CallWithTimeout_HungDaemon(t *testing.T) {
 	start = time.Now()
 	if _, _, _, _, berr := w.GetEncryptedBalanceAtTopoHeight(zeroscid, -1, w.GetAddress().String()); berr == nil {
 		t.Fatal("balance fetch against a hung daemon must error at the deadline")
+	} else if isUnregisteredError(berr) {
+		t.Fatalf("a deadline error must never read as an unregistered verdict, got: %v", berr)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("balance fetch not bounded by the deadline: took %s", elapsed)
@@ -109,5 +112,15 @@ func Test_CallWithTimeout_HungDaemon(t *testing.T) {
 		t.Fatalf("name resolution not bounded by the deadline: took %s", elapsed)
 	}
 
-	_ = wdecoy // the decoy-probe classification assertion arrives with review #3's classifier
+	// the decoy probe classifies the deadline as a transport failure in BOTH modes —
+	// hard error, never a silent lenient drop (finding #3 contract under O10's daemon).
+	start = time.Now()
+	if _, _, cerr := w.curatedRingCandidates(zeroscid, "", &RingPreference{
+		PreferredDecoys: []string{wdecoy.GetAddress().String()}}, 126, nil, nil); cerr == nil ||
+		!strings.Contains(cerr.Error(), "could not verify preferred decoy") {
+		t.Fatalf("hung probe must surface as 'could not verify', got: %v", cerr)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("decoy probe not bounded by the deadline: took %s", elapsed)
+	}
 }

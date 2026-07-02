@@ -63,16 +63,44 @@ type RingPreference struct {
 	// tree before use. Addresses the user controls must NOT be supplied here — curating
 	// your own addresses collapses your anonymity set.
 	//
+	// Slot capacity: a ring places at most ringsize-2 decoys (the sender and the
+	// recipient hold the other two positions). Supplying more than fits is a hard error
+	// in Strict mode ("too many preferred decoys for ring size …"); in lenient mode the
+	// surplus is dropped with a per-decoy log record and counted in the pre-signing
+	// "reduced curation" summary — never placed silently short.
+	//
 	// Ring composition on a scarce tree: when the transfer SCID's own tree cannot supply
-	// enough random members (its random tail is <= 40), assembly falls back to base-tree
-	// members exactly as it does without curation — for a non-zero SCID those fill token
-	// slots with synthesized zero balances. Curated decoys do not widen this behavior and
-	// do not count toward the scarcity measurement. If even the fallback cannot fill the
-	// ring, assembly fails with an explicit pool-exhaustion error instead of retrying
-	// forever (Strict only governs per-decoy validation, never composition).
+	// enough random members — its random tail is <= 40, OR assembly observes it has
+	// stalled (consecutive passes adding no new member) — assembly falls back to
+	// base-tree members exactly as it does without curation; for a non-zero SCID those
+	// fill token slots with synthesized zero balances. Curated decoys do not widen this
+	// behavior and do not count toward the scarcity measurement. If even the fallback
+	// cannot fill the ring within the documented pass/backoff bounds, assembly fails
+	// with an explicit pool-exhaustion error instead of retrying forever. Strict governs
+	// per-decoy validation, not composition — with two fail-closed exceptions: Strict
+	// curation at ring 2 is rejected outright (a ring with no decoy slots cannot honor
+	// the curation it was asked to validate), and Strict over-supply beyond ringsize-2
+	// slots is rejected outright (see slot capacity above). Lenient curation in both
+	// cases proceeds without the unplaceable decoys, each drop recorded and summarized.
+	//
+	// At most 256 entries (2× the maximum ringsize; a ring holds at most ringsize-2
+	// decoys). Exceeding the cap is a hard error in BOTH modes: each decoy costs a
+	// registration RPC under the wallet's transfer mutex, so list length is request
+	// validation, not decoy quality.
 	PreferredDecoys []string
 	// Strict: if true, a bad preferred decoy (unparseable / self / duplicate / unregistered)
 	// is a hard error. If false (default), it is skipped and random selection fills the slot.
+	// Either way, a registration probe that FAILS (daemon/transport fault — no verdict) is a
+	// hard error: a transient blip must not silently strip curation from the ring.
+	//
+	// TRUST NOTE — the "unregistered" verdict itself comes from the connected daemon and
+	// the wallet cannot check it independently. In lenient mode a malicious daemon can
+	// therefore veto curated decoys by answering unregistered; the wallet cannot prevent
+	// that, but it never lets it pass silently (per-decoy V(1) log plus a default-verbosity
+	// summary before signing). Callers who require the build to FAIL rather than degrade
+	// when the daemon disputes their decoys must set Strict — that is the fail-closed mode
+	// against a decoy-vetoing daemon. (A daemon that hostile already controls all RANDOM
+	// member selection and every balance the wallet sees; run your own node.)
 	Strict bool
 }
 

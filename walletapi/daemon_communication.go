@@ -450,6 +450,13 @@ func (w *Wallet_Memory) GetSelfEncryptedBalanceAtTopoHeight(scid crypto.Hash, to
 	return
 }
 
+// isUnregisteredError reports whether err carries the daemon's account-unregistered
+// verdict, as opposed to a transport/daemon failure where no verdict was reached.
+// Same detection idiom as the unregistered special-cases below.
+func isUnregisteredError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), strings.ToLower(errormsg.ErrAccountUnregistered.Error()))
+}
+
 // this is as simple as it gets
 // single threaded communication  gets whether the the key image is spent in pool or in blockchain
 // this can leak informtion which keyimage belongs to us

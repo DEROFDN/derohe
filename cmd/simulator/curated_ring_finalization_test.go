@@ -73,7 +73,11 @@ func Test_CuratedRing_Finalizes_A2(t *testing.T) {
 
 	const ring = 8 // ring > 4 so curated decoys fill real slots beyond sender+recipient
 	// We need genesis + sender + recipient + enough registered decoys to fill the ring.
-	const decoyCount = ring // a generous curation pool (more than ring-2 needed)
+	// Exactly ring-2: that is the ring's decoy capacity (sender and recipient hold the
+	// other two slots), and Strict over-supply is a hard error — this fixture originally
+	// supplied `ring` decoys and the surplus two were validated then silently never
+	// placed, the precise silent-truncation defect the slot-capacity guard now rejects.
+	const decoyCount = ring - 2
 
 	// Create wallets directly (the Test_Creation_TX pattern) — self-contained, no register_wallets
 	// (which spins up RPC/XSWD servers and touches the simulator's package logger).
