@@ -415,7 +415,11 @@ func (w *Wallet_Memory) SendTransaction(tx *transaction.Transaction) (err error)
 	params := rpc.SendRawTransaction_Params{Tx_as_hex: hex.EncodeToString(tx.Serialize())}
 	var result rpc.SendRawTransaction_Result
 
-	if err := rpc_client.Call("DERO.SendRawTransaction", params, &result); err != nil {
+	// deadline-bounded like the ring-assembly calls: SendTransaction holds no lock so a stall
+	// here won't freeze the wallet, but a half-open daemon would otherwise park this broadcast
+	// goroutine for the kernel TCP retransmit timeout — the per-write deadline can't bound it
+	// because the write already succeeded. See walletDaemonCallTimeout.
+	if err := rpc_client.CallWithTimeout(walletDaemonCallTimeout, "DERO.SendRawTransaction", params, &result); err != nil {
 		return err
 	}
 
