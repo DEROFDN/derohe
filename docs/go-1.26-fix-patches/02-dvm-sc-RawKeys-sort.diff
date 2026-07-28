@@ -1,0 +1,55 @@
+Patch 02: Sort `tx_store.RawKeys` in `dvm/sc.go`
+
+TARGET:    dvm/sc.go:279
+SITE:      #2 in audit doc §5
+RISK:      MAXIMUM — Final state commit in Execute_sc_function. Different
+           iteration order → different StoreSCValue call order → different
+           SC state trie root.
+
+MECHANISM: `tx_store.RawKeys` is a `map[string][]byte` populated during
+           DVM execution. After the SC returns successfully, the keys are
+           iterated and each value is committed via `StoreSCValue`. The
+           order in which values are written affects the graviton tree's
+           internal structure and thus its Merkle root.
+
+FIX:       Extract keys, sort lexicographically (string sort is built-in),
+           then iterate sorted slice.
+
+REQUIRED IMPORTS:
+    "sort"    — for sort.Strings
+
+DIFF (apply with `git apply`):
+
+--- a/dvm/sc.go
++++ b/dvm/sc.go
+@@ -276,7 +276,15 @@ func Execute_sc_function(...) (gascompute, gasstorage uint64, err error) {
+
+        if err == nil && result.Type == Uint64 && result.ValueUint64 == 0 { // confirm the changes
+-               for k, v := range tx_store.RawKeys {
++               // DETERMINISM FIX: sort keys to guarantee identical StoreSCValue call order
++               // across Go runtime versions (Swiss Tables in 1.24+).
++               keys := make([]string, 0, len(tx_store.RawKeys))
++               for k := range tx_store.RawKeys {
++                       keys = append(keys, k)
++               }
++               sort.Strings(keys)
++               for _, k := range keys {
++                       v := tx_store.RawKeys[k]
+                        StoreSCValue(data_tree, scid, []byte(k), v)
+
+                        //                      fmt.Printf("storing %x %x\n", k,v)
+
+VERIFICATION:
+    1. Apply patch
+    2. go build -mod=vendor ./...
+    3. Add new test in dvm/dvm_test.go:
+       - Create empty Tree_Wrapper
+       - Populate RawKeys with 100 random keys in random order
+       - Call StoreSCValue in sorted-key order
+       - Hash the result
+       - Repeat with different random insertion order
+       - Assert hashes are equal
+
+REFERENCES:
+    - docs/go-1.26-upgrade-audit.md §5 (Tier 1 site #2)
+    - docs/go-1.26-upgrade-audit.md §6.1 (Swiss Tables)

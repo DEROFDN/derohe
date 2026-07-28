@@ -29,7 +29,6 @@ import "sync/atomic"
 import "context"
 import "strings"
 import "runtime/debug"
-import "encoding/json"
 
 import "github.com/deroproject/derohe/config"
 import "github.com/deroproject/derohe/globals"
@@ -64,31 +63,36 @@ var logger logr.Logger
 
 var client_connections sync.Map
 
-var options = &jrpc2.ServerOptions{AllowPush: true, RPCLog: metrics_generator{}, DecodeContext: func(ctx context.Context, method string, param json.RawMessage) (context.Context, json.RawMessage, error) {
-	t := time.Now()
-	return context.WithValue(ctx, "start_time", &t), param, nil
-}}
+var options = &jrpc2.ServerOptions{
+	AllowPush: true,
+	RPCLog:    metrics_generator{},
+}
 
 type metrics_generator struct{}
 
 func (metrics_generator) LogRequest(ctx context.Context, req *jrpc2.Request) {}
+
+// timedHandler wraps a handler to record timing metrics
+func timedHandler(h jrpc2.Handler) jrpc2.Handler {
+	return func(ctx context.Context, req *jrpc2.Request) (any, error) {
+		start := time.Now()
+		result, err := h(ctx, req)
+		method := req.Method()
+		metrics.Set.GetOrCreateHistogram(method+"_duration_histogram_seconds").UpdateDuration(start)
+		metrics.Set.GetOrCreateCounter(method + "_total").Inc()
+		return result, err
+	}
+}
+
 func (metrics_generator) LogResponse(ctx context.Context, resp *jrpc2.Response) {
+	// Response logging only; timing is handled by timedHandler wrapper
 	defer globals.Recover(2)
-	req := jrpc2.InboundRequest(ctx) // we cannot do anything here
+	req := jrpc2.InboundRequest(ctx)
 	if req == nil {
 		return
 	}
-	start_time, ok := ctx.Value("start_time").(*time.Time)
-	if !ok {
-		return //panic("cannot find time in context")
-	}
-
-	method := req.Method()
-	metrics.Set.GetOrCreateHistogram(method + "_duration_histogram_seconds").UpdateDuration(*start_time)
-	metrics.Set.GetOrCreateCounter(method + "_total").Inc()
-
 	if output, err := resp.MarshalJSON(); err == nil {
-		metrics.Set.GetOrCreateCounter(method + "_total_out_bytes").Add(len(output))
+		metrics.Set.GetOrCreateCounter(req.Method() + "_total_out_bytes").Add(len(output))
 	}
 }
 
@@ -299,44 +303,44 @@ var bridge = jhttp.NewBridge(internal_server.Client)
 */
 var historical_apis = handler.Map{"getinfo": handler.New(GetInfo),
 	"get_info":                   handler.New(GetInfo), // this is just an alias to above
-	"getblock":                   handler.New(GetBlock),
-	"getblockheaderbytopoheight": handler.New(GetBlockHeaderByTopoHeight),
-	"getblockheaderbyhash":       handler.New(GetBlockHeaderByHash),
-	"gettxpool":                  handler.New(GetTxPool),
-	"getrandomaddress":           handler.New(GetRandomAddress),
-	"gettransactions":            handler.New(GetTransaction),
-	"sendrawtransaction":         handler.New(SendRawTransaction),
-	"submitblock":                handler.New(SubmitBlock),
-	"getheight":                  handler.New(GetHeight),
-	"getblockcount":              handler.New(GetBlockCount),
-	"getlastblockheader":         handler.New(GetLastBlockHeader),
-	"getblocktemplate":           handler.New(GetBlockTemplate),
-	"getencryptedbalance":        handler.New(GetEncryptedBalance),
-	"getsc":                      handler.New(GetSC),
-	"getgasestimate":             handler.New(GetGasEstimate),
-	"nametoaddress":              handler.New(NameToAddress)}
+	"getblock":                   timedHandler(handler.New(GetBlock)),
+	"getblockheaderbytopoheight": timedHandler(handler.New(GetBlockHeaderByTopoHeight)),
+	"getblockheaderbyhash":       timedHandler(handler.New(GetBlockHeaderByHash)),
+	"gettxpool":                  timedHandler(handler.New(GetTxPool)),
+	"getrandomaddress":           timedHandler(handler.New(GetRandomAddress)),
+	"gettransactions":            timedHandler(handler.New(GetTransaction)),
+	"sendrawtransaction":         timedHandler(handler.New(SendRawTransaction)),
+	"submitblock":                timedHandler(handler.New(SubmitBlock)),
+	"getheight":                  timedHandler(handler.New(GetHeight)),
+	"getblockcount":              timedHandler(handler.New(GetBlockCount)),
+	"getlastblockheader":         timedHandler(handler.New(GetLastBlockHeader)),
+	"getblocktemplate":           timedHandler(handler.New(GetBlockTemplate)),
+	"getencryptedbalance":        timedHandler(handler.New(GetEncryptedBalance)),
+	"getsc":                      timedHandler(handler.New(GetSC)),
+	"getgasestimate":             timedHandler(handler.New(GetGasEstimate)),
+	"nametoaddress":              timedHandler(handler.New(NameToAddress))}
 
 var servicemux = handler.ServiceMap{
 	"DERO": handler.Map{
 		"Echo":                       handler.New(Echo),
 		"Ping":                       handler.New(Ping),
 		"GetInfo":                    handler.New(GetInfo),
-		"GetBlock":                   handler.New(GetBlock),
-		"GetBlockHeaderByTopoHeight": handler.New(GetBlockHeaderByTopoHeight),
-		"GetBlockHeaderByHash":       handler.New(GetBlockHeaderByHash),
-		"GetTxPool":                  handler.New(GetTxPool),
-		"GetRandomAddress":           handler.New(GetRandomAddress),
-		"GetTransaction":             handler.New(GetTransaction),
-		"SendRawTransaction":         handler.New(SendRawTransaction),
-		"SubmitBlock":                handler.New(SubmitBlock),
-		"GetHeight":                  handler.New(GetHeight),
-		"GetBlockCount":              handler.New(GetBlockCount),
-		"GetLastBlockHeader":         handler.New(GetLastBlockHeader),
-		"GetBlockTemplate":           handler.New(GetBlockTemplate),
-		"GetEncryptedBalance":        handler.New(GetEncryptedBalance),
-		"GetSC":                      handler.New(GetSC),
-		"GetGasEstimate":             handler.New(GetGasEstimate),
-		"NameToAddress":              handler.New(NameToAddress),
+		"GetBlock":                   timedHandler(handler.New(GetBlock)),
+		"GetBlockHeaderByTopoHeight": timedHandler(handler.New(GetBlockHeaderByTopoHeight)),
+		"GetBlockHeaderByHash":       timedHandler(handler.New(GetBlockHeaderByHash)),
+		"GetTxPool":                  timedHandler(handler.New(GetTxPool)),
+		"GetRandomAddress":           timedHandler(handler.New(GetRandomAddress)),
+		"GetTransaction":             timedHandler(handler.New(GetTransaction)),
+		"SendRawTransaction":         timedHandler(handler.New(SendRawTransaction)),
+		"SubmitBlock":                timedHandler(handler.New(SubmitBlock)),
+		"GetHeight":                  timedHandler(handler.New(GetHeight)),
+		"GetBlockCount":              timedHandler(handler.New(GetBlockCount)),
+		"GetLastBlockHeader":         timedHandler(handler.New(GetLastBlockHeader)),
+		"GetBlockTemplate":           timedHandler(handler.New(GetBlockTemplate)),
+		"GetEncryptedBalance":        timedHandler(handler.New(GetEncryptedBalance)),
+		"GetSC":                      timedHandler(handler.New(GetSC)),
+		"GetGasEstimate":             timedHandler(handler.New(GetGasEstimate)),
+		"NameToAddress":              timedHandler(handler.New(NameToAddress)),
 	},
 	"DAEMON": handler.Map{
 		"Echo": handler.New(DAEMON_Echo),

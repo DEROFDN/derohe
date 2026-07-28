@@ -12,11 +12,13 @@ import (
 	"github.com/creachadair/jrpc2/channel"
 )
 
-// Service is the interface used by the Loop and Run functions to start up a
-// server. The methods of this interface allow the instance to manage its
-// state: The Assigner method is called before the server is started, and can
-// be used to initialize the service. The Finish method is called after the
-// server exits, and can be used to clean up.
+// Service is the interface used by the Loop function to start up a server.
+// The methods of this interface allow the instance to manage its state:
+//
+//   - The Assigner method is called before the server is started, to to
+//     initialize the service.
+//
+//   - The Finish method is called after the server exits to clean up.
 type Service interface {
 	// This method is called to create an assigner and initialize the service
 	// for use.  If it reports an error, the server is not started.
@@ -28,12 +30,12 @@ type Service interface {
 	Finish(jrpc2.Assigner, jrpc2.ServerStatus)
 }
 
-// Static wraps a jrpc2.Assigner to trivially implement the Service interface.
-func Static(m jrpc2.Assigner) func() Service { return static{methods: m}.New }
+// Static wraps a [jrpc2.Assigner] to trivially implement the Service interface.
+func Static(m jrpc2.Assigner) func() Service { return static{methods: m}.new }
 
 type static struct{ methods jrpc2.Assigner }
 
-func (s static) New() Service                            { return s }
+func (s static) new() Service                            { return s }
 func (s static) Assigner() (jrpc2.Assigner, error)       { return s.methods, nil }
 func (static) Finish(jrpc2.Assigner, jrpc2.ServerStatus) {}
 
@@ -45,8 +47,8 @@ type Accepter interface {
 	Accept(ctx context.Context) (channel.Channel, error)
 }
 
-// NetAccepter adapts a net.Listener to the Accepter interface, using f as the
-// channel framing.
+// NetAccepter adapts a [net.Listener] to the Accepter interface, using f as
+// the channel framing.
 func NetAccepter(lst net.Listener, f channel.Framing) Accepter {
 	return netAccepter{Listener: lst, newChannel: f}
 }
@@ -86,7 +88,7 @@ func (n netAccepter) Accept(ctx context.Context) (channel.Channel, error) {
 // have returned. In addition, if ctx ends, any active servers will be stopped.
 func Loop(ctx context.Context, lst Accepter, newService func() Service, opts *LoopOptions) error {
 	serverOpts := opts.serverOpts()
-	log := func(string, ...interface{}) {}
+	log := func(string, ...any) {}
 	if serverOpts != nil && serverOpts.Logger != nil {
 		log = serverOpts.Logger.Printf
 	}
@@ -103,10 +105,7 @@ func Loop(ctx context.Context, lst Accepter, newService func() Service, opts *Lo
 			wg.Wait()
 			return err
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			svc := newService()
 			assigner, err := svc.Assigner()
 			if err != nil {
@@ -125,7 +124,7 @@ func Loop(ctx context.Context, lst Accepter, newService func() Service, opts *Lo
 			if stat.Err != nil {
 				log("Server exit: %v", stat.Err)
 			}
-		}()
+		})
 	}
 }
 

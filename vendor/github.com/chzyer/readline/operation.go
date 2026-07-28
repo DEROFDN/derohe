@@ -19,14 +19,13 @@ func (*InterruptError) Error() string {
 }
 
 type Operation struct {
-	m          sync.Mutex
-	cfg        *Config
-	t          *Terminal
-	buf        *RuneBuffer
-	outchan    chan []rune
-	errchan    chan error
-	kickerchan chan struct{}
-	w          io.Writer
+	m       sync.Mutex
+	cfg     *Config
+	t       *Terminal
+	buf     *RuneBuffer
+	outchan chan []rune
+	errchan chan error
+	w       io.Writer
 
 	history *opHistory
 	*opSearch
@@ -70,11 +69,10 @@ func (w *wrapWriter) Write(b []byte) (int, error) {
 func NewOperation(t *Terminal, cfg *Config) *Operation {
 	width := cfg.FuncGetWidth()
 	op := &Operation{
-		t:          t,
-		buf:        NewRuneBuffer(t, cfg.Prompt, cfg, width),
-		outchan:    make(chan []rune),
-		errchan:    make(chan error, 1),
-		kickerchan: make(chan struct{}),
+		t:       t,
+		buf:     NewRuneBuffer(t, cfg.Prompt, cfg, width),
+		outchan: make(chan []rune),
+		errchan: make(chan error, 1),
 	}
 	op.w = op.buf.w
 	op.SetConfig(cfg)
@@ -399,8 +397,6 @@ func (o *Operation) Runes() ([]rune, error) {
 			return e.Line, ErrInterrupt
 		}
 		return nil, err
-	case <-o.kickerchan:
-		return nil, nil
 	}
 }
 
@@ -437,11 +433,6 @@ func (o *Operation) Slice() ([]byte, error) {
 		return nil, err
 	}
 	return []byte(string(r)), nil
-}
-
-// Allow another thread to take the priority of reading
-func (o *Operation) KickReader() {
-	o.kickerchan <- struct{}{}
 }
 
 func (o *Operation) Close() {

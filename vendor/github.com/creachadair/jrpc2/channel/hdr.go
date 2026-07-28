@@ -12,23 +12,23 @@ import (
 	"strings"
 )
 
-// StrictHeader defines a framing that transmits and receives messages using a
-// header prefix similar to HTTP, in which mimeType describes the content type.
+// StrictHeader defines a [Framing] that transmits and receives messages using
+// a header prefix similar to HTTP, in which mimeType describes the content type.
 //
 // Specifically, each message is sent in the format:
 //
-//    Content-Type: <mime-type>\r\n
-//    Content-Length: <nbytes>\r\n
-//    \r\n
-//    <payload>
+//	Content-Type: <mime-type>\r\n
+//	Content-Length: <nbytes>\r\n
+//	\r\n
+//	<payload>
 //
 // The length (nbytes) is encoded as decimal digits. For example, given a
 // mimeType value "application/json", the message "123\n" is transmitted as:
 //
-//    Content-Type: application/json\r\n
-//    Content-Length: 4\r\n
-//    \r\n
-//    123\n
+//	Content-Type: application/json\r\n
+//	Content-Length: 4\r\n
+//	\r\n
+//	123\n
 //
 // If mimeType == "", the Content-Type header is omitted when sending.
 //
@@ -54,7 +54,7 @@ func StrictHeader(mimeType string) Framing {
 	}
 }
 
-// A ContentTypeMismatchError is reported by the Recv method of a Header
+// A ContentTypeMismatchError is reported by the Recv method of a [Header]
 // framing when the content type of the message does not match the type
 // expected by the channel.
 type ContentTypeMismatchError struct {
@@ -90,10 +90,11 @@ func (h *hdr) Send(msg []byte) error {
 	return err
 }
 
-// Recv implements part of the Channel interface. If the content type of the
+// Recv implements part of the [Channel] interface. If the content type of the
 // received message does not match the expected value, Recv returns the decoded
-// message along with an error of concrete type *ContentTypeMismatchError.  The
-// caller may choose to ignore this error by testing explicitly for this type.
+// message along with an error of concrete type [*ContentTypeMismatchError].
+// The caller may choose to ignore this error by testing explicitly for this
+// type.
 func (h *hdr) Recv() ([]byte, error) {
 	var contentType, contentLength string
 	for {
@@ -149,10 +150,10 @@ func (h *hdr) Recv() ([]byte, error) {
 	return data[:size], contentErr
 }
 
-// Close implements part of the Channel interface.
+// Close implements part of the [Channel] interface.
 func (h *hdr) Close() error { return h.wc.Close() }
 
-// Header returns a framing that behaves as StrictHeader, but allows received
+// Header returns a framing that behaves as [StrictHeader], but allows received
 // messages to omit the Content-Type header without error. An error will still
 // be reported if a content-type is set but does not match.
 func Header(mimeType string) Framing {
@@ -174,8 +175,8 @@ func (o opthdr) Recv() ([]byte, error) {
 	return msg, err
 }
 
-// LSP is a header framing (see Header) that transmits and receives messages on
-// r and wc using the MIME type application/vscode-jsonrpc. This is the format
-// preferred by the Language Server Protocol (LSP), defined by
+// LSP is a header framing (see [Header]) that transmits and receives messages
+// on r and wc using the MIME type application/vscode-jsonrpc. This is the
+// format preferred by the Language Server Protocol (LSP), defined by
 // https://microsoft.github.io/language-server-protocol
 var LSP = Header("application/vscode-jsonrpc; charset=utf-8")

@@ -6,24 +6,43 @@ package cbor
 import (
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 )
 
+// field holds shared struct field metadata returned by getFields().
 type field struct {
 	name      string
-	nameAsInt int64 // used to decoder to match field name with CBOR int
-	cborName  []byte
+	nameAsInt int64 // used to match field name with CBOR int
 	idx       []int
-	typ       reflect.Type
-	ef        encodeFunc
-	ief       isEmptyFunc
-	typInfo   *typeInfo // used to decoder to reuse type info
-	tagged    bool      // used to choose dominant field (at the same level tagged fields dominate untagged fields)
-	omitEmpty bool      // used to skip empty field
-	keyAsInt  bool      // used to encode/decode field name as int
+	typ       reflect.Type // used during cache building only
+	keyAsInt  bool         // used to encode/decode field name as int
+	tagged    bool         // used to choose dominant field (at the same level tagged fields dominate untagged fields)
+	omitEmpty bool         // used to skip empty field
+	omitZero  bool         // used to skip zero field
 }
 
 type fields []*field
+
+// encodingField extends field with encoding-specific data.
+type encodingField struct {
+	field
+	cborName           []byte
+	cborNameByteString []byte // major type 2 name encoding if cborName has major type 3
+	ef                 encodeFunc
+	ief                isEmptyFunc
+	izf                isZeroFunc
+}
+
+type encodingFields []*encodingField
+
+// decodingField extends field with decoding-specific data.
+type decodingField struct {
+	field
+	typInfo *typeInfo // used by decoder to reuse type info
+}
+
+type decodingFields []*decodingField
 
 // indexFieldSorter sorts fields by field idx at each level, breaking ties with idx depth.
 type indexFieldSorter struct {
@@ -45,7 +64,7 @@ func (x *indexFieldSorter) Less(i, j int) bool {
 			return iIdx[k] < jIdx[k]
 		}
 	}
-	return len(iIdx) <= len(jIdx)
+	return len(iIdx) < len(jIdx)
 }
 
 // nameLevelAndTagFieldSorter sorts fields by field name, idx depth, and presence of tag.
@@ -65,6 +84,10 @@ func (x *nameLevelAndTagFieldSorter) Less(i, j int) bool {
 	fi, fj := x.fields[i], x.fields[j]
 	if fi.name != fj.name {
 		return fi.name < fj.name
+	}
+	// Fields with the same name but different keyAsInt are in separate namespaces.
+	if fi.keyAsInt != fj.keyAsInt {
+		return fi.keyAsInt
 	}
 	if len(fi.idx) != len(fj.idx) {
 		return len(fi.idx) < len(fj.idx)
@@ -114,22 +137,37 @@ func getFields(t reflect.Type) (flds fields, structOptions string) {
 		}
 	}
 
+	// Normalize keyasint field names to their canonical integer string form.
+	// This ensures that "01", "+1", and "1" are treated as the same key
+	// during deduplication.
+	for _, f := range flds {
+		if f.keyAsInt {
+			nameAsInt, err := strconv.Atoi(f.name)
+			if err != nil {
+				continue // Leave invalid names for callers to report.
+			}
+			f.nameAsInt = int64(nameAsInt)
+			f.name = strconv.Itoa(nameAsInt)
+		}
+	}
+
 	sort.Sort(&nameLevelAndTagFieldSorter{flds})
 
 	// Keep visible fields.
 	j := 0 // index of next unique field
 	for i := 0; i < len(flds); {
 		name := flds[i].name
+		keyAsInt := flds[i].keyAsInt
 		if i == len(flds)-1 || // last field
-			name != flds[i+1].name || // field i has unique field name
+			name != flds[i+1].name || flds[i+1].keyAsInt != keyAsInt || // field i has unique (name, keyAsInt)
 			len(flds[i].idx) < len(flds[i+1].idx) || // field i is at a less nested level than field i+1
 			(flds[i].tagged && !flds[i+1].tagged) { // field i is tagged while field i+1 is not
 			flds[j] = flds[i]
 			j++
 		}
 
-		// Skip fields with the same field name.
-		for i++; i < len(flds) && name == flds[i].name; i++ {
+		// Skip fields with the same (name, keyAsInt).
+		for i++; i < len(flds) && name == flds[i].name && keyAsInt == flds[i].keyAsInt; i++ { //nolint:revive
 		}
 	}
 	if j != len(flds) {
@@ -143,12 +181,20 @@ func getFields(t reflect.Type) (flds fields, structOptions string) {
 }
 
 // appendFields appends type t's exportable fields to flds and anonymous struct fields to nTypes .
-func appendFields(t reflect.Type, idx []int, flds fields, nTypes map[reflect.Type][][]int) (fields, map[reflect.Type][][]int) {
+func appendFields(
+	t reflect.Type,
+	idx []int,
+	flds fields,
+	nTypes map[reflect.Type][][]int,
+) (
+	_flds fields,
+	_nTypes map[reflect.Type][][]int,
+) {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 
 		ft := f.Type
-		for ft.Kind() == reflect.Ptr {
+		for ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
 		}
 
@@ -156,20 +202,22 @@ func appendFields(t reflect.Type, idx []int, flds fields, nTypes map[reflect.Typ
 			continue
 		}
 
+		cborTag := true
 		tag := f.Tag.Get("cbor")
 		if tag == "" {
 			tag = f.Tag.Get("json")
+			cborTag = false
 		}
 		if tag == "-" {
 			continue
 		}
 
-		tagged := len(tag) > 0
+		tagged := tag != ""
 
 		// Parse field tag options
 		var tagFieldName string
-		var omitempty, keyasint bool
-		for j := 0; len(tag) > 0; j++ {
+		var omitempty, omitzero, keyasint bool
+		for j := 0; tag != ""; j++ {
 			var token string
 			idx := strings.IndexByte(tag, ',')
 			if idx == -1 {
@@ -183,6 +231,10 @@ func appendFields(t reflect.Type, idx []int, flds fields, nTypes map[reflect.Typ
 				switch token {
 				case "omitempty":
 					omitempty = true
+				case "omitzero":
+					if cborTag || jsonStdlibSupportsOmitzero {
+						omitzero = true
+					}
 				case "keyasint":
 					keyasint = true
 				}
@@ -198,12 +250,13 @@ func appendFields(t reflect.Type, idx []int, flds fields, nTypes map[reflect.Typ
 		copy(fIdx, idx)
 		fIdx[len(fIdx)-1] = i
 
-		if !f.Anonymous || ft.Kind() != reflect.Struct || len(tagFieldName) > 0 {
+		if !f.Anonymous || ft.Kind() != reflect.Struct || tagFieldName != "" {
 			flds = append(flds, &field{
 				name:      fieldName,
 				idx:       fIdx,
 				typ:       f.Type,
 				omitEmpty: omitempty,
+				omitZero:  omitzero,
 				keyAsInt:  keyasint,
 				tagged:    tagged})
 		} else {
@@ -220,9 +273,8 @@ func appendFields(t reflect.Type, idx []int, flds fields, nTypes map[reflect.Typ
 // isFieldExportable returns true if f is an exportable (regular or anonymous) field or
 // a nonexportable anonymous field of struct type.
 // Nonexportable anonymous field of struct type can contain exportable fields.
-func isFieldExportable(f reflect.StructField, fk reflect.Kind) bool {
-	exportable := f.PkgPath == ""
-	return exportable || (f.Anonymous && fk == reflect.Struct)
+func isFieldExportable(f reflect.StructField, fk reflect.Kind) bool { //nolint:gocritic // ignore hugeParam
+	return f.IsExported() || (f.Anonymous && fk == reflect.Struct)
 }
 
 type embeddedFieldNullPtrFunc func(reflect.Value) (reflect.Value, error)
@@ -235,7 +287,7 @@ func getFieldValue(v reflect.Value, idx []int, f embeddedFieldNullPtrFunc) (fv r
 		fv = fv.Field(n)
 
 		if i < len(idx)-1 {
-			if fv.Kind() == reflect.Ptr && fv.Type().Elem().Kind() == reflect.Struct {
+			if fv.Kind() == reflect.Pointer && fv.Type().Elem().Kind() == reflect.Struct {
 				if fv.IsNil() {
 					// Null pointer to embedded struct field
 					fv, err = f(fv)

@@ -71,8 +71,8 @@ type RPCClient interface {
 	//
 	// Most convenient is to use the following form:
 	// CallBatch(RPCRequests{
-	//   NewRequest("myMethod1", 1, 2, 3),
-	//   NewRequest("myMethod2", "Test"),
+	//   Batch("myMethod1", 1, 2, 3),
+	//   Batch("myMethod2), "Test"),
 	// })
 	//
 	// You can create the []*RPCRequest array yourself, but it is not recommended and you should notice the following:
@@ -392,7 +392,7 @@ func (client *rpcClient) doCall(RPCRequest *RPCRequest) (*RPCResponse, error) {
 
 	httpRequest, err := client.newRequest(RPCRequest)
 	if err != nil {
-		return nil, fmt.Errorf("rpc call %v() on %v: %v", RPCRequest.Method, client.endpoint, err.Error())
+		return nil, fmt.Errorf("rpc call %v() on %v: %v", RPCRequest.Method, httpRequest.URL.String(), err.Error())
 	}
 	httpResponse, err := client.httpClient.Do(httpRequest)
 	if err != nil {
@@ -436,7 +436,7 @@ func (client *rpcClient) doCall(RPCRequest *RPCRequest) (*RPCResponse, error) {
 func (client *rpcClient) doBatchCall(rpcRequest []*RPCRequest) ([]*RPCResponse, error) {
 	httpRequest, err := client.newRequest(rpcRequest)
 	if err != nil {
-		return nil, fmt.Errorf("rpc batch call on %v: %v", client.endpoint, err.Error())
+		return nil, fmt.Errorf("rpc batch call on %v: %v", httpRequest.URL.String(), err.Error())
 	}
 	httpResponse, err := client.httpClient.Do(httpRequest)
 	if err != nil {
@@ -490,7 +490,7 @@ func (client *rpcClient) doBatchCall(rpcRequest []*RPCRequest) ([]*RPCResponse, 
 // request := NewRequest("myMethod", "Alex", 35, true)
 //
 // If you know what you are doing you can omit the Params() call but potentially create incorrect rpc requests:
-// request := &RPCRequest{
+//request := &RPCRequest{
 //   Method: "myMethod",
 //   Params: 2, <-- invalid since a single primitive value must be wrapped in an array --> no magic without Params()
 // }
@@ -498,7 +498,7 @@ func (client *rpcClient) doBatchCall(rpcRequest []*RPCRequest) ([]*RPCResponse, 
 // correct:
 // request := &RPCRequest{
 //   Method: "myMethod",
-//   Params: []int{2}, <-- valid since a single primitive value must be wrapped in an array
+//   Params: []int{2}, <-- invalid since a single primitive value must be wrapped in an array
 // }
 func Params(params ...interface{}) interface{} {
 	var finalParams interface{}

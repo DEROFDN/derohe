@@ -834,7 +834,7 @@ func ReadStringXSWDPrompt(l *readline.Instance, onClose chan bool, prompt string
 		prompt_mutex.Unlock()
 	}()
 
-	l.Operation.KickReader()
+	l.Close()
 
 	input := make(chan string)
 	validValue := false
@@ -857,7 +857,7 @@ func ReadStringXSWDPrompt(l *readline.Instance, onClose chan bool, prompt string
 
 		select {
 		case <-onClose:
-			l.Operation.KickReader()
+			l.Close()
 			return ""
 		case a = <-input:
 		}

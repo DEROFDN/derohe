@@ -5,16 +5,27 @@
 package proxy
 
 import (
+	"context"
 	"net"
-        "time"
 )
 
 type direct struct{}
 
-// Direct is a direct proxy: one that makes network connections directly.
+// Direct implements Dialer by making network connections directly using net.Dial or net.DialContext.
 var Direct = direct{}
 
+var (
+	_ Dialer        = Direct
+	_ ContextDialer = Direct
+)
+
+// Dial directly invokes net.Dial with the supplied parameters.
 func (direct) Dial(network, addr string) (net.Conn, error) {
-	//return net.Dial(network, addr)
-        return net.DialTimeout(network, addr, 5 * time.Second)
+	return net.Dial(network, addr)
+}
+
+// DialContext instantiates a net.Dialer and invokes its DialContext receiver with the supplied parameters.
+func (direct) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
 }

@@ -11,7 +11,6 @@ import (
 	"unicode"
 
 	"github.com/creachadair/jrpc2"
-	"github.com/creachadair/jrpc2/code"
 	"github.com/creachadair/jrpc2/handler"
 	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/rpc"
@@ -115,9 +114,9 @@ func (perm Permission) String() string {
 	return str
 }
 
-const PermissionDenied code.Code = -32043
-const PermissionAlwaysDenied code.Code = -32044
-const RateLimitExceeded code.Code = -32070
+const PermissionDenied jrpc2.Code = -32043
+const PermissionAlwaysDenied jrpc2.Code = -32044
+const RateLimitExceeded jrpc2.Code = -32070
 
 type messageRequest struct {
 	app     *ApplicationData
@@ -653,14 +652,14 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 				err := request.UnmarshalParams(&params)
 				if err != nil {
 					x.logger.V(1).Error(err, "Error while unmarshaling params")
-					return ResponseWithError(request, jrpc2.Errorf(code.InvalidParams, "Error while unmarshaling params: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InvalidParams, "Error while unmarshaling params: %q", err.Error()))
 				}
 
 				x.logger.V(2).Info("requesting daemon with", "method", request.Method(), "param", request.ParamString())
 				result, err := walletapi.GetRPCClient().RPC.Call(context.Background(), request.Method(), params)
 				if err != nil {
 					x.logger.V(1).Error(err, "Error on daemon call")
-					return ResponseWithError(request, jrpc2.Errorf(code.InvalidRequest, "Error on daemon call: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InvalidRequest, "Error on daemon call: %q", err.Error()))
 				}
 
 				// we set original ID
@@ -671,13 +670,13 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 				err = result.UnmarshalResult(&response)
 				if err != nil {
 					x.logger.V(1).Error(err, "Error on unmarshal daemon result")
-					return ResponseWithError(request, jrpc2.Errorf(code.InternalError, "Error on unmarshal daemon call: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InternalError, "Error on unmarshal daemon call: %q", err.Error()))
 				}
 
 				json, err := result.MarshalJSON()
 				if err != nil {
 					x.logger.V(1).Error(err, "Error on marshal daemon response")
-					return ResponseWithError(request, jrpc2.Errorf(code.InternalError, "Error on marshal daemon call: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InternalError, "Error on marshal daemon call: %q", err.Error()))
 				}
 
 				x.logger.V(2).Info("received response", "response", string(json))
@@ -685,12 +684,12 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 				return ResponseWithResult(request, response)
 			} else {
 				x.logger.V(1).Info("Daemon is offline", "endpoint", x.wallet.Daemon_Endpoint)
-				return ResponseWithError(request, jrpc2.Errorf(code.Cancelled, "daemon %s is offline", x.wallet.Daemon_Endpoint))
+				return ResponseWithError(request, jrpc2.Errorf(jrpc2.Cancelled, "daemon %s is offline", x.wallet.Daemon_Endpoint))
 			}
 		}
 
 		x.logger.Info("RPC Method not found", "method", methodName)
-		return ResponseWithError(request, jrpc2.Errorf(code.MethodNotFound, "method %q not found", methodName))
+		return ResponseWithError(request, jrpc2.Errorf(jrpc2.MethodNotFound, "method %q not found", methodName))
 	}
 
 	// only one request at a time
@@ -710,9 +709,9 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 		wallet_context := *x.context
 		wallet_context.Extra["app_data"] = app
 		ctx := context.WithValue(context.Background(), "wallet_context", &wallet_context)
-		response, err := handler.Handle(ctx, request)
+		response, err := handler(ctx, request)
 		if err != nil {
-			return ResponseWithError(request, jrpc2.Errorf(code.InternalError, "Error while handling request method %q: %v", methodName, err))
+			return ResponseWithError(request, jrpc2.Errorf(jrpc2.InternalError, "Error while handling request method %q: %v", methodName, err))
 		}
 
 		return ResponseWithResult(request, response)
@@ -790,20 +789,45 @@ func (x *XSWD) readMessageFromSession(conn *Connection, app *ApplicationData) {
 		}
 
 		// unmarshal the request
-		requests, err := jrpc2.ParseRequests(buff)
+requests, err := jrpc2.ParseRequests(buff)
 		if err != nil {
 			x.logger.Error(err, "Error while parsing request")
-			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(code.ParseError, "Error while parsing request"))); err != nil {
+			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(jrpc2.ParseError, "Error while parsing request"))); err != nil {
 				return
 			}
 			continue
 		}
 
-		request := requests[0]
+		if len(requests) == 0 {
+			continue
+		}
+
+		request := requests[0].ToRequest()
+		if request == nil {
+			// Check if this is an ApplicationData re-auth attempt (invalid JSON-RPC but valid JSON)
+			var appData ApplicationData
+			if json.Unmarshal(buff, &appData) == nil && appData.Id != "" {
+				// Re-auth attempt - reject if already registered
+				if x.HasApplicationId(appData.Id) {
+					x.logger.Info("App ID is already used", "ID", appData.Id)
+					conn.Send(AuthorizationResponse{
+						Message:  "App ID is already used",
+						Accepted: false,
+					})
+				} else {
+					// Not registered - treat as new registration attempt
+					x.registers <- messageRegistration{conn: conn, request: nil, app: &appData}
+				}
+			} else {
+				// Invalid JSON-RPC request - send ParseError
+				conn.Send(ResponseWithError(nil, jrpc2.Errorf(jrpc2.ParseError, "Invalid JSON-RPC request")))
+			}
+			continue
+		}
 		// We only support one request at a time for permission request
 		if len(requests) != 1 {
 			x.logger.V(2).Error(nil, "Invalid number of requests")
-			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(code.ParseError, "Batch requests are not supported"))); err != nil {
+			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(jrpc2.ParseError, "Batch requests are not supported"))); err != nil {
 				return
 			}
 			continue

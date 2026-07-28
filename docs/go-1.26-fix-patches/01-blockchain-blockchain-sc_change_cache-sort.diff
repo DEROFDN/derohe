@@ -1,0 +1,59 @@
+Patch 01: Sort `sc_change_cache` keys in `blockchain/blockchain.go`
+
+TARGET:    blockchain/blockchain.go:971
+SITE:      #1 in audit doc §5
+RISK:      MAXIMUM — `data_trees` slice order feeds into `graviton.Commit`,
+           which produces the block state root. Different iteration order
+           → different state root → hard fork.
+
+MECHANISM: Go 1.24+ uses Swiss Tables for map iteration. The seed and
+           bucket layout differ from Go 1.17. Two nodes on different Go
+           versions will iterate the same map in different orders, causing
+           `data_trees` to be appended in different orders, causing
+           `graviton.Commit(data_trees...)` to produce a different
+           committed_version hash.
+
+FIX:       Extract keys into a slice, sort lexicographically by raw bytes
+           (SCID is `[32]byte`), then iterate the sorted slice and look
+           up values by key.
+
+REQUIRED IMPORTS:
+    "bytes"   — for bytes.Compare
+    "sort"    — for sort.Slice
+
+DIFF (apply with `git apply`):
+
+--- a/blockchain/blockchain.go
++++ b/blockchain/blockchain.go
+@@ -968,7 +968,16 @@ func (chain *Blockchain) Process_Block_Internal(...) error {
+                        }
+                }
+
+-               // at this point, we must commit all the SCs, so entire tree hash is interlinked
+-               for scid, v := range sc_change_cache {
++               // at this point, we must commit all the SCs, so entire tree hash is interlinked
++               // DETERMINISM FIX: sort SCIDs lexicographically to guarantee identical
++               // `data_trees` slice order across Go runtime versions (Swiss Tables in 1.24+).
++               scids := make([]crypto.Hash, 0, len(sc_change_cache))
++               for scid := range sc_change_cache {
++                       scids = append(scids, scid)
++               }
++               sort.Slice(scids, func(i, j int) bool {
++                       return bytes.Compare(scids[i][:], scids[j][:]) < 0
++               })
++               for _, scid := range scids {
++                       v := sc_change_cache[scid]
+                        meta_bytes, err := sc_meta.Get(dvm.SC_Meta_Key(scid))
+                        if err != nil {
+                                panic(err)
+
+VERIFICATION:
+    1. Apply patch
+    2. go build -mod=vendor ./...
+    3. go test -mod=vendor ./blockchain/...  (existing tests must still pass)
+    4. Add new test: TestSCDeterministicCommit that iterates with multiple
+       random insertion orders and asserts identical meta.DataHash
+
+REFERENCES:
+    - docs/go-1.26-upgrade-audit.md §5 (Tier 1 site #1)
+    - docs/go-1.26-upgrade-audit.md §6.1 (Swiss Tables)

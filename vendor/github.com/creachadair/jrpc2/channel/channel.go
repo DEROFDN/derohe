@@ -1,19 +1,19 @@
 // Copyright (C) 2017 Michael J. Fromberger. All Rights Reserved.
 
-// Package channel defines a basic communications channel.
+// Package channel defines a communications channel.
 //
-// A Channel encodes/transmits and decodes/receives data records over an
-// unstructured stream, using a configurable framing discipline. This package
-// provides some basic framing implementations.
+// A [Channel] encodes/transmits and decodes/receives data records. The types
+// in this package support sending and receiving over an unstructured stream
+// using a configurable framing discipline.
 //
-// Channels
+// # Channels
 //
 // A Channel represents the ability to send and received framed records,
 // comprising the methods:
 //
-//     Send([]byte) error      // send a single complete record
-//     Recv() ([]byte, error)  // receive a single complete record
-//     Close() error           // close the channel
+//	Send([]byte) error      // send a single complete record
+//	Recv() ([]byte, error)  // receive a single complete record
+//	Close() error           // close the channel
 //
 // Each record passed to Send is available for Recv. Record contents are not
 // interpreted (except as noted below), and it is up to the implementation to
@@ -21,18 +21,17 @@
 // one sender and one receiver concurrently, but is not otherwise required to
 // be safe for concurrent use.
 //
-// Framing
+// # Framing
 //
-// A Framing function adapts a pair of io.Reader and io.WriteCloser to a
+// A [Framing] function adapts a pair of [io.Reader] and [io.WriteCloser] to a
 // Channel by imposing a particular message-framing discipline. This package
 // provides several framing implementations, for example:
 //
-//    ch := channel.LSP(r, wc)
+//	ch := channel.LSP(r, wc)
 //
 // creates a channel that reads from r and writes to wc using the Language
 // Server Protocol (LSP) framing defined by
 // https://microsoft.github.io/language-server-protocol/specification.
-//
 package channel
 
 import (
@@ -43,7 +42,7 @@ import (
 
 // A Channel represents the ability to transmit and receive data records.  A
 // channel does not interpret the contents of a record, but may add and remove
-// framing so that records can be embedded in higher-level protocols.
+// framing so that records can be embedded in lower-level protocols.
 //
 // One sender and one receiver may use a Channel concurrently, but the methods
 // of a Channel are not otherwise required to be safe for concurrent use.  The
@@ -58,8 +57,7 @@ type Channel interface {
 	// fetches a single complete record.
 	Recv() ([]byte, error)
 
-	// Close shuts down the channel, after which no further records may be
-	// sent or received.
+	// Close shuts down the channel, after which no further records may be sent.
 	Close() error
 }
 

@@ -286,12 +286,11 @@ func onWebsocket(w http.ResponseWriter, r *http.Request) {
 	addr_raw := addr.PublicKey.EncodeCompressed()
 
 	upgrader := newUpgrader()
-	conn, err := upgrader.Upgrade(w, r, nil)
+	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		//panic(err)
 		return
 	}
-	wsConn := conn.(*websocket.Conn)
 
 	session := user_session{address: *addr, address_sum: graviton.Sum(addr_raw)}
 	wsConn.SetSession(&session)
@@ -350,11 +349,12 @@ func Getwork_server() {
 		NPoller:                 runtime.NumCPU(),
 	})
 
-	svr.OnReadBufferAlloc(func(c *nbio.Conn) []byte {
-		return memPool.Get().([]byte)
+	svr.OnReadBufferAlloc(func(c *nbio.Conn) *[]byte {
+		buf := memPool.Get().([]byte)
+		return &buf
 	})
-	svr.OnReadBufferFree(func(c *nbio.Conn, b []byte) {
-		memPool.Put(b)
+	svr.OnReadBufferFree(func(c *nbio.Conn, pbuf *[]byte) {
+		memPool.Put(*pbuf)
 	})
 
 	//globals.Cron.AddFunc("@every 2s", SendJob) // if daemon restart automaticaly send job

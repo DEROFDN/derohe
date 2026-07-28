@@ -31,14 +31,14 @@ limitations under the License.
 // Package zapr defines an implementation of the github.com/go-logr/logr
 // interfaces built on top of Zap (go.uber.org/zap).
 //
-// Usage
+// # Usage
 //
 // A new logr.Logger can be constructed from an existing zap.Logger using
 // the NewLogger function:
 //
-//  log := zapr.NewLogger(someZapLogger)
+//	log := zapr.NewLogger(someZapLogger)
 //
-// Implementation Details
+// # Implementation Details
 //
 // For the most part, concepts in Zap correspond directly with those in
 // logr.
@@ -54,6 +54,8 @@ limitations under the License.
 package zapr
 
 import (
+	"fmt"
+
 	"github.com/go-logr/logr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -134,7 +136,7 @@ func (zl *zapLogger) handleFields(lvl int, args []interface{}, additional ...zap
 				continue
 			}
 			if zl.panicMessages {
-				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("strongly-typed Zap Field passed to logr", zap.Any("zap field", args[i]))
+				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("strongly-typed Zap Field passed to logr", zapIt("zap field", args[i]))
 			}
 			break
 		}
@@ -142,7 +144,7 @@ func (zl *zapLogger) handleFields(lvl int, args []interface{}, additional ...zap
 		// make sure this isn't a mismatched key
 		if i == len(args)-1 {
 			if zl.panicMessages {
-				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("odd number of arguments passed as key-value pairs for logging", zap.Any("ignored key", args[i]))
+				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("odd number of arguments passed as key-value pairs for logging", zapIt("ignored key", args[i]))
 			}
 			break
 		}
@@ -154,16 +156,26 @@ func (zl *zapLogger) handleFields(lvl int, args []interface{}, additional ...zap
 		if !isString {
 			// if the key isn't a string, DPanic and stop logging
 			if zl.panicMessages {
-				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("non-string key argument passed to logging, ignoring all later arguments", zap.Any("invalid key", key))
+				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("non-string key argument passed to logging, ignoring all later arguments", zapIt("invalid key", key))
 			}
 			break
 		}
 
-		fields = append(fields, zap.Any(keyStr, val))
+		fields = append(fields, zapIt(keyStr, val))
 		i += 2
 	}
 
 	return append(fields, additional...)
+}
+
+func invokeMarshaler(field string, m logr.Marshaler) (f string, ret interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			ret = fmt.Sprintf("PANIC=%s", r)
+			f = field + "Error"
+		}
+	}()
+	return field, m.MarshalLog()
 }
 
 func (zl *zapLogger) Init(ri logr.RuntimeInfo) {

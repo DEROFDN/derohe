@@ -67,7 +67,7 @@ func Unsubscribe(ctx context.Context, p Subscribe_Params) bool {
 }
 
 // SignData returned as DERO signed message
-func SignData(ctx context.Context, p []byte) (result Signature_Result, err error) {
+func SignData(ctx context.Context, p [1][]byte) (result Signature_Result, err error) {
 	w := rpcserver.FromContext(ctx)
 	xswd := w.Extra["xswd"].(*XSWD)
 	if xswd.wallet == nil {
@@ -75,13 +75,13 @@ func SignData(ctx context.Context, p []byte) (result Signature_Result, err error
 		return
 	}
 
-	result.Signature = xswd.wallet.SignData(p)
+	result.Signature = xswd.wallet.SignData(p[0])
 
 	return
 }
 
 // CheckSignature of DERO signed message
-func CheckSignature(ctx context.Context, p []byte) (result CheckSignature_Result, err error) {
+func CheckSignature(ctx context.Context, p [1][]byte) (result CheckSignature_Result, err error) {
 	w := rpcserver.FromContext(ctx)
 	xswd := w.Extra["xswd"].(*XSWD)
 	if xswd.wallet == nil {
@@ -91,7 +91,7 @@ func CheckSignature(ctx context.Context, p []byte) (result CheckSignature_Result
 
 	var address *rpc.Address
 	var messageBytes []byte
-	address, messageBytes, err = xswd.wallet.CheckSignature(p)
+	address, messageBytes, err = xswd.wallet.CheckSignature(p[0])
 	if err != nil {
 		return
 	}

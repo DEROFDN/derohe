@@ -1,0 +1,70 @@
+Patch 06: Sort `Entries` iterations in `blockchain/hardcoded_contracts.go`
+
+TARGET:    blockchain/hardcoded_contracts.go:86, 92
+SITE:      #8 in audit doc §5
+RISK:      HIGH — Genesis (height 0) and hardfork (HF1) smart contract
+           installation. These commits are deterministic across the
+           network because they are part of the chain's hardcoded
+           state, but a non-deterministic implementation means the
+           initial state hash diverges between Go versions.
+
+MECHANISM: `install_hardcoded_sc` populates `Entries` maps and then
+           commits them via `w_sc_*.Tree.Put(k, v)`. The order of
+           these Put calls affects the graviton tree's internal layout
+           and thus the SC's initial state hash.
+
+FIX:       Extract keys, sort lexicographically, iterate sorted slice.
+
+REQUIRED IMPORTS:
+    "sort"    — for sort.Strings
+
+DIFF (apply with `git apply`):
+
+--- a/blockchain/hardcoded_contracts.go
++++ b/blockchain/hardcoded_contracts.go
+@@ -83,12 +83,28 @@ func (chain *Blockchain) install_hardcoded_sc(cache map[crypto.Hash]*graviton.Tr
+        if _, ok := cache[scid]; !ok {
+                cache[scid] = w_sc_data_tree.Tree
+        }
+
+-       for k, v := range w_sc_data_tree.Entries { // commit entire data to tree
++       // DETERMINISM FIX: sort keys for consistent commit order across Go versions.
++       dkeys := make([]string, 0, len(w_sc_data_tree.Entries))
++       for k := range w_sc_data_tree.Entries {
++               dkeys = append(dkeys, k)
++       }
++       sort.Strings(dkeys)
++       for _, k := range dkeys {
++               v := w_sc_data_tree.Entries[k]
+                if err = w_sc_data_tree.Tree.Put([]byte(k), v); err != nil {
+                        return
+                }
+        }
+
+-       for k, v := range w_sc_tree.Entries {
++       // DETERMINISM FIX: sort keys for consistent commit order across Go versions.
++       tkeys := make([]string, 0, len(w_sc_tree.Entries))
++       for k := range w_sc_tree.Entries {
++               tkeys = append(tkeys, k)
++       }
++       sort.Strings(tkeys)
++       for _, k := range tkeys {
++               v := w_sc_tree.Entries[k]
+                if err = w_sc_tree.Tree.Put([]byte(k), v); err != nil {
+                        return
+                }
+
+VERIFICATION:
+    1. Apply patch
+    2. go build -mod=vendor ./...
+    3. Add test: TestHardcodedSCDeterministic that calls
+       install_hardcoded_sc with a fresh chain, then compares the
+       resulting SC state hash to a known-good vector.
+
+CRITICAL: This site runs at GENESIS (height 0). A divergence here
+           will split the chain at block 1. The differential test
+           (Phase 1) must explicitly verify this.
+
+REFERENCES:
+    - docs/go-1.26-upgrade-audit.md §5 (Tier 1 site #8)
+    - docs/go-1.26-upgrade-audit.md §6.1 (Swiss Tables)

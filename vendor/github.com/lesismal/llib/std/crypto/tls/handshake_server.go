@@ -104,7 +104,6 @@ func (c *Conn) serverHandshake() error {
 		}
 		return hs.handshake()
 	}
-
 	hs := c.hs
 	if hs == nil {
 		hs = &serverHandshakeState{
@@ -124,7 +123,6 @@ func (hs *serverHandshakeState) handshake() error {
 	if hs.err != nil && hs.err != errDataNotEnough {
 		return hs.err
 	}
-
 	if err := hs.processClientHello(); err != nil {
 		hs.err = err
 		return err
@@ -203,7 +201,6 @@ func (hs *serverHandshakeState) handshake() error {
 	atomic.StoreUint32(&c.handshakeStatus, 1)
 
 	c.handshakeStatusAsync = stateServerHandshakeHandshakeDone
-
 	return nil
 }
 
@@ -574,6 +571,31 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 	var msg interface{}
 	var pub crypto.PublicKey // public key for client auth, if any
 	var certReq *certificateRequestMsg
+	initCertReq := func() {
+		if certReq != nil {
+			return
+		}
+
+		// Request a client certificate
+		certReq = new(certificateRequestMsg)
+		certReq.certificateTypes = []byte{
+			byte(certTypeRSASign),
+			byte(certTypeECDSASign),
+		}
+		if c.vers >= VersionTLS12 {
+			certReq.hasSignatureAlgorithm = true
+			certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms
+		}
+
+		// An empty list of certificateAuthorities signals to
+		// the client that it may send any certificate in response
+		// to our request. When we know the CAs we trust, then
+		// we can send them down, so that the client can choose
+		// an appropriate certificate to give to us.
+		if c.config.ClientCAs != nil {
+			certReq.certificateAuthorities = c.config.ClientCAs.Subjects()
+		}
+	}
 	if c.handshakeStatusAsync < stateServerHandshakeDoFullHandshake2 {
 		c.handshakeStatusAsync = stateServerHandshakeDoFullHandshake2
 
@@ -626,27 +648,9 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 				return err
 			}
 		}
-
 		if c.config.ClientAuth >= RequestClientCert {
 			// Request a client certificate
-			certReq = new(certificateRequestMsg)
-			certReq.certificateTypes = []byte{
-				byte(certTypeRSASign),
-				byte(certTypeECDSASign),
-			}
-			if c.vers >= VersionTLS12 {
-				certReq.hasSignatureAlgorithm = true
-				certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms
-			}
-
-			// An empty list of certificateAuthorities signals to
-			// the client that it may send any certificate in response
-			// to our request. When we know the CAs we trust, then
-			// we can send them down, so that the client can choose
-			// an appropriate certificate to give to us.
-			if c.config.ClientCAs != nil {
-				certReq.certificateAuthorities = c.config.ClientCAs.Subjects()
-			}
+			initCertReq()
 			hs.finishedHash.Write(certReq.marshal())
 			if _, err := c.writeRecord(recordTypeHandshake, certReq.marshal()); err != nil {
 				return err
@@ -662,6 +666,7 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		if _, err := c.flush(); err != nil {
 			return err
 		}
+
 	}
 
 	if c.handshakeStatusAsync < stateServerHandshakeDoFullHandshake2ReadHandshake1 {
@@ -677,7 +682,6 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 
 	// If we requested a client certificate, then the client must send a
 	// certificate message, even if it's empty.
-
 	if c.config.ClientAuth >= RequestClientCert {
 		if c.handshakeStatusAsync < stateServerHandshakeDoFullHandshake2HandleCertificateMsg {
 			c.handshakeStatusAsync = stateServerHandshakeDoFullHandshake2HandleCertificateMsg
@@ -710,7 +714,6 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 
 		}
 	}
-
 	if c.handshakeStatusAsync < stateServerHandshakeDoFullHandshake2HandleVerifyConnection {
 		c.handshakeStatusAsync = stateServerHandshakeDoFullHandshake2HandleVerifyConnection
 		if c.config.VerifyConnection != nil {
@@ -740,7 +743,6 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		}
 
 	}
-
 	if c.handshakeStatusAsync >= stateServerHandshakeDoFullHandshake2ReadHandshake3 {
 		return nil
 	}
@@ -764,10 +766,10 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 			c.handshakeStatusAsync = stateServerHandshakeDoFullHandshake2ReadHandshake3
 			return unexpectedMessageError(certVerify, msg)
 		}
-
 		var sigType uint8
 		var sigHash crypto.Hash
 		if c.vers >= VersionTLS12 {
+			initCertReq()
 			if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, certReq.supportedSignatureAlgorithms) {
 				c.sendAlert(alertIllegalParameter)
 				c.handshakeStatusAsync = stateServerHandshakeDoFullHandshake2ReadHandshake3
@@ -788,6 +790,11 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		}
 
 		signed := hs.finishedHash.hashForClientCertificate(sigType, sigHash, hs.masterSecret)
+		if pub == nil {
+			if len(c.peerCertificates) > 0 {
+				pub = c.peerCertificates[0].PublicKey
+			}
+		}
 		if err := verifyHandshakeSignature(sigType, pub, sigHash, signed, certVerify.signature); err != nil {
 			c.sendAlert(alertDecryptError)
 			c.handshakeStatusAsync = stateServerHandshakeDoFullHandshake2ReadHandshake3

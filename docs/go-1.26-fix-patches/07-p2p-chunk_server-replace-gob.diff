@@ -1,0 +1,76 @@
+Patch 07: Replace `gob` encoder in `p2p/chunk_server.go` with custom encoding
+
+TARGET:    p2p/chunk_server.go:354
+SITE:      Wire protocol risk (audit doc §7)
+RISK:      MEDIUM — `gob` is Go-version-sensitive. Two nodes on different
+           Go runtimes may produce different byte streams for the same
+           in-memory `Chunks` struct, causing chunk-sync failures between
+           upgraded and non-upgraded nodes.
+
+MECHANISM: `gob` serializes Go structs reflectively. The encoder may
+           reorder struct fields, change type encoding for new types,
+           or alter interface dispatch. This is a wire-format break,
+           not a state-root divergence, but it will still cause
+           network segmentation if not fixed.
+
+FIX:       Replace `gob` with explicit length-prefixed binary encoding.
+           Use `binary.LittleEndian` for size headers (matches Go's
+           native endianness) and direct `[]byte` concatenation.
+
+REQUIRED IMPORTS (add):
+    "encoding/binary"
+
+DIFF (apply with `git apply`):
+
+--- a/p2p/chunk_server.go
++++ b/p2p/chunk_server.go
+@@ -350,8 +350,30 @@ func ... (chunk encoding) ... {
+-       if err = enc.Encode(shards); err != nil {
++       // DETERMINISM FIX + WIRE-STABILITY: replace gob with explicit
++       // length-prefixed binary encoding. gob is Go-version-sensitive;
++       // two nodes on different Go runtimes may produce different
++       // byte streams for the same struct, breaking chunk sync.
++       //
++       // Custom encoding format:
++       //   [4 bytes: count of shards] (little-endian uint32)
++       //   for each shard:
++       //     [4 bytes: length of shard data] (little-endian uint32)
++       //     [N bytes: shard data]
++       var buf []byte
++       var hdr [4]byte
++
++       // Encode count
++       binary.LittleEndian.PutUint32(hdr[:], uint32(len(shards)))
++       buf = append(buf, hdr[:]...)
++
++       // Encode each shard with length prefix
++       for _, shard := range shards {
++               binary.LittleEndian.PutUint32(hdr[:], uint32(len(shard)))
++               buf = append(buf, hdr[:]...)
++               buf = append(buf, shard...)
++       }
++       if _, err = w.Write(buf); err != nil {
+                return err
+        }
+
+NOTE: The exact signature of `w` and `shards` may differ. Review the
+      surrounding function to identify the writer type (e.g.
+      `bufio.Writer`, `*net.Conn`) and the shard type (e.g.
+      `[]byte`, `Chunk`).
+
+      The corresponding DECODER in the receiving function must also
+      be updated to read count + per-shard length-prefixed data.
+
+VERIFICATION:
+    1. Apply patch (encoder + decoder symmetrically)
+    2. go build -mod=vendor ./...
+    3. Add test: TestChunkWireFormatStable that encodes a known set
+       of shards and asserts the byte output matches a known vector
+       (golden file or hardcoded hex).
+    4. Add test: TestChunkEncodeDecodeRoundTrip that encodes then
+       decodes and asserts equality.
+
+REFERENCES:
+    - docs/go-1.26-upgrade-audit.md §7 (Wire Protocol Audit)
+    - docs/go-1.26-upgrade-audit.md §9 (P2P/TLS Compatibility)
+    - Go release notes: https://go.dev/doc/go1.24 (Swiss Tables, gob changes)

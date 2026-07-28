@@ -1,0 +1,89 @@
+Patch 03: Sort `Entries` iterations in `dvm/simulator.go`
+
+TARGET:    dvm/simulator.go:297, 313, 328
+SITE:      #3, #4, #5 in audit doc §5
+RISK:      MAXIMUM (313, 328) / HIGH (297) — These three call sites
+           iterate the same `Tree_Wrapper.Entries` map at different
+           lifecycle points: ErrorDeposit (297), ProcessExternal final
+           commit (313), and ProcessExternal SC metadata commit (328).
+
+MECHANISM: `w_sc_data_tree.Entries` and `w_sc_tree.Entries` are
+           `map[string][]byte` buffers. ProcessExternal (313, 328) is
+           the final commit point that writes all SC data to the persistent
+           graviton tree. The graviton tree's Merkle root depends on the
+           order in which keys are inserted.
+
+FIX:       Extract keys, sort lexicographically, then iterate sorted slice.
+           Apply the same pattern to all three sites.
+
+REQUIRED IMPORTS:
+    "sort"    — for sort.Strings
+
+DIFF (apply with `git apply`):
+
+--- a/dvm/simulator.go
++++ b/dvm/simulator.go
+@@ -294,7 +294,15 @@ func ErrorDeposit(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree,
+
+                stored_value, _ := LoadSCAssetValue(w_sc_data_tree, scid, scid_asset)
+                binary.BigEndian.PutUint64(new_value[:], stored_value+burnvalue)
+                StoreSCValue(w_sc_data_tree, scid, scid_asset[:], new_value[:])
+
+-               for k, v := range w_sc_data_tree.Entries { // commit incoming balances to tree
++               // DETERMINISM FIX: sort keys for consistent commit order.
++               ekeys := make([]string, 0, len(w_sc_data_tree.Entries))
++               for k := range w_sc_data_tree.Entries {
++                       ekeys = append(ekeys, k)
++               }
++               sort.Strings(ekeys)
++               for _, k := range ekeys {
++                       v := w_sc_data_tree.Entries[k]
++                       if err := w_sc_data_tree.Tree.Put([]byte(k), v); err != nil {
++                               panic(err)
++                       }
+                }
+
+                cache[scid] = w_sc_data_tree.Tree
+@@ -310,8 +318,15 @@ func ProcessExternal(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree
+        // anything below should never give error
+        cache[scid] = w_sc_data_tree.Tree
+
+-       for k, v := range w_sc_data_tree.Entries { // commit entire data to tree
++       // DETERMINISM FIX: sort keys for consistent commit order.
++       dkeys := make([]string, 0, len(w_sc_data_tree.Entries))
++       for k := range w_sc_data_tree.Entries {
++               dkeys = append(dkeys, k)
++       }
++       sort.Strings(dkeys)
++       for _, k := range dkeys {
++               v := w_sc_data_tree.Entries[k]
+                //if _, ok := globals.Arguments["--debug"]; ok && globals.Arguments["--debug"] != nil && chain.simulator {
+                //              logger.V(1).Info("Writing", "txid", txhash, "scid", scid, "key", fmt.Sprintf("%x", k), "value", fmt.Sprintf("%x", v))
+                //}
+@@ -325,7 +340,14 @@ func ProcessExternal(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree
+                }
+        }
+
+-       for k, v := range w_sc_tree.Entries {
++       // DETERMINISM FIX: sort keys for consistent commit order.
++       tkeys := make([]string, 0, len(w_sc_tree.Entries))
++       for k := range w_sc_tree.Entries {
++               tkeys = append(tkeys, k)
++       }
++       sort.Strings(tkeys)
++       for _, k := range tkeys {
++               v := w_sc_tree.Entries[k]
+                if err = w_sc_tree.Tree.Put([]byte(k), v); err != nil {
+                        panic(err)
+                }
+
+VERIFICATION:
+    1. Apply patch
+    2. go build -mod=vendor ./...
+    3. Add test: TestProcessExternalDeterministic that calls ProcessExternal
+       twice with the same data inserted in different orders, then asserts
+       the resulting graviton tree hashes are equal.
+
+REFERENCES:
+    - docs/go-1.26-upgrade-audit.md §5 (Tier 1 sites #3, #4, #5)
+    - docs/go-1.26-upgrade-audit.md §6.1 (Swiss Tables)

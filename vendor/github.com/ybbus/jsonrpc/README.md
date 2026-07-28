@@ -1,7 +1,6 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/ybbus/jsonrpc)](https://goreportcard.com/report/github.com/ybbus/jsonrpc)
 [![GoDoc](https://godoc.org/github.com/ybbus/jsonrpc?status.svg)](https://godoc.org/github.com/ybbus/jsonrpc)
 [![GitHub license](https://img.shields.io/github/license/mashape/apistatus.svg)]()
-[![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go)  
 
 # JSON-RPC 2.0 Client for golang
 A go implementation of an rpc client using json as data format over http.
@@ -17,7 +16,7 @@ Supports:
 ## Installation
 
 ```sh
-go get -u github.com/ybbus/jsonrpc/v2
+go get -u github.com/ybbus/jsonrpc
 ```
 
 ## Getting started
@@ -26,14 +25,10 @@ Then we want to save this person after we changed a property.
 (Error handling is omitted here)
 
 ```go
-package main
-
-import "github.com/ybbus/jsonrpc/v2"
-
 type Person struct {
-    ID   int    `json:"id"`
+    Id   int `json:"id"`
     Name string `json:"name"`
-    Age  int    `json:"age"`
+    Age  int `json:"age"`
 }
 
 func main() {
@@ -45,7 +40,6 @@ func main() {
     person.Age = 33
     rpcClient.Call("updatePerson", person)
 }
-
 ```
 
 ## In detail
@@ -61,7 +55,7 @@ This calls generate and send a valid rpc-json object. (see: http://www.jsonrpc.o
 func main() {
     rpcClient := jsonrpc.NewClient("http://my-rpc-service:8080/rpc")
     rpcClient.Call("getDate")
-    // generates body: {"method":"getDate","id":0,"jsonrpc":"2.0"}
+    // generates body: {"method":"getDate","id":1,"jsonrpc":"2.0"}
 }
 ```
 
@@ -71,7 +65,7 @@ Call a function with parameter:
 func main() {
     rpcClient := jsonrpc.NewClient("http://my-rpc-service:8080/rpc")
     rpcClient.Call("addNumbers", 1, 2)
-    // generates body: {"method":"addNumbers","params":[1,2],"id":0,"jsonrpc":"2.0"}
+    // generates body: {"method":"addNumbers","params":[1,2],"id":1,"jsonrpc":"2.0"}
 }
 ```
 
@@ -81,7 +75,7 @@ Call a function with arbitrary parameters:
 func main() {
     rpcClient := jsonrpc.NewClient("http://my-rpc-service:8080/rpc")
     rpcClient.Call("createPerson", "Alex", 33, "Germany")
-    // generates body: {"method":"createPerson","params":["Alex",33,"Germany"],"id":0,"jsonrpc":"2.0"}
+    // generates body: {"method":"createPerson","params":["Alex",33,"Germany"],"id":1,"jsonrpc":"2.0"}
 }
 ```
 
@@ -96,7 +90,7 @@ type Person struct {
 func main() {
     rpcClient := jsonrpc.NewClient("http://my-rpc-service:8080/rpc")
     rpcClient.Call("createPerson", &Person{"Alex", 33, "Germany"})
-    // generates body: {"jsonrpc":"2.0","method":"createPerson","params":{"name":"Alex","age":33,"country":"Germany"},"id":0}
+    // generates body: {"jsonrpc":"2.0","method":"createPerson","params":{"name":"Alex","age":33,"country":"Germany"},"id":1}
 }
 ```
 
@@ -111,7 +105,7 @@ type Person struct {
 func main() {
     rpcClient := jsonrpc.NewClient("http://my-rpc-service:8080/rpc")
     rpcClient.Call("createPersonsWithRole", &Person{"Alex", 33, "Germany"}, &Person{"Barney", 38, "Germany"}, []string{"Admin", "User"})
-    // generates body: {"jsonrpc":"2.0","method":"createPersonsWithRole","params":[{"name":"Alex","age":33,"country":"Germany"},{"name":"Barney","age":38,"country":"Germany"},["Admin","User"]],"id":0}
+    // generates body: {"jsonrpc":"2.0","method":"createPersonsWithRole","params":[{"name":"Alex","age":33,"country":"Germany"},{"name":"Barney","age":38,"country":"Germany"},["Admin","User"]],"id":1}
 }
 ```
 

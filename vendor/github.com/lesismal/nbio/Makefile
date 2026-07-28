@@ -12,17 +12,14 @@ lint:
 	golangci-lint run $(PACKAGE_DIRS)
 
 test:
-	$(GO) test $(PACKAGES)
+	$(GO) test -v $(PACKAGES)
 
 clean:
-	rm -f bin/autobahn_server
-	rm -fr autobahn/report/*
-	
-bin/reporter:
-	go build -o bin/reporter ./autobahn
+	rm -rf ./autobahn/bin/*
+	rm -rf ./autobahn/report/*
 
-autobahn: clean bin/reporter
-	./autobahn/script/test.sh --build fuzzingclient config/client_tests.json autobahn/server -o server.test 
-	bin/reporter $(PWD)/autobahn/report/output/index.json
+autobahn:
+	chmod +x ./autobahn/script/run.sh & ./autobahn/script/run.sh
 
 .PHONY: all vet lint test clean  autobahn
+

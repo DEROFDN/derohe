@@ -22,13 +22,15 @@ var (
 	}}
 )
 
+//go:norace
 func isValidCompressionLevel(level int) bool {
 	return minCompressionLevel <= level && level <= maxCompressionLevel
 }
 
+//go:norace
 func decompressReader(r io.Reader) io.ReadCloser {
 	fr, _ := flateReaderPool.Get().(io.ReadCloser)
-	fr.(flate.Resetter).Reset(r, nil)
+	_ = fr.(flate.Resetter).Reset(r, nil)
 	return &flateReadWrapper{fr}
 }
 
@@ -36,6 +38,7 @@ type flateReadWrapper struct {
 	fr io.ReadCloser
 }
 
+//go:norace
 func (r *flateReadWrapper) Read(p []byte) (int, error) {
 	if r.fr == nil {
 		return 0, io.ErrClosedPipe
@@ -45,11 +48,12 @@ func (r *flateReadWrapper) Read(p []byte) (int, error) {
 		// Preemptively place the reader back in the pool. This helps with
 		// scenarios where the application does not call NextReader() soon after
 		// this final read.
-		r.Close()
+		_ = r.Close()
 	}
 	return n, err
 }
 
+//go:norace
 func (r *flateReadWrapper) Close() error {
 	if r.fr == nil {
 		return io.ErrClosedPipe
@@ -60,6 +64,7 @@ func (r *flateReadWrapper) Close() error {
 	return err
 }
 
+//go:norace
 func compressWriter(w io.WriteCloser, level int) io.WriteCloser {
 	p := &flateWriterPools[level-minCompressionLevel]
 	fw, _ := p.Get().(*flate.Writer)
@@ -78,6 +83,7 @@ type truncWriter struct {
 	p [4]byte
 }
 
+//go:norace
 func (w *truncWriter) Write(p []byte) (int, error) {
 	n := 0
 
@@ -110,10 +116,12 @@ type flateWriteWrapper struct {
 	p  *sync.Pool
 }
 
+//go:norace
 func (w *flateWriteWrapper) Write(p []byte) (int, error) {
 	return w.fw.Write(p)
 }
 
+//go:norace
 func (w *flateWriteWrapper) Close() error {
 	err := w.fw.Flush()
 	w.p.Put(w.fw)

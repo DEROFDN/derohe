@@ -6,28 +6,26 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"strconv"
 	"sync"
 
 	"github.com/creachadair/jrpc2/channel"
-	"github.com/creachadair/jrpc2/code"
 )
 
 // A Client is a JSON-RPC 2.0 client. The client sends requests and receives
-// responses on a channel.Channel provided by the caller.
+// responses on a [channel.Channel] provided by the constructor.
 type Client struct {
 	done *sync.WaitGroup // done when the reader is finished at shutdown time
 
-	log   func(string, ...interface{}) // write debug logs here
-	enctx encoder
+	log   func(string, ...any) // write debug logs here
 	snote func(*jmessage)
 	scall func(context.Context, *jmessage) []byte
 	chook func(*Client, *Response)
+	shook func(*Client, error)
 
-	cbctx    context.Context // terminates when the client is closed
-	cbcancel func()          // cancels cbctx
+	cbctx    context.Context    // terminates when the client is closed
+	cbcancel context.CancelFunc // cancels cbctx
 
 	mu      sync.Mutex           // protects the fields below
 	ch      channel.Channel      // channel to the server
@@ -42,10 +40,10 @@ func NewClient(ch channel.Channel, opts *ClientOptions) *Client {
 	c := &Client{
 		done:  new(sync.WaitGroup),
 		log:   opts.logFunc(),
-		enctx: opts.encodeContext(),
 		snote: opts.handleNotification(),
 		scall: opts.handleCallback(),
 		chook: opts.handleCancel(),
+		shook: opts.handleStop(),
 
 		cbctx:    cbctx,
 		cbcancel: cbcancel,
@@ -63,12 +61,10 @@ func NewClient(ch channel.Channel, opts *ClientOptions) *Client {
 	// back to pending requests by their ID. Outbound requests do not queue;
 	// they are sent synchronously in the Send method.
 
-	c.done.Add(1)
-	go func() {
-		defer c.done.Done()
+	c.done.Go(func() {
 		for c.accept(ch) == nil {
 		}
-	}()
+	})
 	return c
 }
 
@@ -86,28 +82,26 @@ func (c *Client) accept(ch receiver) error {
 			c.log("Decoding error: %v", err)
 		}
 		c.mu.Lock()
-		c.stop(err)
+		defer c.stopLocked(err)()
 		c.mu.Unlock()
 		return err
 	}
 
 	c.log("Received %d responses", len(in))
-	c.done.Add(1)
-	go func() {
-		defer c.done.Done()
+	c.done.Go(func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		for _, rsp := range in {
-			c.deliver(rsp)
+			c.deliverLocked(rsp)
 		}
-	}()
+	})
 	return nil
 }
 
-// handleRequest handles a callback or notification from the server. The
+// handleRequestLocked handles a callback or notification from the server.  The
 // caller must hold c.mu. This function does not block for the handler.
 // Precondition: msg is a request or notification, not a response or error.
-func (c *Client) handleRequest(msg *jmessage) {
+func (c *Client) handleRequestLocked(msg *jmessage) {
 	if msg.isNotification() {
 		if c.snote == nil {
 			c.log("Discarding notification: %v", msg)
@@ -122,9 +116,7 @@ func (c *Client) handleRequest(msg *jmessage) {
 		// Run the callback handler in its own goroutine. The context will be
 		// cancelled automatically when the client is closed.
 		ctx := context.WithValue(c.cbctx, clientKey{}, c)
-		c.done.Add(1)
-		go func() {
-			defer c.done.Done()
+		c.done.Go(func() {
 			bits := c.scall(ctx, msg)
 
 			c.mu.Lock()
@@ -134,38 +126,34 @@ func (c *Client) handleRequest(msg *jmessage) {
 			} else if err := c.ch.Send(bits); err != nil {
 				c.log("Sending reply for callback %v failed: %v", msg, err)
 			}
-		}()
+		})
 	}
 }
 
-// For each response, find the request pending on its ID and deliver it.  The
-// caller must hold c.mu.  Unknown response IDs are logged and discarded.  As
-// we are under the lock, we do not wait for the pending receiver to pick up
-// the response; we just drop it in their channel.  The channel is buffered so
-// we don't need to rendezvous.
-func (c *Client) deliver(rsp *jmessage) {
+// deliverLocked delivers rsp to the request pending on its ID.  The caller
+// must hold c.mu.  Unknown response IDs are logged and discarded.  As we are
+// under the lock, we do not wait for the pending receiver to pick up the
+// response; we just drop it in their channel.  The channel is buffered so we
+// don't need to rendezvous.
+func (c *Client) deliverLocked(rsp *jmessage) {
 	if rsp.isRequestOrNotification() {
-		c.handleRequest(rsp)
+		c.handleRequestLocked(rsp)
 		return
 	}
 
 	id := string(fixID(rsp.ID))
-	if p := c.pending[id]; p == nil {
+	p := c.pending[id]
+	if p == nil {
 		c.log("Discarding response for unknown ID %q", id)
-	} else if !c.versionOK(rsp.V) {
-		delete(c.pending, id)
-		p.ch <- &jmessage{
-			ID: rsp.ID,
-			E: &Error{
-				Code:    code.InvalidRequest,
-				Message: fmt.Sprintf("incorrect version marker %q", rsp.V),
-			},
-		}
+		return
+	}
+	// Remove the pending request from the set and deliver its response.
+	// Determining whether it's an error is the caller's responsibility.
+	delete(c.pending, id)
+	if rsp.err != nil {
+		p.ch <- &jmessage{ID: rsp.ID, E: rsp.err}
 		c.log("Invalid response for ID %q", id)
 	} else {
-		// Remove the pending request from the set and deliver its response.
-		// Determining whether it's an error is the caller's responsibility.
-		delete(c.pending, id)
 		p.ch <- rsp
 		c.log("Completed request for ID %q", id)
 	}
@@ -173,7 +161,7 @@ func (c *Client) deliver(rsp *jmessage) {
 
 // req constructs a fresh request for the specified method and parameters.
 // This does not transmit the request to the server; use c.send to do so.
-func (c *Client) req(ctx context.Context, method string, params interface{}) (*jmessage, error) {
+func (c *Client) req(ctx context.Context, method string, params any) (*jmessage, error) {
 	bits, err := c.marshalParams(ctx, method, params)
 	if err != nil {
 		return nil, err
@@ -191,7 +179,7 @@ func (c *Client) req(ctx context.Context, method string, params interface{}) (*j
 }
 
 // note constructs a notification request for the specified method and parameters.
-func (c *Client) note(ctx context.Context, method string, params interface{}) (*jmessage, error) {
+func (c *Client) note(ctx context.Context, method string, params any) (*jmessage, error) {
 	bits, err := c.marshalParams(ctx, method, params)
 	if err != nil {
 		return nil, err
@@ -217,7 +205,7 @@ func (c *Client) send(ctx context.Context, reqs jmessages) ([]*Response, error) 
 	// on a closing path.
 	b, err := reqs.toJSON()
 	if err != nil {
-		return nil, Errorf(code.InternalError, "marshaling request failed: %v", err)
+		return nil, Errorf(InternalError, "marshaling request failed: %v", err)
 	}
 
 	var pends []*Response
@@ -235,7 +223,7 @@ func (c *Client) send(ctx context.Context, reqs jmessages) ([]*Response, error) 
 	if c.err != nil {
 		return nil, c.err
 	}
-	c.log("Outgoing batch: %s", string(b))
+	c.log("Outgoing batch: count=%d, bytes=%d", len(reqs), len(b))
 	if err := c.ch.Send(b); err != nil {
 		return nil, err
 	}
@@ -273,9 +261,9 @@ func (c *Client) waitComplete(pctx context.Context, id string, p *Response) {
 
 	var jerr *Error
 	if c.err != nil && !isUninteresting(c.err) {
-		jerr = &Error{Code: code.InternalError, Message: c.err.Error()}
+		jerr = &Error{Code: InternalError, Message: c.err.Error()}
 	} else if err != nil {
-		jerr = &Error{Code: code.FromError(err), Message: err.Error()}
+		jerr = &Error{Code: ErrorCode(err), Message: err.Error()}
 	}
 
 	p.ch <- &jmessage{
@@ -293,19 +281,18 @@ func (c *Client) waitComplete(pctx context.Context, id string, p *Response) {
 	}
 }
 
-// Call initiates a single request and blocks until the response returns.
-// A successful call reports a nil error and a non-nil response. Errors from
-// the server have concrete type *jrpc2.Error.
+// Call initiates a single request and blocks until the response returns or ctx
+// ends.  A successful call reports a nil error and a non-nil response. Errors
+// from the server have concrete type [*Error].
 //
-//    rsp, err := c.Call(ctx, method, params)
-//    if e, ok := err.(*jrpc2.Error); ok {
-//       log.Fatalf("Error from server: %v", err)
-//    } else if err != nil {
-//       log.Fatalf("Call failed: %v", err)
-//    }
-//    handleValidResponse(rsp)
-//
-func (c *Client) Call(ctx context.Context, method string, params interface{}) (*Response, error) {
+//	rsp, err := c.Call(ctx, method, params)
+//	if e, ok := err.(*jrpc2.Error); ok {
+//	   log.Fatalf("Error from server: %v", err)
+//	} else if err != nil {
+//	   log.Fatalf("Call failed: %v", err)
+//	}
+//	handleValidResponse(rsp)
+func (c *Client) Call(ctx context.Context, method string, params any) (*Response, error) {
 	req, err := c.req(ctx, method, params)
 	if err != nil {
 		return nil, err
@@ -324,7 +311,7 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (*
 // CallResult invokes Call with the given method and params. If it succeeds,
 // the result is decoded into result. This is a convenient shorthand for Call
 // followed by UnmarshalResult. It will panic if result == nil.
-func (c *Client) CallResult(ctx context.Context, method string, params, result interface{}) error {
+func (c *Client) CallResult(ctx context.Context, method string, params, result any) error {
 	rsp, err := c.Call(ctx, method, params)
 	if err != nil {
 		return err
@@ -333,8 +320,8 @@ func (c *Client) CallResult(ctx context.Context, method string, params, result i
 }
 
 // Batch initiates a batch of concurrent requests, and blocks until all the
-// responses return. The responses are returned in the same order as the
-// original specs, omitting notifications.
+// responses return or ctx ends. The responses are returned in the same order
+// as the original specs, omitting notifications.
 //
 // Any error reported by Batch represents an error in encoding or sending the
 // batch to the server. Errors reported by the server in response to requests
@@ -365,16 +352,16 @@ func (c *Client) Batch(ctx context.Context, specs []Spec) ([]*Response, error) {
 }
 
 // A Spec combines a method name and parameter value as part of a Batch.  If
-// the Notify field is true, the request is sent as a notification.
+// the Notify flag is true, the request is sent as a notification.
 type Spec struct {
 	Method string
-	Params interface{}
+	Params any
 	Notify bool
 }
 
 // Notify transmits a notification to the specified method and parameters.  It
-// blocks until the notification has been sent.
-func (c *Client) Notify(ctx context.Context, method string, params interface{}) error {
+// blocks until the notification has been sent or ctx ends.
+func (c *Client) Notify(ctx context.Context, method string, params any) error {
 	req, err := c.note(ctx, method, params)
 	if err != nil {
 		return err
@@ -386,7 +373,7 @@ func (c *Client) Notify(ctx context.Context, method string, params interface{}) 
 // Close shuts down the client, terminating any pending in-flight requests.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	c.stop(errClientStopped)
+	defer c.stopLocked(errClientStopped)()
 	c.mu.Unlock()
 	c.done.Wait()
 
@@ -397,16 +384,25 @@ func (c *Client) Close() error {
 	return c.err
 }
 
+// IsStopped reports whether the client has been stopped, either by a call to
+// its Close method or by a failure of the channel to the server.
+func (c *Client) IsStopped() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err != nil
+}
+
 func isUninteresting(err error) bool {
 	return err == io.EOF || channel.IsErrClosing(err) || err == errClientStopped
 }
 
-// stop closes down the reader for c and records err as its final state.  The
-// caller must hold c.mu. If multiple callers invoke stop, only the first will
-// successfully record its error status.
-func (c *Client) stop(err error) {
+// stopLocked closes down the reader for c and records err as its final state.
+// The caller must hold c.mu. If multiple callers invoke stop, only the first
+// will successfully record its error status.
+// The caller should defer a call to the returned function.
+func (c *Client) stopLocked(err error) func() {
 	if c.ch == nil {
-		return // nothing is running
+		return func() {} // nothing is running
 	}
 	c.ch.Close()
 
@@ -420,15 +416,14 @@ func (c *Client) stop(err error) {
 
 	c.err = err
 	c.ch = nil
+	return func() { c.shook(c, err) }
 }
-
-func (c *Client) versionOK(v string) bool { return v == Version }
 
 // marshalParams validates and marshals params to JSON for a request.  The
 // value of params must be either nil or encodable as a JSON object or array.
-func (c *Client) marshalParams(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+func (c *Client) marshalParams(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	if params == nil {
-		return c.enctx(ctx, method, nil) // no parameters, that is OK
+		return nil, nil // no parameters, that is OK
 	}
 	pbits, err := json.Marshal(params)
 	if err != nil {
@@ -437,13 +432,9 @@ func (c *Client) marshalParams(ctx context.Context, method string, params interf
 	if fb := firstByte(pbits); fb != '[' && fb != '{' && !isNull(pbits) {
 		// JSON-RPC requires that if parameters are provided at all, they are
 		// an array or an object.
-		return nil, &Error{Code: code.InvalidRequest, Message: "invalid parameters: array or object required"}
+		return nil, &Error{Code: InvalidRequest, Message: "invalid parameters: array or object required"}
 	}
-	bits, err := c.enctx(ctx, method, pbits)
-	if err != nil {
-		return nil, err
-	}
-	return bits, err
+	return pbits, nil
 }
 
 func newPending(ctx context.Context, id string) (context.Context, *Response) {

@@ -1,0 +1,54 @@
+Patch 04: Sort `total_per_asset` in `dvm/simulator.go`
+
+TARGET:    dvm/simulator.go:219
+SITE:      #6 in audit doc §5
+RISK:      HIGH — `SanityCheckExternalTransfers` accumulates transfer
+           totals per asset, then commits them to the SC balance tree.
+           Different iteration order over `total_per_asset` produces
+           different `StoreSCValue` call order.
+
+MECHANISM: `total_per_asset` is built fresh inside this function as
+           `map[crypto.Hash]uint64`. After accumulation, the map is
+           iterated to load current stored value, compute new value,
+           and write back. The order of writes affects the graviton
+           tree's Merkle root.
+
+FIX:       Extract keys (SCID = [32]byte), sort by raw bytes, iterate
+           sorted slice.
+
+REQUIRED IMPORTS:
+    "bytes"   — for bytes.Compare
+    "sort"    — for sort.Slice
+
+DIFF (apply with `git apply`):
+
+--- a/dvm/simulator.go
++++ b/dvm/simulator.go
+@@ -216,7 +216,16 @@ func SanityCheckExternalTransfers(w_sc_data_tree *Tree_Wrapper, balance_tree *
+
+        if err == nil {
+-               for asset, value := range total_per_asset {
++               // DETERMINISM FIX: sort assets to guarantee identical StoreSCValue order.
++               assets := make([]crypto.Hash, 0, len(total_per_asset))
++               for asset := range total_per_asset {
++                       assets = append(assets, asset)
++               }
++               sort.Slice(assets, func(i, j int) bool {
++                       return bytes.Compare(assets[i][:], assets[j][:]) < 0
++               })
++               for _, asset := range assets {
++                       value := total_per_asset[asset]
+                        stored_value, _ := LoadSCAssetValue(w_sc_data_tree, scid, asset)
+                        // an SCID can generate it's token infinitely
+                        if asset != scid && stored_value-value > stored_value {
+
+VERIFICATION:
+    1. Apply patch
+    2. go build -mod=vendor ./...
+    3. Add test: TestSanityCheckDeterministic that calls
+       SanityCheckExternalTransfers twice with same transfers in
+       different orders, asserts same final balance tree hash.
+
+REFERENCES:
+    - docs/go-1.26-upgrade-audit.md §5 (Tier 1 site #6)
+    - docs/go-1.26-upgrade-audit.md §6.1 (Swiss Tables)

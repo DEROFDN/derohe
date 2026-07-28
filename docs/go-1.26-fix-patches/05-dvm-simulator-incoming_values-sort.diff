@@ -1,0 +1,74 @@
+Patch 05: Sort `incoming_values` in `dvm/simulator.go`
+
+TARGET:    dvm/simulator.go:253, 288
+SITE:      #7 in audit doc §5
+RISK:      HIGH — `ErrorRevert` (253) and `ErrorDeposit` (288) iterate
+           `incoming_values` to perform balance updates during SC
+           error-rollback or deposit-recovery paths. Different order
+           → different balance tree writes.
+
+MECHANISM: `incoming_values` is `map[crypto.Hash]uint64` passed in as
+           a parameter. Each iteration step:
+           - looks up the current cached tree
+           - loads the existing balance
+           - updates it
+           - writes it back
+           The write order affects the final tree hash.
+
+FIX:       Extract keys (SCID = [32]byte), sort by raw bytes, iterate
+           sorted slice. Apply same pattern to both call sites.
+
+REQUIRED IMPORTS:
+    "bytes"   — for bytes.Compare
+    "sort"    — for sort.Slice
+
+DIFF (apply with `git apply`):
+
+--- a/dvm/simulator.go
++++ b/dvm/simulator.go
+@@ -250,7 +250,16 @@ func ErrorRevert(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree,
+ func ErrorRevert(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree, balance_tree *graviton.Tree, signer [33]byte, scid crypto.Hash, incoming_values map[crypto.Hash]uint64) {
+        var err error
+
+-       for scid_asset, burnvalue := range incoming_values {
++       // DETERMINISM FIX: sort assets to guarantee identical balance-update order.
++       assets := make([]crypto.Hash, 0, len(incoming_values))
++       for k := range incoming_values {
++               assets = append(assets, k)
++       }
++       sort.Slice(assets, func(i, j int) bool {
++               return bytes.Compare(assets[i][:], assets[j][:]) < 0
++       })
++       for _, scid_asset := range assets {
++               burnvalue := incoming_values[scid_asset]
+                var zeroscid crypto.Hash
+
+                var curbtree *graviton.Tree
+@@ -285,7 +294,16 @@ func ErrorDeposit(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree,
+ func ErrorDeposit(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree, balance_tree *graviton.Tree, signer [33]byte, scid crypto.Hash, incoming_values map[crypto.Hash]uint64) {
+
+-       for scid_asset, burnvalue := range incoming_values {
++       // DETERMINISM FIX: sort assets to guarantee identical balance-update order.
++       assets := make([]crypto.Hash, 0, len(incoming_values))
++       for k := range incoming_values {
++               assets = append(assets, k)
++       }
++       sort.Slice(assets, func(i, j int) bool {
++               return bytes.Compare(assets[i][:], assets[j][:]) < 0
++       })
++       for _, scid_asset := range assets {
++               burnvalue := incoming_values[scid_asset]
+                var new_value [8]byte
+
+                w_sc_data_tree := Wrapped_tree(cache, ss, scid) // get a new tree, discarding everything
+
+VERIFICATION:
+    1. Apply patch
+    2. go build -mod=vendor ./...
+    3. Add test: TestErrorRevertDepositDeterministic that calls
+       ErrorRevert and ErrorDeposit with the same inputs in different
+       orders, asserts same final state.
+
+REFERENCES:
+    - docs/go-1.26-upgrade-audit.md §5 (Tier 1 site #7)
+    - docs/go-1.26-upgrade-audit.md §6.1 (Swiss Tables)
