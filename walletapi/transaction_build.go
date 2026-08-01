@@ -21,6 +21,13 @@ type GenerateProofFunc func(scid crypto.Hash, scid_index int, s *crypto.Statemen
 
 var GenerateProoffuncptr GenerateProofFunc = crypto.GenerateProof
 
+// buildLegacyPayloadCBOR is a test-only seam. When true, BuildTransaction emits the
+// legacy type-0 (ENCRYPTED_DEFAULT_PAYLOAD_CBOR) payload encoding instead of V2, so the
+// legacy receive-decode branch in daemon_communication.go can be exercised end-to-end
+// with a consensus-valid proof (the payload bytes are bound into the txid the proof signs,
+// so the encoding cannot be swapped after the fact). Production always emits V2.
+var buildLegacyPayloadCBOR bool
+
 // generate proof  etc
 func (w *Wallet_Memory) BuildTransaction(transfers []rpc.Transfer, emap [][][]byte, rings [][]*bn256.G1, block_hash crypto.Hash, height uint64, scdata rpc.Arguments, roothash []byte, max_bits int, fees uint64) *transaction.Transaction {
 
@@ -172,27 +179,41 @@ rebuild_tx:
 					panic("currently we donot support ring size >= 512")
 				}
 
-				asset.RPCType = transaction.ENCRYPTED_DEFAULT_PAYLOAD_CBOR_V2
+				if buildLegacyPayloadCBOR {
+					// TEST-ONLY: legacy type-0 encoding. Shared secret matches the receiver's
+					// decode: GenerateSharedSecret(r, receiver_pub) == GenerateSharedSecret(receiver_secret, D=g^r).
+					// The leading byte is the (unauthenticated at ring>2) attribution slot index.
+					asset.RPCType = transaction.ENCRYPTED_DEFAULT_PAYLOAD_CBOR
 
-				data, _ := transfers[t].Payload_RPC.CheckPack(transaction.PAYLOAD0_LIMIT)
+					data, _ := transfers[t].Payload_RPC.CheckPack(transaction.PAYLOAD_LIMIT - 1)
+					shared_key := crypto.GenerateSharedSecret(r, publickeylist[i])
+					payload := append([]byte{byte(uint(witness_index[1]))}, data...)
+					crypto.EncryptDecryptUserData(crypto.Keccak256(shared_key[:], publickeylist[i].EncodeCompressed()), payload)
+					asset.RPCPayload = payload
+				} else {
 
-				ephemeral_key := crypto.ShakeXOF(publickeylist[i].String(), sender_secret.Bytes(), roothash[:])
-				ephemeral_seed := crypto.ShakeXOF(sender.String(), ephemeral_key[:], rinputs, publickeylist[i].EncodeCompressed())
-				ephemeral_scalar := new(big.Int).SetBytes(ephemeral_seed[:])
-				ephemeral_scalar = ephemeral_scalar.Mod(ephemeral_scalar, bn256.Order)
-				ephemeral_pub := crypto.GPoint.ScalarMult(crypto.GetBNRed(ephemeral_scalar))
+					asset.RPCType = transaction.ENCRYPTED_DEFAULT_PAYLOAD_CBOR_V2
 
-				shared_key := crypto.GenerateSharedSecret(ephemeral_scalar, publickeylist[i])
+					data, _ := transfers[t].Payload_RPC.CheckPack(transaction.PAYLOAD0_LIMIT)
 
-				payload := append([]byte{byte(uint(witness_index[1]))}, data...)
-				//fmt.Printf("buulding shared_key %x  index of receiver %d\n",shared_key,i)
-				//fmt.Printf("building plaintext payload %x\n",asset.RPCPayload)
+					ephemeral_key := crypto.ShakeXOF(publickeylist[i].String(), sender_secret.Bytes(), roothash[:])
+					ephemeral_seed := crypto.ShakeXOF(sender.String(), ephemeral_key[:], rinputs, publickeylist[i].EncodeCompressed())
+					ephemeral_scalar := new(big.Int).SetBytes(ephemeral_seed[:])
+					ephemeral_scalar = ephemeral_scalar.Mod(ephemeral_scalar, bn256.Order)
+					ephemeral_pub := crypto.GPoint.ScalarMult(crypto.GetBNRed(ephemeral_scalar))
 
-				//fmt.Printf("%d packed rpc payload %d %x\n ", t, len(data), data)
-				// make sure used data encryption is optional, just in case we would like to play together with ring members
-				// we intoduce an element to create dependency of input key, so receiver cannot prove otherwise
-				crypto.EncryptDecryptUserData(crypto.Keccak256(shared_key[:], publickeylist[i].EncodeCompressed()), payload)
-				asset.RPCPayload = append(ephemeral_pub.EncodeCompressed(), payload...)
+					shared_key := crypto.GenerateSharedSecret(ephemeral_scalar, publickeylist[i])
+
+					payload := append([]byte{byte(uint(witness_index[1]))}, data...)
+					//fmt.Printf("buulding shared_key %x  index of receiver %d\n",shared_key,i)
+					//fmt.Printf("building plaintext payload %x\n",asset.RPCPayload)
+
+					//fmt.Printf("%d packed rpc payload %d %x\n ", t, len(data), data)
+					// make sure used data encryption is optional, just in case we would like to play together with ring members
+					// we intoduce an element to create dependency of input key, so receiver cannot prove otherwise
+					crypto.EncryptDecryptUserData(crypto.Keccak256(shared_key[:], publickeylist[i].EncodeCompressed()), payload)
+					asset.RPCPayload = append(ephemeral_pub.EncodeCompressed(), payload...)
+				}
 
 				//fmt.Printf("building encrypted payload %x\n",asset.RPCPayload)
 
