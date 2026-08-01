@@ -59,3 +59,24 @@ func TestGate0_OutgoingSelfSendNotUnverified(t *testing.T) {
 		t.Fatalf("outgoing self-send sender not shown plainly; got:\n%s", out)
 	}
 }
+
+// TestGate0_PreUpgradeEntryServesPersistedSender pins the non-retroactive rule: an entry
+// persisted BEFORE the attribution upgrade deserializes SenderVerified=false with RingSize=0
+// (no real ring was decoded). Such an entry MUST render its persisted sender as-is, NOT be
+// relabeled "unknown (unverifiable, ring size 0)" — that would rewrite legitimate history and
+// disagree with GetTransfers, which serves these entries unchanged. Only a genuine post-upgrade
+// ring>2 decode (RingSize>0, unverified) is withheld. This test goes RED if the withhold render
+// fires for a RingSize==0 entry.
+func TestGate0_PreUpgradeEntryServesPersistedSender(t *testing.T) {
+	const sender = "deroLEGACYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXsender"
+
+	// Pre-upgrade received entry: guessed sender persisted, zero-value SenderVerified + RingSize.
+	out := Entry{PayloadType: 0, Incoming: true, Sender: sender, SenderVerified: false, RingSize: 0}.String()
+	if strings.Contains(out, "unverifiable") {
+		t.Fatalf("pre-upgrade entry (RingSize==0) wrongly withheld as unverifiable; legitimate "+
+			"history must be served as-is; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Sender: "+sender+"\n") {
+		t.Fatalf("pre-upgrade entry did not serve its persisted sender; got:\n%s", out)
+	}
+}

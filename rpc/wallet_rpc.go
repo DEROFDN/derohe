@@ -93,6 +93,7 @@ type Entry struct {
 	//   ring 2 / true  / addr      -> trusted counterparty; show it
 	//   self   / true  / own addr  -> our own send; show it
 	//   ring>2 / false / ""        -> withheld (scrubbed); show "unknown (unverifiable, ring N)"
+	//   ring 0 / false / addr      -> pre-upgrade entry; served as-is (non-retroactive), show it
 	//   any    / false / "" + PayloadError != "" -> decode failed (distinct from a scrub)
 	//
 	// NON-RETROACTIVE: the scrub runs at DECODE time only. Entries persisted before the
@@ -137,10 +138,18 @@ func (e Entry) String() string {
 			// attribution must read as a deliberate refusal, distinct from a decode failure.
 			if e.SenderVerified {
 				fmt.Fprintf(&b, "Sender: %s\n", e.Sender)
-			} else if e.PayloadError == "" {
-				fmt.Fprintf(&b, "Sender: unknown (unverifiable, ring size %d)\n", e.RingSize)
-			} else {
+			} else if e.PayloadError != "" {
 				fmt.Fprintf(&b, "Sender: unknown (payload decode failed)\n")
+			} else if e.RingSize == 0 {
+				// Pre-upgrade / unknown-ring entry: no real ring was decoded (RingSize==0),
+				// so the non-retroactive rule applies — serve the persisted sender as-is
+				// rather than relabel legitimate history as unverifiable. This matches
+				// GetTransfers, which serves these entries unchanged.
+				fmt.Fprintf(&b, "Sender: %s\n", e.Sender)
+			} else {
+				// Genuine post-upgrade ring>2 decode with an unverified (sender-chosen)
+				// index: the sender was scrubbed at decode; render the deliberate refusal.
+				fmt.Fprintf(&b, "Sender: unknown (unverifiable, ring size %d)\n", e.RingSize)
 			}
 			if e.PayloadError == "" {
 				args, _ := e.ProcessPayload()
