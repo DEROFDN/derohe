@@ -18,7 +18,12 @@ func (s *UDPSession) defaultReadLoop() {
 				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 				continue
 			}
-			s.packetInput(buf[:n])
+
+			if n >= s.headerSize+IKCP_OVERHEAD {
+				s.packetInput(buf[:n])
+			} else {
+				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			}
 		} else {
 			s.notifyReadError(errors.WithStack(err))
 			return
@@ -30,7 +35,11 @@ func (l *Listener) defaultMonitor() {
 	buf := make([]byte, mtuLimit)
 	for {
 		if n, from, err := l.conn.ReadFrom(buf); err == nil {
-			l.packetInput(buf[:n], from)
+			if n >= l.headerSize+IKCP_OVERHEAD {
+				l.packetInput(buf[:n], from)
+			} else {
+				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			}
 		} else {
 			l.notifyReadError(errors.WithStack(err))
 			return

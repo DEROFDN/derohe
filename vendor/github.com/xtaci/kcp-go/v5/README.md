@@ -1,10 +1,10 @@
 <img src="kcp-go.png" alt="kcp-go" height="50px" />
 
 
-[![GoDoc][1]][2] [![Powered][9]][10] [![MIT licensed][11]][12] [![Build Status][3]][4] [![Go Report Card][5]][6] [![Coverage Statusd][7]][8] [![Sourcegraph][13]][14]
+[![GoDoc][1]][2] [![Powered][9]][10] [![MIT licensed][11]][12] [![Build Status][3]][4] [![Go Report Card][5]][6] [![Coverage Statusd][7]][8]
 
 [1]: https://godoc.org/github.com/xtaci/kcp-go?status.svg
-[2]: https://pkg.go.dev/github.com/xtaci/kcp-go
+[2]: https://godoc.org/github.com/xtaci/kcp-go
 [3]: https://travis-ci.org/xtaci/kcp-go.svg?branch=master
 [4]: https://travis-ci.org/xtaci/kcp-go
 [5]: https://goreportcard.com/badge/github.com/xtaci/kcp-go
@@ -15,8 +15,6 @@
 [10]: https://github.com/skywind3000/kcp
 [11]: https://img.shields.io/badge/license-MIT-blue.svg
 [12]: LICENSE
-[13]: https://sourcegraph.com/github.com/xtaci/kcp-go/-/badge.svg
-[14]: https://sourcegraph.com/github.com/xtaci/kcp-go?badge
 
 ## Introduction
 
@@ -94,7 +92,6 @@ SIZE:
 
 ## Benchmark
 ```
-===
 Model Name:	MacBook Pro
 Model Identifier:	MacBookPro14,1
 Processor Name:	Intel Core i5
@@ -104,7 +101,6 @@ Total Number of Cores:	2
 L2 Cache (per Core):	256 KB
 L3 Cache:	4 MB
 Memory:	8 GB
-===
 
 $ go test -v -run=^$ -bench .
 beginning tests, encryption:salsa20, fec:10/3
@@ -146,8 +142,6 @@ ok  	github.com/xtaci/kcp-go	50.349s
 ```
 
 ```
-=== Raspberry Pi 4 ===
-
 ➜  kcp-go git:(master) cat /proc/cpuinfo
 processor	: 0
 model name	: ARMv7 Processor rev 3 (v7l)
@@ -159,43 +153,43 @@ CPU variant	: 0x0
 CPU part	: 0xd08
 CPU revision	: 3
 
-➜  kcp-go git:(master)  go test -run=^$ -bench .
-2020/01/05 19:25:13 beginning tests, encryption:salsa20, fec:10/3
+➜  kcp-go git:(master) go test -run=^$ -bench .
+2020/01/03 17:01:20 beginning tests, encryption:salsa20, fec:10/3
 goos: linux
 goarch: arm
 pkg: github.com/xtaci/kcp-go/v5
-BenchmarkSM4-4                     20000             86475 ns/op          34.69 MB/s           0 B/op          0 allocs/op
-BenchmarkAES128-4                  20000             62254 ns/op          48.19 MB/s           0 B/op          0 allocs/op
-BenchmarkAES192-4                  20000             71802 ns/op          41.78 MB/s           0 B/op          0 allocs/op
-BenchmarkAES256-4                  20000             80570 ns/op          37.23 MB/s           0 B/op          0 allocs/op
-BenchmarkTEA-4                     50000             37343 ns/op          80.34 MB/s           0 B/op          0 allocs/op
-BenchmarkXOR-4                    100000             22266 ns/op         134.73 MB/s           0 B/op          0 allocs/op
-BenchmarkBlowfish-4                20000             66123 ns/op          45.37 MB/s           0 B/op          0 allocs/op
-BenchmarkNone-4                  3000000               518 ns/op        5786.77 MB/s           0 B/op          0 allocs/op
-BenchmarkCast5-4                   20000             76705 ns/op          39.11 MB/s           0 B/op          0 allocs/op
-Benchmark3DES-4                     5000            418868 ns/op           7.16 MB/s           0 B/op          0 allocs/op
-BenchmarkTwofish-4                  5000            326896 ns/op           9.18 MB/s           0 B/op          0 allocs/op
-BenchmarkXTEA-4                    10000            114418 ns/op          26.22 MB/s           0 B/op          0 allocs/op
-BenchmarkSalsa20-4                 50000             36736 ns/op          81.66 MB/s           0 B/op          0 allocs/op
-BenchmarkCRC32-4                 1000000              1735 ns/op         589.98 MB/s
-BenchmarkCsprngSystem-4          1000000              2179 ns/op           7.34 MB/s
-BenchmarkCsprngMD5-4             2000000               811 ns/op          19.71 MB/s
-BenchmarkCsprngSHA1-4            2000000               862 ns/op          23.19 MB/s
-BenchmarkCsprngNonceMD5-4        2000000               878 ns/op          18.22 MB/s
-BenchmarkCsprngNonceAES128-4     5000000               326 ns/op          48.97 MB/s
-BenchmarkFECDecode-4              200000              9081 ns/op         165.16 MB/s         140 B/op          1 allocs/op
-BenchmarkFECEncode-4              100000             12039 ns/op         124.59 MB/s          11 B/op          0 allocs/op
-BenchmarkFlush-4                  100000             21704 ns/op               0 B/op          0 allocs/op
-BenchmarkEchoSpeed4K-4              2000            981182 ns/op           4.17 MB/s       12384 B/op        424 allocs/op
-BenchmarkEchoSpeed64K-4              100          10503324 ns/op           6.24 MB/s      123616 B/op       3779 allocs/op
-BenchmarkEchoSpeed512K-4              20         138633802 ns/op           3.78 MB/s     1606584 B/op      29233 allocs/op
-BenchmarkEchoSpeed1M-4                 5         372903568 ns/op           2.81 MB/s     4080504 B/op      63600 allocs/op
-BenchmarkSinkSpeed4K-4             10000            121239 ns/op          33.78 MB/s        4647 B/op        104 allocs/op
-BenchmarkSinkSpeed64K-4             1000           1587906 ns/op          41.27 MB/s       50914 B/op       1115 allocs/op
-BenchmarkSinkSpeed256K-4             100          16277830 ns/op          32.21 MB/s      453027 B/op       9296 allocs/op
-BenchmarkSinkSpeed1M-4               100          31040703 ns/op          33.78 MB/s      898097 B/op      18932 allocs/op
+BenchmarkSM4-4                 	   10000	    101301 ns/op	  29.61 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAES128-4              	   20000	     76029 ns/op	  39.46 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAES192-4              	   20000	     85112 ns/op	  35.25 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAES256-4              	   20000	     93801 ns/op	  31.98 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTEA-4                 	   50000	     37356 ns/op	  80.31 MB/s	       0 B/op	       0 allocs/op
+BenchmarkXOR-4                 	   50000	     32239 ns/op	  93.05 MB/s	       0 B/op	       0 allocs/op
+BenchmarkBlowfish-4            	   20000	     65694 ns/op	  45.67 MB/s	       0 B/op	       0 allocs/op
+BenchmarkNone-4                	 3000000	       521 ns/op	5757.08 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCast5-4               	   20000	     72051 ns/op	  41.64 MB/s	       0 B/op	       0 allocs/op
+Benchmark3DES-4                	    5000	    398459 ns/op	   7.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTwofish-4             	    5000	    340181 ns/op	   8.82 MB/s	       0 B/op	       0 allocs/op
+BenchmarkXTEA-4                	   10000	    120154 ns/op	  24.97 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSalsa20-4             	   50000	     37164 ns/op	  80.72 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCRC32-4               	 1000000	      1737 ns/op	 589.43 MB/s
+BenchmarkCsprngSystem-4        	 1000000	      2196 ns/op	   7.28 MB/s
+BenchmarkCsprngMD5-4           	 2000000	       818 ns/op	  19.54 MB/s
+BenchmarkCsprngSHA1-4          	 2000000	       860 ns/op	  23.25 MB/s
+BenchmarkCsprngNonceMD5-4      	 2000000	       891 ns/op	  17.94 MB/s
+BenchmarkCsprngNonceAES128-4   	 5000000	       326 ns/op	  49.05 MB/s
+BenchmarkFECDecode-4           	  200000	      9468 ns/op	 158.41 MB/s	     140 B/op	       1 allocs/op
+BenchmarkFECEncode-4           	  100000	     12719 ns/op	 117.93 MB/s	      11 B/op	       0 allocs/op
+BenchmarkFlush-4               	  100000	     22944 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEchoSpeed4K-4         	    2000	    992565 ns/op	   4.13 MB/s	   12427 B/op	     425 allocs/op
+BenchmarkEchoSpeed64K-4        	     100	  10391474 ns/op	   6.31 MB/s	  127564 B/op	    3835 allocs/op
+BenchmarkEchoSpeed512K-4       	      10	 110521615 ns/op	   4.74 MB/s	 1492676 B/op	   26791 allocs/op
+BenchmarkEchoSpeed1M-4         	       5	 298269651 ns/op	   3.52 MB/s	 3576904 B/op	   60760 allocs/op
+BenchmarkSinkSpeed4K-4         	   20000	     94335 ns/op	  43.42 MB/s	    3971 B/op	      99 allocs/op
+BenchmarkSinkSpeed64K-4        	    2000	   1164323 ns/op	  56.29 MB/s	   45752 B/op	    1080 allocs/op
+BenchmarkSinkSpeed256K-4       	     100	  12246407 ns/op	  42.81 MB/s	  449397 B/op	    9792 allocs/op
+BenchmarkSinkSpeed1M-4         	     100	  21781137 ns/op	  48.14 MB/s	  872098 B/op	   17772 allocs/op
 PASS
-ok      github.com/xtaci/kcp-go/v5      64.151s
+ok  	github.com/xtaci/kcp-go/v5	60.906s
 ```
 
 
@@ -277,3 +271,9 @@ A: Yes, for the safety of protocol, even if the upper layer has encrypted.
 1. https://github.com/xtaci/libkcp -- FEC enhanced KCP session library for iOS/Android in C++
 1. https://github.com/skywind3000/kcp -- A Fast and Reliable ARQ Protocol
 1. https://github.com/klauspost/reedsolomon -- Reed-Solomon Erasure Coding in Go
+
+## Consulting 
+
+WeChat(付费技术咨询)
+
+<img src="wechat_donate.jpg" alt="kcptun" height="120px" /> 

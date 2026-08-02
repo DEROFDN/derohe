@@ -39,6 +39,11 @@ func (s *UDPSession) readLoop() {
 					continue
 				}
 
+				if msg.N < s.headerSize+IKCP_OVERHEAD {
+					atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+					continue
+				}
+
 				// source and size has validated
 				s.packetInput(msg.Buffers[0][:msg.N])
 			}
@@ -90,7 +95,11 @@ func (l *Listener) monitor() {
 		if count, err := xconn.ReadBatch(msgs, 0); err == nil {
 			for i := 0; i < count; i++ {
 				msg := &msgs[i]
-				l.packetInput(msg.Buffers[0][:msg.N], msg.Addr)
+				if msg.N >= l.headerSize+IKCP_OVERHEAD {
+					l.packetInput(msg.Buffers[0][:msg.N], msg.Addr)
+				} else {
+					atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+				}
 			}
 		} else {
 			// compatibility issue:
