@@ -434,15 +434,19 @@ func (w *Wallet_Memory) Clean() {
 // conflating the cached balance snapshot with the live daemon tip.
 //
 // WalletHeight and WalletTopoHeight identify the snapshot represented by the
-// cached native balance. DaemonHeight and DaemonTopoHeight identify the latest
-// tip observed from the daemon. Synchronized is true only when the cached
-// native snapshot has reached the observed daemon height.
+// cached native balance. NativeSyncHeight and NativeSyncTopoHeight identify
+// the daemon tip successfully observed by this wallet's latest native refresh.
+// DaemonHeight and DaemonTopoHeight identify the latest tip observed from the
+// daemon. Synchronized is true only when this wallet has successfully refreshed
+// native state against that latest tip.
 type NativeSyncStatus struct {
-	WalletHeight     uint64 `json:"wallet_height"`
-	WalletTopoHeight int64  `json:"wallet_topoheight"`
-	DaemonHeight     uint64 `json:"daemon_height"`
-	DaemonTopoHeight int64  `json:"daemon_topoheight"`
-	Synchronized     bool   `json:"synchronized"`
+	WalletHeight         uint64 `json:"wallet_height"`
+	WalletTopoHeight     int64  `json:"wallet_topoheight"`
+	NativeSyncHeight     uint64 `json:"native_sync_height"`
+	NativeSyncTopoHeight int64  `json:"native_sync_topoheight"`
+	DaemonHeight         uint64 `json:"daemon_height"`
+	DaemonTopoHeight     int64  `json:"daemon_topoheight"`
+	Synchronized         bool   `json:"synchronized"`
 }
 
 // Get_Native_Sync_Status returns the native-balance synchronization state.
@@ -452,16 +456,21 @@ type NativeSyncStatus struct {
 func (w *Wallet_Memory) Get_Native_Sync_Status() NativeSyncStatus {
 	var scid crypto.Hash
 	balance := w.getEncryptedBalanceresult(scid)
-	daemonHeight, daemonTopoHeight := getDaemonHeights()
+	nativeSyncHeight, nativeSyncTopoHeight, nativeSyncGeneration := w.nativeSyncHeights()
+	daemonHeight, daemonTopoHeight, daemonGeneration, connected := daemonSyncState()
 
 	return NativeSyncStatus{
-		WalletHeight:     uint64(balance.Height),
-		WalletTopoHeight: balance.Topoheight,
-		DaemonHeight:     uint64(daemonHeight),
-		DaemonTopoHeight: daemonTopoHeight,
-		Synchronized: daemonHeight > 0 &&
-			balance.Height == daemonHeight &&
-			balance.Topoheight == daemonTopoHeight,
+		WalletHeight:         uint64(balance.Height),
+		WalletTopoHeight:     balance.Topoheight,
+		NativeSyncHeight:     uint64(nativeSyncHeight),
+		NativeSyncTopoHeight: nativeSyncTopoHeight,
+		DaemonHeight:         uint64(daemonHeight),
+		DaemonTopoHeight:     daemonTopoHeight, Synchronized: connected &&
+			daemonHeight > 0 &&
+			nativeSyncGeneration == daemonGeneration &&
+
+			nativeSyncHeight == daemonHeight &&
+			nativeSyncTopoHeight == daemonTopoHeight,
 	}
 }
 
@@ -504,6 +513,7 @@ func (w *Wallet_Memory) Get_Keys() _Keys {
 // by default a wallet opens in Offline Mode
 // however, if the wallet is in online mode, it can be made offline instantly using this
 func (w *Wallet_Memory) SetOfflineMode() bool {
+	w.markNativeSync(0, 0)
 	w.sync_loop_mu.Lock()
 	defer w.sync_loop_mu.Unlock()
 
@@ -577,6 +587,7 @@ func (w *Wallet_Memory) SetOnlineMode() bool {
 		return true
 	}
 	w.wallet_online_mode = true
+	w.markNativeSync(0, 0)
 	stop := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	w.sync_loop_stop = stop

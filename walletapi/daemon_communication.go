@@ -66,18 +66,32 @@ var (
 	daemon_height                 int64
 	daemon_topoheight             int64
 	last_event_topoheight_tracked int64
+	connectionGeneration          uint64
 )
 
 func setConnected(connected bool) {
 	daemonStateMu.Lock()
+	if connected && !Connected {
+		connectionGeneration++
+	}
 	Connected = connected
 	daemonStateMu.Unlock()
 }
 
+func getConnectionGeneration() uint64 {
+	_, _, generation, _ := daemonSyncState()
+	return generation
+}
+
 func isConnected() bool {
+	_, _, _, connected := daemonSyncState()
+	return connected
+}
+
+func daemonSyncState() (height, topoheight int64, generation uint64, connected bool) {
 	daemonStateMu.RLock()
 	defer daemonStateMu.RUnlock()
-	return Connected
+	return daemon_height, daemon_topoheight, connectionGeneration, Connected
 }
 
 func setDaemonHeights(height, topoheight int64) {
@@ -230,6 +244,7 @@ func test_connectivity_with_context(ctx context.Context) (err error) {
 	if err = rpc_client.CallWithContext(ctx, "DERO.Echo", []string{"hello", "world"}, &result); err != nil {
 		logger.V(1).Error(err, "DERO.Echo Call failed:")
 		setConnected(false)
+		setDaemonHeights(0, 0)
 		return
 	}
 	//fmt.Println(result)
@@ -239,6 +254,7 @@ func test_connectivity_with_context(ctx context.Context) (err error) {
 	if err = rpc_client.CallWithContext(ctx, "DERO.GetInfo", nil, &info); err != nil {
 		logger.V(1).Error(err, "DERO.GetInfo Call failed:")
 		setConnected(false)
+		setDaemonHeights(0, 0)
 		return
 	}
 
@@ -248,6 +264,8 @@ func test_connectivity_with_context(ctx context.Context) (err error) {
 	if info.Testnet != !globals.IsMainnet() {
 		err = fmt.Errorf("Mainnet/TestNet  is different between wallet/daemon.Please run daemon/wallet without --testnet")
 		logger.Error(err, "Mainnet/Testnet mismatch")
+		setConnected(false)
+		setDaemonHeights(0, 0)
 		return
 	}
 
@@ -449,6 +467,7 @@ func invalidateRPCClient(cli *Client, expected *jrpc2.Client) {
 	}
 	if cli == rpc_client {
 		setConnected(false)
+		setDaemonHeights(0, 0)
 	}
 }
 
@@ -491,6 +510,13 @@ func (w *Wallet_Memory) Sync_Wallet_Memory_With_Daemon_internal(scid crypto.Hash
 		previous := w.getEncryptedBalanceresult(scid).Data
 
 		if _, _, _, e, err := w.GetEncryptedBalanceAtTopoHeight(scid, -1, w.GetAddress().String()); err == nil {
+			if scid.IsZero() {
+				// The native refresh completed against the daemon tip reported
+				// by this response. Keep this progress marker separate from the
+				// balance snapshot metadata used by history synchronization.
+				daemonHeight, daemonTopoHeight := getDaemonHeights()
+				w.markNativeSync(daemonHeight, daemonTopoHeight)
+			}
 
 			//fmt.Printf("data '%s' previous '%s' scid %s\n", w.account.Balance_Result[scid].Data, previous, scid)
 			if w.getEncryptedBalanceresult(scid).Data != previous {
