@@ -430,6 +430,41 @@ func (w *Wallet_Memory) Clean() {
 	w.account.Registered = false
 }
 
+// NativeSyncStatus describes native-balance synchronization without
+// conflating the cached balance snapshot with the live daemon tip.
+//
+// WalletHeight and WalletTopoHeight identify the snapshot represented by the
+// cached native balance. DaemonHeight and DaemonTopoHeight identify the latest
+// tip observed from the daemon. Synchronized is true only when the cached
+// native snapshot has reached the observed daemon height.
+type NativeSyncStatus struct {
+	WalletHeight     uint64 `json:"wallet_height"`
+	WalletTopoHeight int64  `json:"wallet_topoheight"`
+	DaemonHeight     uint64 `json:"daemon_height"`
+	DaemonTopoHeight int64  `json:"daemon_topoheight"`
+	Synchronized     bool   `json:"synchronized"`
+}
+
+// Get_Native_Sync_Status returns the native-balance synchronization state.
+// Get_Height remains the balance snapshot height for history correctness; use
+// this method when a caller needs to decide whether the native wallet has
+// caught up with the latest daemon block.
+func (w *Wallet_Memory) Get_Native_Sync_Status() NativeSyncStatus {
+	var scid crypto.Hash
+	balance := w.getEncryptedBalanceresult(scid)
+	daemonHeight, daemonTopoHeight := getDaemonHeights()
+
+	return NativeSyncStatus{
+		WalletHeight:     uint64(balance.Height),
+		WalletTopoHeight: balance.Topoheight,
+		DaemonHeight:     uint64(daemonHeight),
+		DaemonTopoHeight: daemonTopoHeight,
+		Synchronized: daemonHeight > 0 &&
+			balance.Height == daemonHeight &&
+			balance.Topoheight == daemonTopoHeight,
+	}
+}
+
 // return height of wallet
 func (w *Wallet_Memory) Get_Height() uint64 {
 	var scid crypto.Hash
