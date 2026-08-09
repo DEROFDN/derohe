@@ -31,7 +31,8 @@ package walletapi
 
 //import "net/url"
 import (
-	"strings"
+	"context"
+	"sync"
 
 	"github.com/creachadair/jrpc2"
 	"github.com/creachadair/jrpc2/channel"
@@ -44,74 +45,79 @@ import (
 type Client struct {
 	WS  *websocket.Conn
 	RPC *jrpc2.Client
+	mu  sync.RWMutex
+	// lifecycleMu prevents Connect/invalidation from closing an RPC client
+	// while a call is still using it.
+	lifecycleMu sync.RWMutex
 }
 
 var rpc_client = &Client{}
+var connectionMu sync.Mutex // serializes Connect with final connectivity teardown
 
 // this is as simple as it gets
 // single threaded communication to get the daemon status and height
 // this will tell whether the wallet can connection successfully to  daemon or not
-func Connect(endpoint string) (err error) {
+func Connect(endpoint string) error {
+	return connectWithContext(context.Background(), endpoint)
+}
 
-	var daemon_uri string
+func connectWithContext(ctx context.Context, endpoint string) (err error) {
+	connectionMu.Lock()
+	defer connectionMu.Unlock()
 
-	// Take globals arg configured daemon if endpoint param is not defined
+	// A final shared-loop Stop admits no new direct connections. Calls that
+	// were already inside this gate finish before teardown; later calls wait
+	// behind the gate and then observe the stopping state instead of installing
+	// a client that the teardown is about to invalidate.
+	sharedConnectivity.mu.Lock()
+	stopping := sharedConnectivity.stopping
+	sharedConnectivity.mu.Unlock()
+	if stopping {
+		return context.Canceled
+	}
+
+	var daemonURI string
+	activeEndpoint := getDaemonEndpointActive()
 	if endpoint == "" {
-		Daemon_Endpoint_Active = get_daemon_address()
+		activeEndpoint = get_daemon_address()
 	} else {
-		Daemon_Endpoint_Active = endpoint
+		setDaemonEndpointActive(endpoint)
+		activeEndpoint = endpoint
 	}
 
-	logger.V(1).Info("Daemon endpoint ", "address", Daemon_Endpoint_Active)
+	daemonURI = daemonWebsocketURL(activeEndpoint)
 
-	// Trim off http, https, wss, ws to get endpoint to use for connecting
-	if strings.HasPrefix(Daemon_Endpoint_Active, "https") {
-		ld := strings.TrimPrefix(strings.ToLower(Daemon_Endpoint_Active), "https://")
-		daemon_uri = "wss://" + ld + "/ws"
-
-		rpc_client.WS, _, err = websocket.DefaultDialer.Dial(daemon_uri, nil)
-	} else if strings.HasPrefix(Daemon_Endpoint_Active, "http") {
-		ld := strings.TrimPrefix(strings.ToLower(Daemon_Endpoint_Active), "http://")
-		daemon_uri = "ws://" + ld + "/ws"
-
-		rpc_client.WS, _, err = websocket.DefaultDialer.Dial(daemon_uri, nil)
-	} else if strings.HasPrefix(Daemon_Endpoint_Active, "wss") {
-		ld := strings.TrimPrefix(strings.ToLower(Daemon_Endpoint_Active), "wss://")
-		daemon_uri = "wss://" + ld + "/ws"
-
-		rpc_client.WS, _, err = websocket.DefaultDialer.Dial(daemon_uri, nil)
-	} else if strings.HasPrefix(Daemon_Endpoint_Active, "ws") {
-		ld := strings.TrimPrefix(strings.ToLower(Daemon_Endpoint_Active), "ws://")
-		daemon_uri = "ws://" + ld + "/ws"
-
-		rpc_client.WS, _, err = websocket.DefaultDialer.Dial(daemon_uri, nil)
-	} else {
-		daemon_uri = "ws://" + Daemon_Endpoint_Active + "/ws"
-
-		rpc_client.WS, _, err = websocket.DefaultDialer.Dial(daemon_uri, nil)
-	}
-
-	// notify user of any state change
-	// if daemon connection breaks or comes live again
-	if err == nil {
-		if !Connected {
-			logger.V(1).Info("Connection to RPC server successful", "address", daemon_uri)
-			Connected = true
+	logger.V(1).Info("Daemon endpoint ", "address", activeEndpoint)
+	newWS, _, err := websocket.DefaultDialer.DialContext(ctx, daemonURI, nil)
+	if err != nil {
+		if !IsDaemonOnline() {
+			setConnected(false)
 		}
-	} else {
-
-		if Connected {
-			logger.V(1).Error(err, "Connection to RPC server Failed", "endpoint", daemon_uri)
-		}
-		Connected = false
-		return
+		return err
 	}
 
-	input_output := rwc.New(rpc_client.WS)
-	rpc_client.RPC = jrpc2.NewClient(channel.RawJSON(input_output, input_output), &jrpc2.ClientOptions{OnNotify: Notify_broadcaster})
+	// Build the complete replacement before publishing either pointer. A caller
+	// therefore observes either the old matched WS/RPC pair or the new pair.
+	inputOutput := rwc.New(newWS)
+	newRPC := jrpc2.NewClient(channel.RawJSON(inputOutput, inputOutput), &jrpc2.ClientOptions{OnNotify: Notify_broadcaster})
 
-	if err = test_connectivity(); err != nil {
-		Connected = false
+	rpc_client.lifecycleMu.Lock()
+	rpc_client.mu.Lock()
+	oldWS, oldRPC := rpc_client.WS, rpc_client.RPC
+	rpc_client.WS, rpc_client.RPC = newWS, newRPC
+	rpc_client.mu.Unlock()
+
+	if oldWS != nil {
+		_ = oldWS.Close()
+	}
+	if oldRPC != nil {
+		_ = oldRPC.Close()
+	}
+	rpc_client.lifecycleMu.Unlock()
+
+	setConnected(true)
+	if err = test_connectivity_with_context(ctx); err != nil {
+		invalidateRPCClient(rpc_client, newRPC)
 		return err
 	}
 	return nil

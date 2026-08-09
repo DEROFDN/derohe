@@ -33,6 +33,15 @@ func GetTransfers(ctx context.Context, p rpc.Get_Transfers_Params) (result rpc.G
 
 	w := FromContext(ctx)
 
+	// Token history is not part of the background zero-SCID polling loop.
+	// Refresh tracked tokens asynchronously so a transfer query never blocks on
+	// a full historical scan. The response contains the latest completed scan.
+	if !p.SCID.IsZero() && w.wallet.IsSCIDTracked(p.SCID) && w.wallet.GetMode() && w.wallet.IsDaemonOnlineCached() {
+		if err := w.wallet.SyncHistoryAsync(p.SCID); err != nil {
+			return result, err
+		}
+	}
+
 	result.Entries = w.wallet.Show_Transfers(p.SCID, p.Coinbase, p.In, p.Out, p.Min_Height, p.Max_Height, p.Sender, p.Receiver, p.DestinationPort, p.SourcePort)
 
 	return result, nil

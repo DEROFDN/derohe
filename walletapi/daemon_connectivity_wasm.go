@@ -29,7 +29,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -45,6 +45,10 @@ var netClient *http.Client
 type Client struct {
 	WS  *websocket.Conn
 	RPC *jrpc2.Client
+	mu  sync.RWMutex
+	// lifecycleMu prevents Connect/invalidation from closing an RPC client
+	// while a call is still using it.
+	lifecycleMu sync.RWMutex
 }
 
 var rpc_client = &Client{}
@@ -52,11 +56,21 @@ var rpc_client = &Client{}
 // this is as simple as it gets
 // single threaded communication to get the daemon status and height
 // this will tell whether the wallet can connection successfully to  daemon or not
-func Connect(endpoint string) (err error) {
+func Connect(endpoint string) error {
+	return connectWithContext(context.Background(), endpoint)
+}
 
-	Daemon_Endpoint_Active = get_daemon_address()
+func connectWithContext(ctx context.Context, endpoint string) (err error) {
 
-	logger.V(1).Info("Daemon endpoint ", "address", Daemon_Endpoint_Active)
+	activeEndpoint := getDaemonEndpointActive()
+	if endpoint == "" {
+		activeEndpoint = get_daemon_address()
+	} else {
+		setDaemonEndpointActive(endpoint)
+		activeEndpoint = endpoint
+	}
+
+	logger.V(1).Info("Daemon endpoint ", "address", activeEndpoint)
 
 	// TODO enable socks support here
 	var netTransport = &http.Transport{
@@ -71,34 +85,37 @@ func Connect(endpoint string) (err error) {
 		Transport: netTransport,
 	}
 
-	if strings.HasPrefix(Daemon_Endpoint, "https") {
-		ld := strings.TrimPrefix(strings.ToLower(Daemon_Endpoint), "https://")
-		fmt.Printf("will use endpoint %s\n", "wss://"+ld+"/ws")
-		rpc_client.WS, _, err = websocket.Dial(context.Background(), "wss://"+ld+"/ws", nil)
-	} else {
-		fmt.Printf("will use endpoint %s\n", "ws://"+Daemon_Endpoint+"/ws")
-		rpc_client.WS, _, err = websocket.Dial(context.Background(), "ws://"+Daemon_Endpoint+"/ws", nil)
+	daemonURI := daemonWebsocketURL(activeEndpoint)
+	fmt.Printf("will use endpoint %s\n", daemonURI)
+
+	newWS, _, err := websocket.Dial(ctx, daemonURI, nil)
+	if err != nil {
+		setConnected(false)
+		return err
 	}
+	inputOutput := rwc.NewNhooyr(newWS)
+	newRPC := jrpc2.NewClient(channel.RawJSON(inputOutput, inputOutput), &jrpc2.ClientOptions{OnNotify: Notify_broadcaster})
+
+	rpc_client.lifecycleMu.Lock()
+	rpc_client.mu.Lock()
+	oldWS, oldRPC := rpc_client.WS, rpc_client.RPC
+	rpc_client.WS, rpc_client.RPC = newWS, newRPC
+	rpc_client.mu.Unlock()
+
+	if oldWS != nil {
+		_ = oldWS.Close()
+	}
+	if oldRPC != nil {
+		_ = oldRPC.Close()
+	}
+	rpc_client.lifecycleMu.Unlock()
 
 	// notify user of any state change
 	// if daemon connection breaks or comes live again
-	if err == nil {
-		if !Connected {
-			logger.V(1).Info("Connection to RPC server successful", "address", "ws://"+Daemon_Endpoint+"/ws")
-			fmt.Printf("successfully connected\n")
-			Connected = true
-		}
-	} else {
-		if Connected {
-			logger.V(1).Error(err, "Connection to RPC server Failed", "endpoint", "ws://"+Daemon_Endpoint+"/ws")
-		}
-		Connected = false
-		fmt.Printf("connection to endpoint failed.err %s\n", err)
-		return
+	setConnected(true)
+	if err = test_connectivity(); err != nil {
+		invalidateRPCClient(rpc_client, newRPC)
+		return err
 	}
-
-	input_output := rwc.NewNhooyr(rpc_client.WS)
-	rpc_client.RPC = jrpc2.NewClient(channel.RawJSON(input_output, input_output), &jrpc2.ClientOptions{OnNotify: Notify_broadcaster})
-
-	return test_connectivity()
+	return nil
 }
