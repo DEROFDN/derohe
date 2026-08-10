@@ -171,6 +171,18 @@ func Blockchain_Start(params map[string]interface{}) (*Blockchain, error) {
 
 	if params["--simulator"] == true {
 		chain.simulator = true // enable simulator mode, this will set hard coded difficulty to 1
+
+		// a simulator chain is created at genesis and never reaches an activation
+		// height, so a height-gated state rule is permanently inert there and dApp
+		// developers would keep testing against superseded deposit semantics.
+		// keyed on params["--simulator"] (not globals.IsSimulator(), which reads a
+		// CLI flag only cmd/simulator/simulator.go sets) so that in-process chains
+		// and embedders get the same rule as the shipped binary. globals.Config is a
+		// value copy of the network struct, so config.Mainnet is not mutated.
+		// deliberately applied AFTER the config copy so a test can still pin a
+		// pre-fork height by assigning globals.Config.BLACKHOLE_HEIGHT once the
+		// chain is up -- the gate is read per-tx at execution time.
+		globals.Config.BLACKHOLE_HEIGHT = 0
 	}
 
 	chain.Exit_Event = make(chan bool) // init exit channel

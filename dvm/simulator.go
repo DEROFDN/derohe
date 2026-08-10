@@ -183,13 +183,11 @@ func (s *Simulator) common(w_sc_tree, w_sc_data_tree *Tree_Wrapper, scid crypto.
 		err = SanityCheckExternalTransfers(w_sc_data_tree, s.balance_tree, scid)
 	}
 
-	if err != nil { // error occured, give everything to SC, since we may not have information to send them back
-		var zeroaddress [33]byte
-		if signer != zeroaddress { // if we can identify sender, return funds to him
-			ErrorRevert(s.ss, s.cache, s.balance_tree, signer, scid, incoming_values)
-		} else { //  we could not extract signer, give burned funds to SC
-			ErrorRevert(s.ss, s.cache, s.balance_tree, signer, scid, incoming_values)
-		}
+	if err != nil { // error occured, refund what can be refunded, the rest stays burned
+		// non-panicking variant: this Simulator backs DERO.GetGasEstimate, where an
+		// omitted signer is legal. the panicking ErrorRevert turned that plus any
+		// attached burn into a stack trace instead of the contract's own error.
+		ErrorRevertHF3(s.ss, s.cache, s.balance_tree, signer, scid, incoming_values)
 
 		return
 	}
@@ -280,6 +278,44 @@ func ErrorRevert(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree, ba
 			nb.Balance = nb.Balance.Plus(new(big.Int).SetUint64(burnvalue)) // add back burn value to users balance homomorphically
 			curbtree.Put(signer[:], nb.Serialize())                         // reserialize and store
 		}
+	}
+}
+
+// HF3 variant of ErrorRevert: never panics, so it can be reached from the
+// error paths which HF3 newly routes into the refund block. anything which
+// cannot be credited deterministically is left untouched (burned, as before).
+func ErrorRevertHF3(ss *graviton.Snapshot, cache map[crypto.Hash]*graviton.Tree, balance_tree *graviton.Tree, signer [33]byte, scid crypto.Hash, incoming_values map[crypto.Hash]uint64) {
+	for scid_asset, burnvalue := range incoming_values {
+		var zeroscid crypto.Hash
+
+		var curbtree *graviton.Tree
+		switch scid_asset {
+		case zeroscid: // main dero balance, handle it
+			curbtree = balance_tree
+		case scid: // this scid balance, handle it
+			curbtree = cache[scid]
+		default: // any other asset scid
+			var ok bool
+			var err error
+			if curbtree, ok = cache[scid_asset]; !ok {
+				if curbtree, err = ss.GetTree(string(scid_asset[:])); err != nil {
+					continue
+				}
+				cache[scid_asset] = curbtree
+			}
+		}
+
+		if curbtree == nil { // tree was never materialized, nothing to credit into
+			continue
+		}
+
+		balance_serialized, err := curbtree.Get(signer[:])
+		if err != nil { // signer not present in this tree, cannot credit
+			continue
+		}
+		nb := new(crypto.NonceBalance).Deserialize(balance_serialized)
+		nb.Balance = nb.Balance.Plus(new(big.Int).SetUint64(burnvalue)) // add back burn value to users balance homomorphically
+		curbtree.Put(signer[:], nb.Serialize())                         // reserialize and store
 	}
 }
 

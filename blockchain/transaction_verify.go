@@ -87,6 +87,14 @@ func (chain *Blockchain) Verify_Transaction_NonCoinbase_CheckNonce_Tips(hf_versi
 		return fmt.Errorf("no tips provided, cannot verify")
 	}
 
+	// NOTE: an SC deposit carried at ringsize > 2 is unrefundable (Extract_signer
+	// recovers a sender only from a zero-SCID ringsize-2 payload), and an earlier
+	// revision of this patch refused such a tx HERE. That was withdrawn: this
+	// function is the block-add verifier (blockchain.go Add_Complete_Block), so a
+	// refusal here rejects the WHOLE block, and the stock wallet builds SC deposits
+	// at its default ringsize 16 -- an un-upgraded miner would keep producing blocks
+	// that a patched node can never add. The loss is now prevented one layer up, at
+	// tx construction time (walletapi.TransferPayload0). See BLACKHOLE_FIX_AS_BUILT.
 	tips_string := tx_hash.String()
 	for _, tip := range tips {
 		tips_string += fmt.Sprintf("%s", tip.String())

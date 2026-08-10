@@ -264,10 +264,6 @@ func (chain *Blockchain) process_transaction(changed map[crypto.Hash]*graviton.T
 // all processing occurs in wrapped trees, if any error occurs we dicard all trees
 func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.Tree, ss *graviton.Snapshot, bl_height, bl_topoheight, bl_timestamp uint64, blid crypto.Hash, tx transaction.Transaction, balance_tree *graviton.Tree, sc_tree *graviton.Tree) (gas uint64, err error) {
 
-	if len(tx.SCDATA) == 0 {
-		return tx.Fees(), nil
-	}
-
 	gas = tx.Fees()
 
 	var gascompute, gasstorage uint64
@@ -288,15 +284,50 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 		}
 	}()
 
+	// these two exits pre-date the action switch, both return err == nil, and neither
+	// logs at any verbosity, so a burn attached to such a tx was debited by
+	// process_transaction and then destroyed without a trace -- the same loss family
+	// the switch sites below fix. they sit before incoming_value/signer are built, so
+	// the gated `break`-into-the-refund-block idiom cannot reach them; post-fork they
+	// refund through the helper instead. the len()==0 test was moved below the recover
+	// above on purpose: nothing between the two touches state (pre-fork replay is
+	// unchanged), and the refund must never be able to panic a node.
+	if len(tx.SCDATA) == 0 {
+		if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+			chain.blackhole_refund(cache, ss, tx, balance_tree, scid)
+		}
+		return tx.Fees(), nil
+	}
+
 	if !tx.SCDATA.Has(rpc.SCACTION, rpc.DataUint64) { //  tx doesn't have sc action
+		if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+			chain.blackhole_refund(cache, ss, tx, balance_tree, scid)
+		}
 		return tx.Fees(), nil
 	}
 
 	incoming_value := map[crypto.Hash]uint64{}
 	for _, payload := range tx.Payloads {
-		incoming_value[payload.SCID] = payload.BurnValue
+		if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+			// more than one payload per SCID is a legal wire shape (transaction_verify.go
+			// keeps a per-SCID payload counter for exactly that reason) and every payload
+			// is debited independently, so assignment destroyed every burn but the last
+			// one -- both for the refund and for what the contract itself sees.
+			incoming_value[payload.SCID] += payload.BurnValue
+		} else {
+			incoming_value[payload.SCID] = payload.BurnValue
+		}
 	}
 
+	// the error is discarded here in the original and stays discarded on purpose.
+	// if expansion fails, Extract_signer below panics ("tx is not expanded") into
+	// the recover above and the function returns (tx.Fees(), nil) with the burn
+	// destroyed. that is ugly but it is NOT a hole this patch can close: nothing
+	// between here and there mutates cache/balance_tree, so an explicit gated early
+	// return produces the byte-identical (gas, err) tuple and the byte-identical
+	// state -- and a refund is impossible anyway, because the signer is exactly
+	// what could not be recovered. checking the error would change no outcome, only
+	// which line the control flow leaves from. RESIDUAL, release-note it.
 	chain.Expand_Transaction_NonCoinbase(&tx)
 
 	signer, err := Extract_signer(&tx)
@@ -310,6 +341,12 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 	switch action_code {
 	case rpc.SC_INSTALL: // request to install an SC
 		if !tx.SCDATA.Has(rpc.SCCODE, rpc.DataString) { // but only it is present
+			// leaving err nil here reaches SanityCheckExternalTransfers with a nil
+			// w_sc_data_tree, which nil-derefs; the panic is swallowed by the recover
+			// above and the function returns success while the burn is destroyed.
+			if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+				err = fmt.Errorf("no code provided")
+			}
 			break
 		}
 		sc_code := tx.SCDATA.Value(rpc.SCCODE, rpc.DataString).(string)
@@ -353,6 +390,9 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 		}
 
 		if err != nil {
+			if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+				break // HF3: fall through to the refund block instead of exiting
+			}
 			return
 		}
 
@@ -372,6 +412,9 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 
 		if _, err = w_sc_tree.Get(dvm.SC_Meta_Key(scid)); err != nil {
 			err = fmt.Errorf("scid %s not installed", scid)
+			if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+				break // HF3: fall through to the refund block instead of exiting
+			}
 			return
 		}
 
@@ -390,6 +433,9 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 
 	default: // unknown  what to do
 		err = fmt.Errorf("unknown action what to do scid %x", scid)
+		if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+			break // HF3: fall through to the refund block instead of exiting
+		}
 		return
 	}
 
@@ -405,8 +451,12 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 		}
 
 		if signer, err1 := Extract_signer(&tx); err1 == nil { // if we can identify sender, return funds to him
-			dvm.ErrorRevert(ss, cache, balance_tree, signer, scid, incoming_value)
-		} else { //  we could not extract signer, we burn all the funds
+			if bl_height >= uint64(globals.Config.BLACKHOLE_HEIGHT) {
+				dvm.ErrorRevertHF3(ss, cache, balance_tree, signer, scid, incoming_value)
+			} else {
+				dvm.ErrorRevert(ss, cache, balance_tree, signer, scid, incoming_value)
+			}
+		} else if bl_height < uint64(globals.Config.BLACKHOLE_HEIGHT) { //  we could not extract signer, we burn all the funds
 			dvm.ErrorRevert(ss, cache, balance_tree, signer, scid, incoming_value)
 		}
 
@@ -424,6 +474,39 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 	//fmt.Printf("%s successfully executed sc_call data_tree hash %x %s\n", scid, h, err)
 
 	return tx.Fees(), nil
+}
+
+// refund a burn attached to an SC_TX which never reaches the action switch
+// (empty SCDATA, or SCDATA carrying no SC_ACTION of type uint64 -- e.g. a caller
+// that passed sc_rpc arguments with no scid, or sent SC_ACTION with the wrong
+// datatype). deliberately self contained, since at those two sites neither
+// incoming_value nor signer exists yet.
+//
+// only ever called with bl_height >= BLACKHOLE_HEIGHT. it cannot panic: the
+// expansion error is checked rather than ignored, and ErrorRevertHF3 skips
+// anything it cannot credit. ring > 2 has no recoverable signer, so it burns,
+// exactly as it does on the switch paths.
+func (chain *Blockchain) blackhole_refund(cache map[crypto.Hash]*graviton.Tree, ss *graviton.Snapshot, tx transaction.Transaction, balance_tree *graviton.Tree, scid crypto.Hash) {
+	incoming_value := map[crypto.Hash]uint64{}
+	total := uint64(0)
+	for _, payload := range tx.Payloads {
+		incoming_value[payload.SCID] += payload.BurnValue
+		total += payload.BurnValue
+	}
+	if total == 0 { // nothing was burned, nothing to give back
+		return
+	}
+
+	if err := chain.Expand_Transaction_NonCoinbase(&tx); err != nil {
+		return // cannot inspect the ring, cannot identify a sender
+	}
+
+	signer, err := Extract_signer(&tx)
+	if err != nil { // ring > 2, sender is anonymous by construction
+		return
+	}
+
+	dvm.ErrorRevertHF3(ss, cache, balance_tree, signer, scid, incoming_value)
 }
 
 // func extract signer from a tx, if possible
