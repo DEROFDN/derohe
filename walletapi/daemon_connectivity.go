@@ -52,7 +52,6 @@ type Client struct {
 }
 
 var rpc_client = &Client{}
-var connectionMu sync.Mutex // serializes Connect with final connectivity teardown
 
 // this is as simple as it gets
 // single threaded communication to get the daemon status and height
@@ -125,4 +124,35 @@ func connectWithContext(ctx context.Context, endpoint string) (err error) {
 
 func GetRPCClient() *Client {
 	return rpc_client
+}
+
+func invalidateRPCClient(cli *Client, expected *jrpc2.Client) {
+	if cli == nil {
+		return
+	}
+
+	cli.lifecycleMu.Lock()
+	defer cli.lifecycleMu.Unlock()
+
+	cli.mu.Lock()
+	if expected != nil && cli.RPC != expected {
+		cli.mu.Unlock()
+		return
+	}
+	rpc := cli.RPC
+	ws := cli.WS
+	cli.RPC = nil
+	cli.WS = nil
+	cli.mu.Unlock()
+
+	if ws != nil {
+		_ = ws.Close()
+	}
+	if rpc != nil {
+		_ = rpc.Close()
+	}
+	if cli == rpc_client {
+		setConnected(false)
+		setDaemonHeights(0, 0)
+	}
 }

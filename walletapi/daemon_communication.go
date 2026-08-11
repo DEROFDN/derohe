@@ -61,6 +61,8 @@ import (
 // this global variable should be within wallet structure
 var Connected bool = false
 
+var connectionMu sync.Mutex // serializes Connect with final connectivity teardown
+
 var (
 	daemonStateMu                 sync.RWMutex
 	daemon_height                 int64
@@ -438,37 +440,6 @@ func isRPCTransportFailure(err error) bool {
 	// jrpc2 reports application errors as *jrpc2.Error. Other errors are
 	// transport/lifecycle failures and must not leave a dead client online.
 	return true
-}
-
-func invalidateRPCClient(cli *Client, expected *jrpc2.Client) {
-	if cli == nil {
-		return
-	}
-
-	cli.lifecycleMu.Lock()
-	defer cli.lifecycleMu.Unlock()
-
-	cli.mu.Lock()
-	if expected != nil && cli.RPC != expected {
-		cli.mu.Unlock()
-		return
-	}
-	rpc := cli.RPC
-	ws := cli.WS
-	cli.RPC = nil
-	cli.WS = nil
-	cli.mu.Unlock()
-
-	if ws != nil {
-		_ = ws.Close()
-	}
-	if rpc != nil {
-		_ = rpc.Close()
-	}
-	if cli == rpc_client {
-		setConnected(false)
-		setDaemonHeights(0, 0)
-	}
 }
 
 // currently process url  with compatibility for older ip address

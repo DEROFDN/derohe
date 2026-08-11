@@ -103,7 +103,7 @@ func connectWithContext(ctx context.Context, endpoint string) (err error) {
 	rpc_client.mu.Unlock()
 
 	if oldWS != nil {
-		_ = oldWS.Close()
+		_ = oldWS.Close(websocket.StatusNormalClosure, "")
 	}
 	if oldRPC != nil {
 		_ = oldRPC.Close()
@@ -118,4 +118,35 @@ func connectWithContext(ctx context.Context, endpoint string) (err error) {
 		return err
 	}
 	return nil
+}
+
+func invalidateRPCClient(cli *Client, expected *jrpc2.Client) {
+	if cli == nil {
+		return
+	}
+
+	cli.lifecycleMu.Lock()
+	defer cli.lifecycleMu.Unlock()
+
+	cli.mu.Lock()
+	if expected != nil && cli.RPC != expected {
+		cli.mu.Unlock()
+		return
+	}
+	rpc := cli.RPC
+	ws := cli.WS
+	cli.RPC = nil
+	cli.WS = nil
+	cli.mu.Unlock()
+
+	if ws != nil {
+		_ = ws.Close(websocket.StatusNormalClosure, "")
+	}
+	if rpc != nil {
+		_ = rpc.Close()
+	}
+	if cli == rpc_client {
+		setConnected(false)
+		setDaemonHeights(0, 0)
+	}
 }
