@@ -601,10 +601,12 @@ func P2P_Server_v2() {
 		if IsAddressConnected(ParseIPNoError(raddr.String())) {
 			logger.V(4).Info("incoming address is already connected", "ip", raddr.String())
 			conn.Close()
+			continue
 
 		} else if IsAddressInBanList(ParseIPNoError(raddr.IP.String())) { //if incoming IP is banned, disconnect now
 			logger.V(2).Info("Incoming IP is banned, disconnecting now", "IP", raddr.IP.String())
 			conn.Close()
+			continue
 		}
 
 		tunekcp(conn) // tuning paramters for local stack

@@ -173,10 +173,14 @@ func IsAddressInBanList(address string) bool {
 
 	// any i which cannot be banned should never be banned
 	// this list contains any seed nodes/exclusive nodes/proirity nodes
-	// these are never banned
+	// these are never banned.
+	// nonbanlist stores entries as host:port while callers pass a bare IP,
+	// so normalize the stored entry before comparing. ip-based entries are
+	// exempted here; hostname-based seeds would require DNS resolution and
+	// are not matched by this check.
 	for i := range nonbanlist {
-		if address == nonbanlist[i] {
-			return true
+		if norm := ParseIPNoError(nonbanlist[i]); norm != "" && norm == address {
+			return false
 		}
 	}
 
