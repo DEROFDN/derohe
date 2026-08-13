@@ -55,8 +55,16 @@ Upstream calls `net.Dial` with no timeout. The patch bounds the dial at 5 second
 	}
 ```
 
-Upstream has no early `break` (it walks the whole tree) and returns `int64(count)` when
-`len(depth_array) <= 4`.
+Upstream at that same revision **already has** the `>= 20` early break — that part is not a
+local change. The entire local delta is two lines, the small-tree return:
+
+```
+upstream:  if len(depth_array) <= 4  { return int64(count) }
+vendored:  if len(depth_array) <= 19 { return int64(len(depth_array)) }
+```
+
+Note `count` is a named return that is never assigned, so upstream returns **0** for trees with
+≤4 keys. The local change reports the real sampled count instead, for trees up to 19 keys.
 
 **Consumers — note this value crosses the p2p boundary:**
 
@@ -84,8 +92,10 @@ balance tree, and the consumer floors at 2 chunks and rounds to powers of two, s
 wrong estimate costs round-trips rather than correctness. It is still not cosmetic, and should
 not be changed on the assumption that it is.
 
-**If reverted:** the early `break` is lost (full tree walk on every call) and the value returned
-for small trees changes.
+**If reverted:** trees with ≤4 keys report `KeyCount` 0 instead of their real count, and trees
+with 5–19 keys report `exp2(avg_depth)` instead of the exact count. No fastsync consumer branches
+differently at those magnitudes (both still yield `chunks=2` and take the `< 4096` path), so the
+practical effect is nil — but the reported number does change.
 
 Note: this directory also contains a nested `vendor/gopkg.in/yaml.v2` subtree, which
 `go mod vendor` never produces — it was copied by some other means.
