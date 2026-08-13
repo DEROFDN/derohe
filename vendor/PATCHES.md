@@ -65,7 +65,24 @@ Upstream has no early `break` (it walks the whole tree) and returns `int64(count
 - `p2p/rpc_treesection.go:42` — `response.KeyCount = topo_balance_tree.KeyCountEstimate()`
 
 The function's own comment says *"very crude but only used for use display"*. That comment is
-inaccurate: the value is sent to peers during chain sync.
+inaccurate. There are no display consumers in this tree. The value is serialized to peers as a
+CBOR wire field (`p2p/wire_structs.go:111`, `cbor:"KEYCOUNT"`) and the receiving node computes
+with it during fastsync:
+
+- `p2p/chain_bootstrap.go:100-105` — `chunks_estm := response.KeyCount / chunksize`, then
+  doubles `chunks` and increments `path_length` until it covers the estimate. This sets how many
+  `Peer.TreeSection` requests the peer issues and the bit-depth it asks for.
+- `p2p/chain_bootstrap.go:166-171,183,186` — same for `SCKeyCount`.
+- `p2p/chain_bootstrap.go:224` — `} else if sc_response.KeyCount < 4096 {` selects the
+  whole-tree path instead of chunked retrieval.
+
+The handlers are registered unconditionally (`p2p/controller.go:662,671`), so every node with
+p2p enabled emits this value; only the consumer side is behind fastsync.
+
+This is not consensus-critical — the value never reaches block validation, hashing, or the
+balance tree, and the consumer floors at 2 chunks and rounds to powers of two, so a moderately
+wrong estimate costs round-trips rather than correctness. It is still not cosmetic, and should
+not be changed on the assumption that it is.
 
 **If reverted:** the early `break` is lost (full tree walk on every call) and the value returned
 for small trees changes.
