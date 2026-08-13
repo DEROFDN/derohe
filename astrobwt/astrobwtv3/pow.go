@@ -8,7 +8,7 @@ import "encoding/binary"
 import "crypto/rand"
 
 import "github.com/dchest/siphash"
-import "github.com/cespare/xxhash"
+import "github.com/cespare/xxhash/v2"
 
 //import "github.com/minio/highwayhash"
 import "github.com/minio/sha256-simd"
