@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [community-dev, community-mainnet, community-testnet, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      - name: go build ./...
+        run: go build ./...
+
+  quality:
+    name: quality (advisory)
+    runs-on: ubuntu-latest
+    # Every step here is advisory (continue-on-error) so the check stays green while
+    # the pre-existing findings are burned down. Promote a step to blocking by removing
+    # its continue-on-error once its debt reaches zero.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: go vet ./... (advisory)
+        continue-on-error: true
+        run: go vet ./...
+
+      - name: gofmt (advisory)
+        continue-on-error: true
+        run: |
+          unformatted=$(git ls-files '*.go' | grep -v '^vendor/' | xargs -r gofmt -l)
+          if [ -n "$unformatted" ]; then
+            echo "The following non-vendor files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go test -race ./walletapi/... (advisory)
+        continue-on-error: true
+        run: go test -race -timeout 15m ./walletapi/...
