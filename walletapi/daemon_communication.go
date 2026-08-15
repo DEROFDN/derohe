@@ -195,26 +195,18 @@ func (w *Wallet_Memory) sync_loop() {
 			//	w.db.Sync()
 		}
 
-		if IsDaemonOnline() && test_connectivity() != nil {
-			time.Sleep(timeout) // wait 5 seconds
+		if !IsDaemonOnline() {
+			time.Sleep(timeout) // wait 3 seconds before retry
 			continue
 		}
 
 		var zerohash crypto.Hash
-		if len(w.account.EntriesNative) == 0 {
-			if err := w.Sync_Wallet_Memory_With_Daemon(); err != nil {
-				logger.Error(err, "wallet syncing err")
-			}
-		} else {
-			for k := range w.account.EntriesNative {
-				err := w.Sync_Wallet_Memory_With_Daemon_internal(k)
-				if k == zerohash && err != nil {
-					logger.Error(err, "wallet syncing err")
-				}
-			}
+		// Sync zero SCID first so wallet height tracks daemon height.
+		if err := w.Sync_Wallet_Memory_With_Daemon_internal(zerohash); err != nil {
+			logger.Error(err, "wallet syncing err")
 		}
-
-		time.Sleep(timeout) // wait 5 seconds
+		// Token SCIDs sync on demand from wallet API callers.
+		time.Sleep(timeout) // wait 3 seconds for next block
 	}
 }
 
