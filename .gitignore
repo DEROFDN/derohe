@@ -1,0 +1,2 @@
+# Local build artifacts (go build -o build/...)
+build/
