@@ -138,7 +138,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 			// at this point we must send the registration transaction
 			fmt.Fprintf(l.Stderr(), "Wallet address : "+color_green+"%s"+color_white+" is going to be registered. Please wait till the account is registered.", wallet.GetAddress())
 			fmt.Fprintf(l.Stderr(), "This is a pre-condition POW for using the online chain.")
-			fmt.Fprintf(l.Stderr(), "This will take a couple of minutes. Please wait....\n")
+			fmt.Fprintf(l.Stderr(), "This will take a few minutes on fast hardware and up to ~an hour on older devices. Please wait....\n")
 
 			var reg_tx *transaction.Transaction
 
@@ -152,9 +152,10 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 					for counter == 0 {
 
 						lreg_tx := wallet.GetRegistrationTX()
-						hash := lreg_tx.GetHash()
 
-						if hash[0] == 0 && hash[1] == 0 && hash[2] == 0 {
+						// Target the raised 28-bit consensus difficulty (HF4); a
+						// 28-bit winner also satisfies the older 24-bit check.
+						if lreg_tx.RegistrationPoWSolved(transaction.RegistrationPoWLeadingZeroBits) {
 							successful_regs <- lreg_tx
 							counter++
 							break

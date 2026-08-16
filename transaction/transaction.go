@@ -254,6 +254,50 @@ func (tx *Transaction) GasStorage() (fees uint64) {
 	*/
 }
 
+// RegistrationPoWLeadingZeroBits is the number of leading zero bits the
+// registration tx hash must carry to be accepted by consensus once HF4 is
+// active. It was raised from 24 to 28 bits to restore the anti-spam cost of
+// wallet registration after client-side registration miners were optimized
+// (increment-optimized nonce search) and made hashing much faster.
+//
+// A registration found under the 28-bit target trivially satisfies the
+// historical 24-bit target, so wallets may always search for the harder
+// target and remain valid before and after the fork.
+const RegistrationPoWLeadingZeroBits = 28
+
+// registrationHashPoWSolved reports whether hash meets a proof-of-work target
+// of `bits` leading zero bits.
+func registrationHashPoWSolved(hash crypto.Hash, bits int) bool {
+	if bits < 0 || bits > 256 {
+		return false
+	}
+	fullBytes := bits / 8
+	remBits := bits % 8
+	for i := 0; i < fullBytes && i < len(hash); i++ {
+		if hash[i] != 0 {
+			return false
+		}
+	}
+	if remBits > 0 && fullBytes < len(hash) {
+		mask := byte(0xFF << (8 - remBits))
+		if hash[fullBytes]&mask != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// RegistrationPoWSolved reports whether the tx hash meets the registration
+// proof-of-work target of `bits` leading zero bits. Historically the network
+// required 24 bits (hash[0], hash[1], hash[2] == 0); with HF4 this is raised
+// to 28 bits (additionally the high nibble of hash[3] must be zero).
+func (tx *Transaction) RegistrationPoWSolved(bits int) bool {
+	if tx.TransactionType != REGISTRATION {
+		return false
+	}
+	return registrationHashPoWSolved(tx.GetHash(), bits)
+}
+
 func (tx *Transaction) IsRegistrationValid() (result bool) {
 
 	var u bn256.G1

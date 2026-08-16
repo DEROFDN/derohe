@@ -709,8 +709,15 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 				}
 
 				tx_hash := cbl.Txs[i].GetHash()
-				if chain.simulator == false && tx_hash[0] != 0 && tx_hash[1] != 0 {
-					return fmt.Errorf("Registration TX has not solved PoW"), false
+				if chain.simulator == false {
+					if bl.Height >= uint64(globals.Config.MAJOR_HF4_HEIGHT) {
+						// HF4: registration PoW target raised from 24 to 28 bits.
+						if !cbl.Txs[i].RegistrationPoWSolved(transaction.RegistrationPoWLeadingZeroBits) {
+							return fmt.Errorf("Registration TX has not solved PoW"), false
+						}
+					} else if tx_hash[0] != 0 && tx_hash[1] != 0 {
+						return fmt.Errorf("Registration TX has not solved PoW"), false
+					}
 				}
 
 				if bl.Height >= uint64(globals.Config.MAJOR_HF3_HEIGHT) {
@@ -1191,6 +1198,19 @@ func (chain *Blockchain) Get_Height() int64 {
 	return chain.Load_TOP_HEIGHT()
 }
 
+// registrationPoWRequiredBits returns the number of leading zero bits a
+// registration tx hash must carry at the given chain height: 24 bits before
+// MAJOR_HF4_HEIGHT, and transaction.RegistrationPoWLeadingZeroBits (28) from
+// that height onward. A 28-bit winner trivially satisfies the 24-bit check,
+// so wallets may always target the harder difficulty and stay valid on both
+// sides of the fork.
+func registrationPoWRequiredBits(height int64, hf4Height int64) int {
+	if height >= hf4Height {
+		return transaction.RegistrationPoWLeadingZeroBits
+	}
+	return 24
+}
+
 // get height where chain is now stable
 func (chain *Blockchain) Get_Stable_Height() int64 {
 	return chain.Get_Height() - config.STABLE_LIMIT
@@ -1246,9 +1266,16 @@ func (chain *Blockchain) Add_TX_To_Pool(tx *transaction.Transaction) error {
 	}
 	if tx.IsRegistration() { // registration tx will not go any forward
 
-		tx_hash := tx.GetHash()
-		if chain.simulator == false && !(tx_hash[0] == 0 && tx_hash[1] == 0 && tx_hash[2] == 0) {
-			return fmt.Errorf("TX doesn't solve Pow")
+		if chain.simulator == false {
+			// Pre-HF4 the consensus target is 24 leading zero bits; from
+			// MAJOR_HF4_HEIGHT onward it is raised to 28 bits to restore the
+			// anti-spam cost of wallet registration after client-side
+			// registration miners were optimized. A 28-bit winner trivially
+			// satisfies the 24-bit check, so wallets may always target the
+			// harder difficulty and stay valid on both sides of the fork.
+			if !tx.RegistrationPoWSolved(registrationPoWRequiredBits(chain.Get_Height(), globals.Config.MAJOR_HF4_HEIGHT)) {
+				return fmt.Errorf("TX doesn't solve Pow")
+			}
 		}
 
 		// ggive regpool a chance to register

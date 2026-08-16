@@ -430,8 +430,9 @@ func register_wallet_callbacks() {
 				go func() {
 					for counter == 0 {
 						lreg_tx := Local_wallet_instance.GetRegistrationTX()
-						hash := lreg_tx.GetHash()
-						if hash[0] == 0 && hash[1] == 0 && hash[2] == 0 {
+						// Target the raised 28-bit consensus difficulty (HF4); a
+						// 28-bit winner also satisfies the older 24-bit check.
+						if lreg_tx.RegistrationPoWSolved(transaction.RegistrationPoWLeadingZeroBits) {
 							successful_regs <- lreg_tx
 							counter++
 							break

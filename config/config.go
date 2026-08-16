@@ -92,6 +92,7 @@ type CHAIN_CONFIG struct {
 	HF2_HEIGHT       int64 // second HF applie here
 	MAJOR_HF2_HEIGHT int64 // MAJOR HF2 applies here, changes pow
 	MAJOR_HF3_HEIGHT int64 // MAJOR HF3 applied here, changes/adds consensus rules
+	MAJOR_HF4_HEIGHT int64 // MAJOR HF4 applies here, raises registration PoW target from 24 to 28 bits (anti wallet-spam)
 
 	Dev_Address        string // to which address the integrator rewatd will go, if user doesn't specify integrator address'
 	Genesis_Tx         string
@@ -108,6 +109,7 @@ var Mainnet = CHAIN_CONFIG{Name: "mainnet",
 	HF2_HEIGHT:              29000,
 	MAJOR_HF2_HEIGHT:        481600,
 	MAJOR_HF3_HEIGHT:        7504640,
+	MAJOR_HF4_HEIGHT:        9000000, // TODO: set the real activation height before release
 
 	Genesis_Tx: "" +
 		"01" + // version
@@ -130,6 +132,7 @@ var Testnet = CHAIN_CONFIG{Name: "testnet", // testnet will always have last 3 b
 	HF2_HEIGHT:       0, // on testnet apply at genesis
 	MAJOR_HF2_HEIGHT: 4, // on testnet apply at 4
 	MAJOR_HF3_HEIGHT: 0, // on testnet apply at genesis
+	MAJOR_HF4_HEIGHT: 3000000, // TODO: set the real activation height before release
 
 	Genesis_Tx: "" +
 		"01" + // version
