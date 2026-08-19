@@ -40,8 +40,10 @@ type storetopofs struct {
 	last_state_version uint64
 
 	// count_mu guards the remembered Count() result. it is a leaf mutex, no
-	// other lock is ever taken while it is held and it is never held across the
-	// backward walk, so a reader can never delay a writer.
+	// other lock is ever taken while it is held, and it is never held across
+	// the backward walk or across Sync(), so a reader can never delay a writer.
+	// a writer does briefly delay readers: Write holds it across its WriteAt so
+	// the remembered count cannot disagree with what is on disk.
 	count_mu    sync.Mutex
 	count       int64
 	count_valid bool
