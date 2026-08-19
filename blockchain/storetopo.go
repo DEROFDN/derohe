@@ -68,8 +68,8 @@ func (s *storetopofs) Open(basedir string) (err error) {
 //
 // Rewind_Chain zeroes the popped records but never shortens topo.map, so after
 // a deep pop the walk below costs one pread per popped record. derod calls
-// Count() on the order of ten times per block connected, which is what makes
-// catching up after a deep pop unusable. The walk itself is unchanged, its
+// Count() roughly fourteen times per block connected, which multiplies the cost
+// of that walk while a node catches up. The walk itself is unchanged, its
 // result is remembered here and kept in step by Write(), so it runs once per
 // invalidation instead of once per call.
 func (s *storetopofs) Count() int64 {
