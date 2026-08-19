@@ -241,6 +241,16 @@ func TestTopoCountIgnoresFailedWrite(t *testing.T) {
 	if err := s.Write(200, blid, test_state_version, 200); err == nil {
 		t.Fatal("write to a read only file unexpectedly succeeded")
 	}
+	// asserted directly: a total failure leaves the file untouched, so the
+	// remembered value and a fresh walk agree and the observable count cannot
+	// tell them apart. the branch still has to fire, because a PARTIAL write
+	// grows the file and would leave the remembered value stale-low.
+	s.count_mu.Lock()
+	valid := s.count_valid
+	s.count_mu.Unlock()
+	if valid {
+		t.Fatal("a failed write left the remembered count valid")
+	}
 	if got := s.Count(); got != 100 {
 		t.Fatalf("failed write was remembered: count = %d, want 100", got)
 	}
@@ -277,5 +287,35 @@ func TestTopoCountConcurrentWithCleans(t *testing.T) {
 	readers.Wait()
 	if want, got := linearCount(s), s.Count(); want != got {
 		t.Fatalf("count = %d, walk = %d", got, want)
+	}
+}
+
+// the whole point of the change: while a node is catching up it only ever
+// appends live records, and those may raise the remembered count but must
+// never invalidate it. driven with the file closed after priming, so any walk
+// would fail loudly rather than quietly succeed.
+func TestTopoCountSurvivesCatchUpWrites(t *testing.T) {
+	s := fill(t, 500, 200) // 300 live records, 200 cleaned above them
+	if got := s.Count(); got != 300 {
+		t.Fatalf("count = %d, want 300", got)
+	}
+
+	var blid [32]byte
+	blid[0] = 1
+	for i := int64(300); i < 500; i++ { // catch-up re-appends over the cleaned tail
+		if err := s.Write(i, blid, uint64(i+1), i); err != nil {
+			t.Fatalf("write %d: %s", i, err)
+		}
+		if !s.count_valid {
+			t.Fatalf("a live write at index %d invalidated the remembered count", i)
+		}
+		if got := s.Count(); got != i+1 {
+			t.Fatalf("count after writing %d = %d, want %d", i, got, i+1)
+		}
+	}
+
+	s.topomapping.Close() // no walk may happen from here on
+	if got := s.Count(); got != 500 {
+		t.Fatalf("count after close = %d, want 500", got)
 	}
 }
