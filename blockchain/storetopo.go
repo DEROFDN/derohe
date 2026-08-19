@@ -18,6 +18,7 @@ package blockchain
 
 import "os"
 import "fmt"
+import "sync"
 import "math"
 import "path/filepath"
 import "encoding/binary"
@@ -37,6 +38,14 @@ const TOPORECORD_SIZE int64 = 48
 type storetopofs struct {
 	topomapping        *os.File
 	last_state_version uint64
+
+	// count_mu guards the remembered Count() result. it is a leaf mutex, no
+	// other lock is ever taken while it is held and it is never held across the
+	// backward walk, so a reader can never delay a writer.
+	count_mu    sync.Mutex
+	count       int64
+	count_valid bool
+	count_gen   uint64 // bumped by every write, so a walk knows if it raced one
 }
 
 func (s TopoRecord) String() string {
@@ -44,11 +53,33 @@ func (s TopoRecord) String() string {
 }
 
 func (s *storetopofs) Open(basedir string) (err error) {
-	s.topomapping, err = os.OpenFile(filepath.Join(basedir, "topo.map"), os.O_RDWR|os.O_CREATE, 0700)
+	f, err := os.OpenFile(filepath.Join(basedir, "topo.map"), os.O_RDWR|os.O_CREATE, 0700)
+	s.count_mu.Lock()
+	s.count_gen++ // a walk over the previous file must not publish against this one
+	s.count, s.count_valid = 0, false
+	s.topomapping = f
+	s.count_mu.Unlock()
 	return err
 }
 
+// Count returns one past the index of the last non clean record.
+//
+// Rewind_Chain zeroes the popped records but never shortens topo.map, so after
+// a deep pop the walk below costs one pread per popped record. derod calls
+// Count() on the order of ten times per block connected, which is what makes
+// catching up after a deep pop unusable. The walk itself is unchanged, its
+// result is remembered here and kept in step by Write(), so it runs once per
+// invalidation instead of once per call.
 func (s *storetopofs) Count() int64 {
+	s.count_mu.Lock()
+	if s.count_valid {
+		count := s.count
+		s.count_mu.Unlock()
+		return count
+	}
+	gen := s.count_gen
+	s.count_mu.Unlock()
+
 	fstat, err := s.topomapping.Stat()
 	if err != nil {
 		panic(fmt.Sprintf("cannot stat topofile. err %s", err))
@@ -61,7 +92,19 @@ func (s *storetopofs) Count() int64 {
 			panic(fmt.Sprintf("cannot read topofile. err %s", err))
 		}
 	}
+
+	s.publish_count(gen, count)
 	return count
+}
+
+// publish_count remembers a walk's result, unless a write landed while the walk
+// was running, in which case the walk may already be stale and is discarded.
+func (s *storetopofs) publish_count(gen uint64, count int64) {
+	s.count_mu.Lock()
+	if s.count_gen == gen {
+		s.count, s.count_valid = count, true
+	}
+	s.count_mu.Unlock()
 }
 
 // it basically represents Load_Block_Topological_order_at_index
@@ -87,19 +130,36 @@ func (s *storetopofs) Write(index int64, blid [32]byte, state_version uint64, he
 	var record TopoRecord
 	var zero_hash [32]byte
 
+	record.BLOCK_ID, record.State_Version = blid, state_version
+
 	copy(buf[:], blid[:])
 	binary.LittleEndian.PutUint64(buf[len(record.BLOCK_ID):], state_version)
 
 	//height := chain.Load_Height_for_BL_ID(blid)
 	binary.LittleEndian.PutUint64(buf[len(record.BLOCK_ID)+8:], uint64(height))
 
+	s.count_mu.Lock()
+	s.count_gen++
 	_, err = s.topomapping.WriteAt(buf[:], index*TOPORECORD_SIZE)
-	if s.last_state_version != state_version || state_version == 0 {
+	switch { // keep the remembered count in step with what the walk would now return
+	case err != nil: // a failed or partial write can lower it, walk again
+		s.count_valid = false
+	case record.IsClean(): // exactly what the walk skips, so it can lower the count
+		s.count_valid = false
+	case s.count_valid && index+1 > s.count: // a live record can only raise it
+		s.count = index + 1
+	}
+	sync_needed := s.last_state_version != state_version || state_version == 0
+	s.last_state_version = state_version
+	s.count_mu.Unlock()
+
+	if sync_needed {
+		// deliberately not IsClean(): this gate is about fsync cost, not about
+		// what the walk counts, and widening it would fsync every bootstrap write
 		if blid != zero_hash { // during fast sync avoid syncing overhead
 			s.topomapping.Sync() // looks like this is the cause of corruption
 		}
 	}
-	s.last_state_version = state_version
 
 	return err
 }
