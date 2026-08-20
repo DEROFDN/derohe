@@ -99,6 +99,19 @@ func (s *storetopofs) Count() int64 {
 	return count
 }
 
+// SetCount remembers a count the caller already knows, without walking for it.
+//
+// Rewind_Chain uses this: it knows where the chain will land before it starts
+// cleaning, so it can say so once instead of leaving every concurrent Count()
+// to walk and, because each Clean() bumps count_gen, throw the walk away. The
+// caller must have established that index count-1 holds a live record.
+func (s *storetopofs) SetCount(count int64) {
+	s.count_mu.Lock()
+	s.count_gen++ // a walk already in flight predates this and must not publish
+	s.count, s.count_valid = count, true
+	s.count_mu.Unlock()
+}
+
 // publish_count remembers a walk's result, unless a write landed while the walk
 // was running, in which case the walk may already be stale and is discarded.
 func (s *storetopofs) publish_count(gen uint64, count int64) {
@@ -146,8 +159,17 @@ func (s *storetopofs) Write(index int64, blid [32]byte, state_version uint64, he
 	switch { // keep the remembered count in step with what the walk would now return
 	case err != nil: // a failed or partial write can lower it, walk again
 		s.count_valid = false
-	case record.IsClean(): // exactly what the walk skips, so it can lower the count
-		s.count_valid = false
+	case record.IsClean():
+		// a clean record is exactly what the walk skips, so it can lower the
+		// count - unless it lands at or above a count we already hold, where by
+		// the walk's own invariant every record from there up is clean already.
+		// that write changes nothing the walk would return, and leaving the
+		// memo alone is what keeps it alive across Rewind_Chain's run of
+		// Clean() calls. either way a clean record must never RAISE the count,
+		// so this arm handles both outcomes rather than falling through.
+		if !(s.count_valid && index >= s.count) {
+			s.count_valid = false
+		}
 	case s.count_valid && index+1 > s.count: // a live record can only raise it
 		s.count = index + 1
 	}
