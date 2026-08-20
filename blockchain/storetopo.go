@@ -112,6 +112,27 @@ func (s *storetopofs) SetCount(count int64) {
 	s.count_mu.Unlock()
 }
 
+// SettleForClean remembers where a descending run of Clean() calls is going to
+// leave the count, before the run starts, so that the run does not invalidate
+// the memo and leave every concurrent Count() walking.
+//
+// top is the highest index about to be cleaned and n is how many records the
+// run covers, so the count lands at top-n+1. It only settles once it has
+// confirmed the record directly below that point is live; if it cannot, it
+// settles nothing and the walk stays in charge. Reports what it settled on and
+// whether it did, so the caller can re-assert it after the run.
+func (s *storetopofs) SettleForClean(top, n int64) (settled int64, ok bool) {
+	settled = top - n + 1
+	if n <= 0 || settled < 1 {
+		return settled, false
+	}
+	if record, err := s.Read(settled - 1); err != nil || record.IsClean() {
+		return settled, false
+	}
+	s.SetCount(settled)
+	return settled, true
+}
+
 // publish_count remembers a walk's result, unless a write landed while the walk
 // was running, in which case the walk may already be stale and is discarded.
 func (s *storetopofs) publish_count(gen uint64, count int64) {

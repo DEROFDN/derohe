@@ -194,3 +194,55 @@ func TestSetCount_CleanWriteBelowCountStillInvalidates(t *testing.T) {
 	}
 	t.Log("clean write below the count invalidates, as it must")
 }
+
+// SettleForClean carries the arithmetic and the liveness guard that Rewind_Chain
+// used to hold inline, where nothing could reach them. Both are pinned here.
+func TestSettleForClean_LandingCountAndGuard(t *testing.T) {
+	const live = 1000
+	top := int64(live - 1)
+
+	// the arithmetic: cleaning n records from top must land at top-n+1, and
+	// that must equal what a fresh walk sees once the run has happened.
+	for _, n := range []int64{1, 2, 99, 500, 999} {
+		s, dir := newTopo(t, live)
+		settled, ok := s.SettleForClean(top, n)
+		if !ok {
+			t.Fatalf("n=%d: refused to settle on a fully live file", n)
+		}
+		if want := top - n + 1; settled != want {
+			t.Fatalf("n=%d: settled %d, want %d", n, settled, want)
+		}
+		for i := int64(0); i < n; i++ {
+			s.Clean(top - i)
+		}
+		if walk := linearCount(s); walk != settled {
+			t.Fatalf("n=%d: settled %d but a fresh walk says %d", n, settled, walk)
+		}
+		s.topomapping.Close()
+		os.RemoveAll(dir)
+	}
+
+	// the guard: refuse when the record below the landing point is not live,
+	// when nothing is being cleaned, and when the run would consume the file.
+	s, dir := newTopo(t, live)
+	defer os.RemoveAll(dir)
+
+	if _, ok := s.SettleForClean(top, 0); ok {
+		t.Fatal("settled for a zero-length run")
+	}
+	if _, ok := s.SettleForClean(top, live); ok {
+		t.Fatal("settled when the run reaches index 0, leaving nothing live below it")
+	}
+	if _, ok := s.SettleForClean(top, live+50); ok {
+		t.Fatal("settled on a negative landing count")
+	}
+
+	s.Clean(400) // punch a hole, then land directly on top of it
+	if _, ok := s.SettleForClean(top, top-401+1); ok {
+		t.Fatal("settled with a clean record directly below the landing point")
+	}
+	if _, ok := s.SettleForClean(top, 10); !ok {
+		t.Fatal("refused a landing point whose record below is live")
+	}
+	t.Log("landing count matches a fresh walk at 5 depths; guard refuses all four bad shapes")
+}

@@ -1489,19 +1489,9 @@ func (chain *Blockchain) Rewind_Chain(rewind_count int) (result bool) {
 	}
 
 	// where the chain lands is known before a single record is cleaned, so say
-	// so up front. otherwise every Clean() below invalidates the remembered
-	// count and each concurrent Count() walks the growing clean run and then
-	// discards the walk, which is the cost this whole exercise is about. the
-	// count is only asserted once the record below it is confirmed live; if it
-	// is not, nothing is asserted and the walk stays in charge.
-	settled_count := top_block_topo_index - rewinded + 1
-	count_settled := false
-	if rewinded > 0 && settled_count >= 1 {
-		if r, err := chain.Store.Topo_store.Read(settled_count - 1); err == nil && !r.IsClean() {
-			chain.Store.Topo_store.SetCount(settled_count)
-			count_settled = true
-		}
-	}
+	// so up front, otherwise every Clean() below leaves concurrent Count()
+	// callers walking the growing clean run.
+	settled_count, count_settled := chain.Store.Topo_store.SettleForClean(top_block_topo_index, rewinded)
 
 	for i := int64(0); i < rewinded; i++ {
 		chain.Store.Topo_store.Clean(top_block_topo_index - i)
