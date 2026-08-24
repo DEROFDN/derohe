@@ -422,6 +422,14 @@ func (chain *Blockchain) Create_new_block_template_mining(miniblock_miner_addres
 			err = fmt.Errorf("unregistered miner or you need to wait 15 mins")
 			return
 		}
+
+		// HF4: refuse to hand out work to a miner whose wallet registered
+		// post-HF4 but has not yet waited the activation cooldown. Legacy
+		// miners (no marker) and pre-HF4 chains are unaffected.
+		if !chain.IsMinerUsableFromHash(miner_hash) {
+			err = fmt.Errorf("wallet is not yet active — new wallets become mineable %d blocks after registration", config.RegistrationActiveAfterBlocks)
+			return
+		}
 	}
 
 	miniblock_blob = fmt.Sprintf("%x", mbl.Serialize())
@@ -492,6 +500,14 @@ func (chain *Blockchain) Accept_new_block(tstamp uint64, miniblock_blob []byte) 
 		if !chain.IsAddressHashValid(true, miner_hash) {
 			logger.V(3).Error(err, "unregistered miner %s", miner_hash)
 			err = fmt.Errorf("unregistered miner or you need to wait 15 mins")
+			return
+		}
+
+		// HF4: reject miniblocks from a miner whose wallet is still in the
+		// registration-activation cooldown (post-HF4 registrations only).
+		if !chain.IsMinerUsableFromHash(miner_hash) {
+			logger.V(3).Error(nil, "miner not yet active (HF4 registration cooldown) %s", miner_hash)
+			err = fmt.Errorf("wallet is not yet active — new wallets become mineable %d blocks after registration", config.RegistrationActiveAfterBlocks)
 			return
 		}
 

@@ -137,6 +137,15 @@ func (chain *Blockchain) InsertMiniBlock(mbl block.MiniBlock) (err error, result
 		return err, false
 	}
 
+	// HF4: do not accept miniblocks from a miner whose wallet is still in the
+	// registration-activation cooldown (post-HF4 registrations only; legacy
+	// miners and pre-HF4 chains pass the usable gate).
+	if !chain.IsMinerUsableFromHash(miner_hash) {
+		logger.V(1).Error(nil, "miner not yet active (HF4 registration cooldown)", "miner", miner_hash)
+		err = fmt.Errorf("miner not yet active (HF4 registration cooldown)")
+		return err, false
+	}
+
 	if err, result = chain.MiniBlocks.InsertMiniBlock(mbl); result == true {
 		chain.RPC_NotifyNewMiniBlock.L.Lock()
 		chain.RPC_NotifyNewMiniBlock.Broadcast()

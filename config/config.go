@@ -35,6 +35,16 @@ const BLOCK_TIME = uint64(18)
 const BLOCK_TIME_MILLISECS = BLOCK_TIME * 1000
 const MINIBLOCK_HIGHDIFF = 9
 
+// RegistrationActiveAfterBlocks is how many final (miner) blocks a freshly
+// registered wallet must wait before it becomes "active" (usable) on the
+// network. Final blocks run at BLOCK_TIME (18s), so 50 blocks ≈ 15 minutes.
+// This is the availability-style gate: the activation delay is measured in
+// lived chain activity (block heights), not wall-clock time, so it stays
+// consistent even if block time changes in a future hard fork. See
+// transaction.RegistrationActivationTopo and the HF4 helpers in the
+// blockchain package.
+const RegistrationActiveAfterBlocks = int64(50)
+
 // note we are keeping the tree name small for disk savings, since they will be stored n times (atleast or archival nodes)
 // this is used by graviton
 const BALANCE_TREE = "B" // keeps main balance
@@ -92,7 +102,7 @@ type CHAIN_CONFIG struct {
 	HF2_HEIGHT       int64 // second HF applie here
 	MAJOR_HF2_HEIGHT int64 // MAJOR HF2 applies here, changes pow
 	MAJOR_HF3_HEIGHT int64 // MAJOR HF3 applied here, changes/adds consensus rules
-	MAJOR_HF4_HEIGHT int64 // MAJOR HF4 applies here, raises registration PoW target from 24 to 28 bits (anti wallet-spam)
+	MAJOR_HF4_HEIGHT int64 // MAJOR HF4 applies here: raises registration PoW target from 24 to 28 bits (anti wallet-spam) AND activates the registration usability cooldown (a wallet is only active RegistrationActiveAfterBlocks blocks after registration)
 
 	Dev_Address        string // to which address the integrator rewatd will go, if user doesn't specify integrator address'
 	Genesis_Tx         string
@@ -128,10 +138,10 @@ var Testnet = CHAIN_CONFIG{Name: "testnet", // testnet will always have last 3 b
 	Wallet_RPC_Default_Port: 40403,
 
 	Dev_Address:      "deto1qy0ehnqjpr0wxqnknyc66du2fsxyktppkr8m8e6jvplp954klfjz2qqdzcd8p",
-	HF1_HEIGHT:       0, // on testnet apply at genesis
-	HF2_HEIGHT:       0, // on testnet apply at genesis
-	MAJOR_HF2_HEIGHT: 4, // on testnet apply at 4
-	MAJOR_HF3_HEIGHT: 0, // on testnet apply at genesis
+	HF1_HEIGHT:       0,       // on testnet apply at genesis
+	HF2_HEIGHT:       0,       // on testnet apply at genesis
+	MAJOR_HF2_HEIGHT: 4,       // on testnet apply at 4
+	MAJOR_HF3_HEIGHT: 0,       // on testnet apply at genesis
 	MAJOR_HF4_HEIGHT: 3000000, // TODO: set the real activation height before release
 
 	Genesis_Tx: "" +

@@ -594,6 +594,13 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 				err = fmt.Errorf("miner address not registered")
 				return err, false
 			}
+			// HF4: a block must not contain miniblocks mined by a wallet that is
+			// still in the registration-activation cooldown (post-HF4
+			// registrations only; legacy miners and pre-HF4 chains unaffected).
+			if mbl.Final == false && !chain.IsMinerUsableFromHash(miner_hash) {
+				err = fmt.Errorf("miniblocks mined by a wallet not yet active (HF4 registration cooldown)")
+				return err, false
+			}
 		}
 
 		// verify Pow of miniblocks
@@ -873,6 +880,22 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 		if fail_count > 0 { // check the result
 			block_logger.Error(fmt.Errorf("TX verification failed"), "rejecting block")
 			return errormsg.ErrInvalidTX, false
+		}
+	}
+
+	// HF4: a miner could bypass its own mempool and include a "too young"
+	// wallet's spend directly in a block, so the registration-activation
+	// cooldown must also be enforced here at block-acceptance for every tx
+	// whose sender is deterministically known (ring-size >= 2 key identity
+	// recovered by Extract_signer). Anonymous ring > 2 spends are exempt by
+	// protocol design. Registration/coinbase txs are exempt (registration is
+	// how a wallet first enters the chain).
+	if chain.Get_Height() >= globals.Config.MAJOR_HF4_HEIGHT {
+		for _, tx := range cbl.Txs {
+			if err := chain.senderActiveForTx(tx); err != nil {
+				block_logger.Error(err, "TX rejected by HF4 registration-activation gate", "txid", tx.GetHash())
+				return err, false
+			}
 		}
 	}
 
@@ -1376,6 +1399,15 @@ func (chain *Blockchain) Add_TX_To_Pool(tx *transaction.Transaction) error {
 	if err := chain.Verify_Transaction_NonCoinbase(tx); err != nil {
 		logger.V(2).Error(err, "Incoming TX could not be verified", "txid", txhash)
 		return fmt.Errorf("Incoming TX %s could not be verified, err %s", txhash, err)
+	}
+
+	// HF4: reject spends whose traceable sender is a wallet that has not yet
+	// waited the registration-activation cooldown. Only ring-size-2 senders
+	// are attributable, so anonymous (ring > 2) spends remain allowed — the
+	// gate cannot violate ring anonymity by design (see registration_activation.go).
+	if err := chain.senderActiveForTx(tx); err != nil {
+		logger.V(2).Error(err, "Incoming TX rejected by HF4 registration-activation gate", "txid", txhash)
+		return fmt.Errorf("Incoming TX %s rejected: %s", txhash, err)
 	}
 
 	if chain.Mempool.Mempool_Add_TX(tx, 0) { // new tx come with 0 marker

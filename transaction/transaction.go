@@ -298,6 +298,27 @@ func (tx *Transaction) RegistrationPoWSolved(bits int) bool {
 	return registrationHashPoWSolved(tx.GetHash(), bits)
 }
 
+// RegistrationActivationTopo reports whether a wallet registered at
+// registrationTopo has been "active" long enough to be usable at nowTopo, i.e.
+// whether at least afterBlocks final (miner) blocks have passed since
+// registration. Final blocks run at config.BLOCK_TIME (18s), so the caller
+// picks afterBlocks = config.RegistrationActiveAfterBlocks (50 → ~15 min).
+//
+// This is the availability-style gate that replaces the loose "wait a bit"
+// mining cooldown once the HF4 rule is active: a wallet is only usable after
+// it has lived N confirmed blocks on-chain, measured in chain-height progress
+// rather than wall-clock time, so it stays correct across future block-time
+// changes.
+//
+// Guards the arithmetic: a registration in the future (clock skew / reorg)
+// and a topo that has not yet advanced are both treated as "not yet active".
+func RegistrationActivationTopo(registrationTopo, nowTopo, afterBlocks int64) bool {
+	if nowTopo < 0 || registrationTopo < 0 || afterBlocks <= 0 {
+		return false
+	}
+	return nowTopo-registrationTopo >= afterBlocks
+}
+
 func (tx *Transaction) IsRegistrationValid() (result bool) {
 
 	var u bn256.G1
