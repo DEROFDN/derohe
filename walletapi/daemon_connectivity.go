@@ -107,7 +107,11 @@ func Connect(endpoint string) (err error) {
 		return
 	}
 
-	input_output := rwc.New(rpc_client.WS)
+	// per-write deadline: without it, one write blocked on a half-open daemon holds
+	// the jrpc2 client-wide send mutex for the kernel TCP retransmit timeout and
+	// freezes every concurrent call INCLUDING its context-deadline delivery — see
+	// walletDaemonWriteTimeout (daemon_communication.go).
+	input_output := rwc.NewWithWriteTimeout(rpc_client.WS, walletDaemonWriteTimeout)
 	rpc_client.RPC = jrpc2.NewClient(channel.RawJSON(input_output, input_output), &jrpc2.ClientOptions{OnNotify: Notify_broadcaster})
 
 	if err = test_connectivity(); err != nil {
