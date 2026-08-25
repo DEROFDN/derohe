@@ -24,6 +24,10 @@ import (
 	"github.com/deroproject/derohe/rpc"
 )
 
+// GetTransfers serves persisted entries as-is. Consumers reading sender /
+// sender_verified / ringsize MUST honor the rpc.Entry.SenderVerified contract,
+// including its non-retroactive caveat: entries persisted before the attribution
+// upgrade are NOT re-scrubbed and deserialize SenderVerified=false, RingSize=0.
 func GetTransfers(ctx context.Context, p rpc.Get_Transfers_Params) (result rpc.Get_Transfers_Result, err error) {
 	defer func() { // safety so if anything wrong happens, we return error
 		if r := recover(); r != nil {
