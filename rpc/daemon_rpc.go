@@ -269,7 +269,7 @@ type (
 	SendRawTransaction_Result struct {
 		Status string `json:"status"`
 		TXID   string `json:"txid"`
-		Reason string `json:"string"`
+		Reason string `json:"reason"`
 	}
 )
 
