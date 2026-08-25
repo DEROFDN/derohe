@@ -17,6 +17,7 @@
 package main
 
 import "io"
+import "os"
 import "fmt"
 import "time"
 import "strconv"
@@ -248,6 +249,27 @@ func common_processing(wallet *walletapi.Wallet_Disk) {
 	}
 
 	wallet.SetNetwork(!globals.Arguments["--testnet"].(bool))
+
+	// capture the wallet's ring size as the post-send reset target ("set first, then fire":
+	// a one-off per-tx ring size set in the Transaction Build Options menu reverts here).
+	default_ringsize = wallet.GetRingSize()
+
+	if globals.Arguments["--anonymous"] != nil && globals.Arguments["--anonymous"].(bool) {
+		attribution_mode = walletapi.AttributionAnonymous
+		// console-only (NOT the on-disk log): never persist anonymize-intent to disk (O3).
+		// --anonymous only seeds ANONYMOUS; SELF is never reachable from a flag (it is a
+		// deliberate, warned, in-session choice only).
+		fmt.Fprintf(os.Stderr, "Extra sender privacy ON for this session (configure in the Transaction Build Options menu)\n")
+	}
+	if globals.Arguments["--decoys"] != nil && globals.Arguments["--decoys"].(string) != "" {
+		for _, d := range strings.Split(globals.Arguments["--decoys"].(string), ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				decoys_default = append(decoys_default, d)
+			}
+		}
+		// console-only (NOT the on-disk log): never persist the curated decoy set to disk (O3).
+		fmt.Fprintf(os.Stderr, "Loaded preferred decoys: %d\n", len(decoys_default))
+	}
 
 	// start rpc server if requested
 	if globals.Arguments["--rpc-server"].(bool) == true {

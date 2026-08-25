@@ -21,8 +21,105 @@ type GenerateProofFunc func(scid crypto.Hash, scid_index int, s *crypto.Statemen
 
 var GenerateProoffuncptr GenerateProofFunc = crypto.GenerateProof
 
+// AttributionMode controls which ring slot index is written into the encrypted
+// receiver payload (the leading byte at the witness_index write below). It changes
+// only the sender-attribution metadata the receiver decrypts; it never affects which
+// keys are sender/receiver, the amount, the recipient, or consensus validity.
+type AttributionMode uint8
+
+const (
+	// AttributionHonest writes witness_index[1] (the receiver's own slot) — the default
+	// and today's behavior. The receiver already knows it is the receiver, so this leaks
+	// nothing about the sender.
+	//
+	// GUARDRAIL: honest/default mode MUST write witness_index[1] and MUST NOT be changed to
+	// witness_index[0] (the real sender slot). The sender slot is reachable ONLY via the
+	// explicit AttributionSelf value below — never via honest. This keeps the guardrail
+	// against ACCIDENTAL/default self-pointing intact while allowing a deliberate, named opt-in.
+	AttributionHonest AttributionMode = iota
+	// AttributionAnonymous writes the slot index of a decoy ring member (drawn from the
+	// anonymity set, never the real sender or receiver). The receiver is reduced to the
+	// ring's 1-of-N anonymity instead of being handed the sender's slot directly.
+	AttributionAnonymous
+	// AttributionSelf writes witness_index[0] (the real sender's own slot) — an explicit,
+	// advanced-only, deliberately self-doxxing choice. It points the receiver-readable
+	// attribution byte at the true sender: the recipient (and anyone who ever decrypts this
+	// transaction in the future) can prove who sent it. This is the attribution field's
+	// ORIGINAL purpose; DERO's default hides it instead. It works at ANY ring size — the
+	// sender slot [0] always exists (unlike a decoy slot, which needs ring > 2). It is NEVER
+	// the default and is reachable only by naming this value (the CLI gates it behind a
+	// mandatory loud warning).
+	AttributionSelf
+	// A "point attribution at a specific named address" mode is intentionally NOT defined:
+	// that is targeted impersonation, not privacy.
+)
+
+// RingPreference is an opt-in decoy-curation hint for ring assembly. A nil
+// *RingPreference reproduces today's behavior (pure DERO.GetRandomAddress selection).
+// The curation logic that consumes it is wired in wallet_transfer.go.
+type RingPreference struct {
+	// PreferredDecoys are base-address strings to place in the ring first (after dedup);
+	// random members top up to ringsize. Each is validated registered on the base balance
+	// tree before use. Addresses the user controls must NOT be supplied here — curating
+	// your own addresses collapses your anonymity set.
+	//
+	// Slot capacity: a ring places at most ringsize-2 decoys (the sender and the
+	// recipient hold the other two positions). Supplying more than fits is a hard error
+	// in Strict mode ("too many preferred decoys for ring size …"); in lenient mode the
+	// surplus is dropped with a per-decoy log record and counted in the pre-signing
+	// "reduced curation" summary — never placed silently short.
+	//
+	// Ring composition on a scarce tree: when the transfer SCID's own tree cannot supply
+	// enough random members — its random tail is <= 40, OR assembly observes it has
+	// stalled (consecutive passes adding no new member) — assembly falls back to
+	// base-tree members exactly as it does without curation; for a non-zero SCID those
+	// fill token slots with synthesized zero balances. Curated decoys do not widen this
+	// behavior and do not count toward the scarcity measurement. If even the fallback
+	// cannot fill the ring within the documented pass/backoff bounds, assembly fails
+	// with an explicit pool-exhaustion error instead of retrying forever. Strict governs
+	// per-decoy validation, not composition — with two fail-closed exceptions: Strict
+	// curation at ring 2 is rejected outright (a ring with no decoy slots cannot honor
+	// the curation it was asked to validate), and Strict over-supply beyond ringsize-2
+	// slots is rejected outright (see slot capacity above). Lenient curation in both
+	// cases proceeds without the unplaceable decoys, each drop recorded and summarized.
+	//
+	// At most 256 entries (2× the maximum ringsize; a ring holds at most ringsize-2
+	// decoys). Exceeding the cap is a hard error in BOTH modes: each decoy costs a
+	// registration RPC under the wallet's transfer mutex, so list length is request
+	// validation, not decoy quality.
+	PreferredDecoys []string
+	// Strict: if true, a bad preferred decoy (unparseable / self / duplicate / unregistered)
+	// is a hard error. If false (default), it is skipped and random selection fills the slot.
+	// Either way, a registration probe that FAILS (daemon/transport fault — no verdict) is a
+	// hard error: a transient blip must not silently strip curation from the ring.
+	//
+	// TRUST NOTE — the "unregistered" verdict itself comes from the connected daemon and
+	// the wallet cannot check it independently. In lenient mode a malicious daemon can
+	// therefore veto curated decoys by answering unregistered; the wallet cannot prevent
+	// that, but it never lets it pass silently (per-decoy V(1) log plus a default-verbosity
+	// summary before signing). Callers who require the build to FAIL rather than degrade
+	// when the daemon disputes their decoys must set Strict — that is the fail-closed mode
+	// against a decoy-vetoing daemon. (A daemon that hostile already controls all RANDOM
+	// member selection and every balance the wallet sees; run your own node.)
+	Strict bool
+}
+
+// TransferOptions carries opt-in, additive transfer privacy knobs. The zero value
+// reproduces today's behavior exactly (honest attribution, random ring selection).
+type TransferOptions struct {
+	Attribution AttributionMode // zero value = AttributionHonest
+	Ring        *RingPreference // nil = today's random ring selection
+}
+
 // generate proof  etc
+//
+// BuildTransaction is preserved verbatim as a shim over buildTransaction so existing
+// callers (tests, benchmarks) keep compiling and get honest, non-curated behavior.
 func (w *Wallet_Memory) BuildTransaction(transfers []rpc.Transfer, emap [][][]byte, rings [][]*bn256.G1, block_hash crypto.Hash, height uint64, scdata rpc.Arguments, roothash []byte, max_bits int, fees uint64) *transaction.Transaction {
+	return w.buildTransaction(transfers, emap, rings, block_hash, height, scdata, roothash, max_bits, fees, TransferOptions{})
+}
+
+func (w *Wallet_Memory) buildTransaction(transfers []rpc.Transfer, emap [][][]byte, rings [][]*bn256.G1, block_hash crypto.Hash, height uint64, scdata rpc.Arguments, roothash []byte, max_bits int, fees uint64, opts TransferOptions) *transaction.Transaction {
 
 	sender := w.account.Keys.Public.G1()
 	sender_secret := w.account.Keys.Secret.BigInt()
@@ -184,7 +281,25 @@ rebuild_tx:
 
 				shared_key := crypto.GenerateSharedSecret(ephemeral_scalar, publickeylist[i])
 
-				payload := append([]byte{byte(uint(witness_index[1]))}, data...)
+				// honest/default attribution writes witness_index[1] (the receiver's own slot).
+				// GUARDRAIL: honest mode NEVER writes witness_index[0] (the real sender) — that
+				// would reveal the true sender to the receiver on every transfer. The sender slot
+				// is reachable ONLY via the explicit, named AttributionSelf branch below, never by
+				// the default path; so the guardrail against ACCIDENTAL self-pointing stands.
+				attrIndex := witness_index[1]
+				if opts.Attribution == AttributionAnonymous && len(witness_index) > 2 {
+					// witness_index[2:] are the anonymity-set (decoy) slots: real, registered
+					// ring members that are neither the sender [0] nor the receiver [1].
+					// Pointing attribution at one reduces the receiver to 1-of-N ring anonymity.
+					decoyPos := 2 + crand.Intn(len(witness_index)-2)
+					attrIndex = witness_index[decoyPos]
+				} else if opts.Attribution == AttributionSelf {
+					// explicit, advanced-only, deliberate self-doxx: point the byte at the real
+					// sender's own slot. witness_index[0] is the logical sender and always exists,
+					// so this needs no ring-size guard (unlike a decoy slot).
+					attrIndex = witness_index[0]
+				}
+				payload := append([]byte{byte(uint(attrIndex))}, data...)
 				//fmt.Printf("buulding shared_key %x  index of receiver %d\n",shared_key,i)
 				//fmt.Printf("building plaintext payload %x\n",asset.RPCPayload)
 
