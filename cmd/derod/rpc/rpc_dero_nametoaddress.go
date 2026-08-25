@@ -30,7 +30,8 @@ func NameToAddress(ctx context.Context, p rpc.NameToAddress_Params) (result rpc.
 
 	defer func() { // safety so if anything wrong happens, we return error
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic occured. stack trace %s", debug.Stack())
+			logger.V(1).Error(nil, "panic in RPC handler", "r", r, "stack", debug.Stack())
+			err = fmt.Errorf("internal error")
 		}
 	}()
 
@@ -63,7 +64,7 @@ func NameToAddress(ctx context.Context, p rpc.NameToAddress_Params) (result rpc.
 		}
 
 		addr, _ := rpc.NewAddressFromCompressedKeys([]byte(v.ValueString))
-		if err != nil {
+		if addr == nil { // malformed stored value (e.g. empty); avoid nil-pointer deref
 			return
 		}
 		addr.Mainnet = globals.IsMainnet()

@@ -27,7 +27,6 @@ import "go/parser"
 import "go/token"
 import "math"
 
-import "runtime/debug"
 import "github.com/blang/semver/v4"
 import "github.com/deroproject/derohe/cryptography/crypto"
 
@@ -346,7 +345,7 @@ func RunSmartContract(SC *SmartContract, EntryPoint string, state *Shared_State,
 
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("Recovered in function %+v stack %s", r, string(debug.Stack()))
+			err = fmt.Errorf("Recovered in function %+v", r)
 		}
 
 	}()
