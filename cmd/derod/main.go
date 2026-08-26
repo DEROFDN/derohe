@@ -1021,7 +1021,9 @@ restart_loop:
 			if len(line_parts) == 3 { // process ban time if provided
 				// if user provided a time, apply ban for specific time
 				if s, err := strconv.ParseInt(line_parts[2], 10, 64); err == nil && s >= 0 {
-					p2p.Ban_Address(line_parts[1], uint64(s))
+					if err := p2p.Ban_Address(line_parts[1], uint64(s)); err != nil {
+						fmt.Printf("err banning address %s\n", err)
+					}
 					break
 				} else {
 					fmt.Printf("err parsing ban time (only positive number) %s", err)
@@ -1031,7 +1033,7 @@ restart_loop:
 
 			err := p2p.Ban_Address(line_parts[1], 10*60) // default ban is 10 minutes
 			if err != nil {
-				fmt.Printf("err parsing address %s", err)
+				fmt.Printf("err banning address %s\n", err)
 				break
 			}
 

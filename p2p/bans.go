@@ -162,6 +162,38 @@ func ParseAddress(address string) (ipnet *net.IPNet, result string, err error) {
 	return
 }
 
+// isNonBannable reports whether address is a seed/exclusive/priority node the
+// operator pinned on the command line (or a compiled-in seed), which must never
+// be banned.
+//
+// nonbanlist stores entries verbatim, either "ip:port"/"host:port" (compiled-in
+// seeds, and any pin given with a port) or a bare IP (a pin given without one).
+// Callers of IsAddressInBanList always pass a bare IP. So this only normalizes
+// entries that ALREADY parse as a bare IP -- net.ParseIP fails on both
+// "1.2.3.4:11011" and a hostname, so ported pins and every compiled-in seed
+// stay exempt from nothing here: they remain bannable and evictable like any
+// other peer. Only a pin given WITHOUT a port is covered.
+func isNonBannable(address string) bool {
+	if address == "" {
+		return false
+	}
+	for _, entry := range nonbanlist {
+		if entry == "" {
+			continue
+		}
+		if ip := net.ParseIP(entry); ip != nil {
+			if ip.String() == address {
+				return true
+			}
+			continue
+		}
+		if entry == address {
+			return true
+		}
+	}
+	return false
+}
+
 // check whether an IP is in the map already
 //
 //	we should loop and search in subnets also
@@ -171,13 +203,10 @@ func IsAddressInBanList(address string) bool {
 	ban_mutex.Lock()
 	defer ban_mutex.Unlock()
 
-	// any i which cannot be banned should never be banned
-	// this list contains any seed nodes/exclusive nodes/proirity nodes
-	// these are never banned
-	for i := range nonbanlist {
-		if address == nonbanlist[i] {
-			return true
-		}
+	// any address which cannot be banned should never be reported as banned.
+	// see isNonBannable for exactly what this does and does not cover.
+	if isNonBannable(address) {
+		return false
 	}
 
 	// if it's a subnet or direct ip, do instant check
@@ -212,10 +241,17 @@ func Ban_Address(address string, ban_seconds uint64) (err error) {
 	ban_mutex.Lock()
 	defer ban_mutex.Unlock()
 
-	// make sure we are not banning seed nodes/exclusive node/priority nodes on command line
 	_, address, err = ParseAddress(address)
 	if err != nil {
 		return
+	}
+
+	// make sure we are not banning seed nodes/exclusive node/priority nodes on
+	// command line. Previously this comment described intent the code never
+	// implemented; isNonBannable is the actual check, so refuse here rather
+	// than silently recording a ban that would never be enforced.
+	if isNonBannable(address) {
+		return fmt.Errorf("address %q is a pinned seed/exclusive/priority node and cannot be banned", address)
 	}
 
 	//logger.Warnf("%s banned for %d secs", address, ban_seconds)
