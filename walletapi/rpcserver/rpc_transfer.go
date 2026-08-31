@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/deroproject/derohe/cryptography/crypto"
+	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/transaction"
 )
@@ -37,7 +38,8 @@ func Transfer(ctx context.Context, p rpc.Transfer_Params) (result rpc.Transfer_R
 
 	defer func() { // safety so if anything wrong happens, we return error
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic occured. stack trace %s", debug.Stack())
+			globals.Logger.V(1).Error(nil, "panic in RPC handler", "r", r, "stack", debug.Stack())
+			err = fmt.Errorf("internal error")
 		}
 	}()
 
