@@ -254,6 +254,71 @@ func (tx *Transaction) GasStorage() (fees uint64) {
 	*/
 }
 
+// RegistrationPoWLeadingZeroBits is the number of leading zero bits the
+// registration tx hash must carry to be accepted by consensus once HF4 is
+// active. It was raised from 24 to 28 bits to restore the anti-spam cost of
+// wallet registration after client-side registration miners were optimized
+// (increment-optimized nonce search) and made hashing much faster.
+//
+// A registration found under the 28-bit target trivially satisfies the
+// historical 24-bit target, so wallets may always search for the harder
+// target and remain valid before and after the fork.
+const RegistrationPoWLeadingZeroBits = 28
+
+// registrationHashPoWSolved reports whether hash meets a proof-of-work target
+// of `bits` leading zero bits.
+func registrationHashPoWSolved(hash crypto.Hash, bits int) bool {
+	if bits < 0 || bits > 256 {
+		return false
+	}
+	fullBytes := bits / 8
+	remBits := bits % 8
+	for i := 0; i < fullBytes && i < len(hash); i++ {
+		if hash[i] != 0 {
+			return false
+		}
+	}
+	if remBits > 0 && fullBytes < len(hash) {
+		mask := byte(0xFF << (8 - remBits))
+		if hash[fullBytes]&mask != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// RegistrationPoWSolved reports whether the tx hash meets the registration
+// proof-of-work target of `bits` leading zero bits. Historically the network
+// required 24 bits (hash[0], hash[1], hash[2] == 0); with HF4 this is raised
+// to 28 bits (additionally the high nibble of hash[3] must be zero).
+func (tx *Transaction) RegistrationPoWSolved(bits int) bool {
+	if tx.TransactionType != REGISTRATION {
+		return false
+	}
+	return registrationHashPoWSolved(tx.GetHash(), bits)
+}
+
+// RegistrationActivationTopo reports whether a wallet registered at
+// registrationTopo has been "active" long enough to be usable at nowTopo, i.e.
+// whether at least afterBlocks final (miner) blocks have passed since
+// registration. Final blocks run at config.BLOCK_TIME (18s), so the caller
+// picks afterBlocks = config.RegistrationActiveAfterBlocks (50 → ~15 min).
+//
+// This is the availability-style gate that replaces the loose "wait a bit"
+// mining cooldown once the HF4 rule is active: a wallet is only usable after
+// it has lived N confirmed blocks on-chain, measured in chain-height progress
+// rather than wall-clock time, so it stays correct across future block-time
+// changes.
+//
+// Guards the arithmetic: a registration in the future (clock skew / reorg)
+// and a topo that has not yet advanced are both treated as "not yet active".
+func RegistrationActivationTopo(registrationTopo, nowTopo, afterBlocks int64) bool {
+	if nowTopo < 0 || registrationTopo < 0 || afterBlocks <= 0 {
+		return false
+	}
+	return nowTopo-registrationTopo >= afterBlocks
+}
+
 func (tx *Transaction) IsRegistrationValid() (result bool) {
 
 	var u bn256.G1

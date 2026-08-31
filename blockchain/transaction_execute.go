@@ -199,6 +199,14 @@ func (chain *Blockchain) process_transaction(changed map[crypto.Hash]*graviton.T
 
 		balance_tree.Put(tx.MinerAddress[:], nb.Serialize())
 
+		// HF4: record the block height at which this wallet registered, so the
+		// registration-activation cooldown (a wallet is only usable
+		// RegistrationActiveAfterBlocks≈50 blocks ≈15 min after registration)
+		// can be enforced once the rule is active. The marker is additive and
+		// lives outside the account's balance value, so it never disturbs the
+		// homomorphic balance or its NonceHeight.
+		writeRegistrationHeightMarker(balance_tree, tx.MinerAddress, int64(height))
+
 		return 0 // registration doesn't give any fees . why & how ?
 
 	case transaction.BURN_TX, transaction.NORMAL, transaction.SC_TX: // burned amount is not added anywhere and thus lost forever

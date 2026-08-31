@@ -187,6 +187,12 @@ func SendJob() {
 
 			if !v.valid_address && !chain.IsAddressHashValid(false, v.address_sum) {
 				params.LastError = "unregistered miner or you need to wait 15 mins"
+			} else if !v.valid_address && !chain.IsMinerUsableFromHash(v.address_sum) {
+				// HF4: a wallet registered post-HF4 cannot mine until it has
+				// waited the registration-activation cooldown. Legacy miners
+				// (no marker) and pre-HF4 chains pass the usable gate above.
+				params.LastError = "wallet is not yet active — new wallets become mineable " +
+					fmt.Sprintf("%d", config.RegistrationActiveAfterBlocks) + " blocks after registration"
 			} else {
 				v.valid_address = true
 			}
