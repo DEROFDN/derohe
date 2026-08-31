@@ -33,6 +33,17 @@ func GetTransfers(ctx context.Context, p rpc.Get_Transfers_Params) (result rpc.G
 
 	w := FromContext(ctx)
 
+	// Token history is not part of the background zero-SCID polling loop.
+	// Refresh tracked tokens asynchronously so a transfer query never blocks on
+	// a full historical scan. This is best-effort: a transient daemon error here
+	// must not turn a previously pure local read into a hard RPC failure, so we
+	// log and fall through to the cached data below rather than returning err.
+	if !p.SCID.IsZero() && w.wallet.IsSCIDTracked(p.SCID) && w.wallet.GetMode() && w.wallet.IsDaemonOnlineCached() {
+		if err := w.wallet.SyncHistoryAsync(p.SCID); err != nil {
+			w.logger.V(1).Error(err, "GetTransfers: best-effort token refresh failed, serving cached history", "scid", p.SCID.String())
+		}
+	}
+
 	result.Entries = w.wallet.Show_Transfers(p.SCID, p.Coinbase, p.In, p.Out, p.Min_Height, p.Max_Height, p.Sender, p.Receiver, p.DestinationPort, p.SourcePort)
 
 	return result, nil

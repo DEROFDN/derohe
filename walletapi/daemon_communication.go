@@ -28,8 +28,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -59,18 +61,77 @@ import (
 // this global variable should be within wallet structure
 var Connected bool = false
 
-var daemon_height int64
-var daemon_topoheight int64
-var last_event_topoheight_tracked int64
+var connectionMu sync.Mutex // serializes Connect with final connectivity teardown
 
+var (
+	daemonStateMu                 sync.RWMutex
+	daemon_height                 int64
+	daemon_topoheight             int64
+	last_event_topoheight_tracked int64
+	connectionGeneration          uint64
+)
+
+func setConnected(connected bool) {
+	daemonStateMu.Lock()
+	if connected && !Connected {
+		connectionGeneration++
+	}
+	Connected = connected
+	daemonStateMu.Unlock()
+}
+
+func getConnectionGeneration() uint64 {
+	_, _, generation, _ := daemonSyncState()
+	return generation
+}
+
+func isConnected() bool {
+	_, _, _, connected := daemonSyncState()
+	return connected
+}
+
+func daemonSyncState() (height, topoheight int64, generation uint64, connected bool) {
+	daemonStateMu.RLock()
+	defer daemonStateMu.RUnlock()
+	return daemon_height, daemon_topoheight, connectionGeneration, Connected
+}
+
+func setDaemonHeights(height, topoheight int64) {
+	daemonStateMu.Lock()
+	daemon_height = height
+	daemon_topoheight = topoheight
+	daemonStateMu.Unlock()
+}
+
+func getDaemonHeights() (height, topoheight int64) {
+	daemonStateMu.RLock()
+	defer daemonStateMu.RUnlock()
+	return daemon_height, daemon_topoheight
+}
+
+func getDaemonTopoHeight() int64 {
+	_, topoheight := getDaemonHeights()
+	return topoheight
+}
+
+func trackDaemonTopoHeight(topoheight int64) bool {
+	daemonStateMu.Lock()
+	defer daemonStateMu.Unlock()
+	if topoheight <= last_event_topoheight_tracked {
+		return false
+	}
+	last_event_topoheight_tracked = topoheight
+	return true
+}
 // return daemon height
 func Get_Daemon_Height() int64 {
-	return daemon_height
+	height, _ := getDaemonHeights()
+	return height
 }
 
 // return topoheight of daemon
 func Get_Daemon_TopoHeight() int64 {
-	return daemon_topoheight
+	return getDaemonTopoHeight()
 }
 
 var simulator bool // turns on simulator, which has 0 fees
@@ -99,7 +160,6 @@ func WaitNewHeightBlock() {
 }
 
 func Notify_broadcaster(req *jrpc2.Request) {
-	timer.Reset(timeout) // connection is alive
 	switch req.Method() {
 	case "Block":
 		NotifyNewBlock.L.Lock()
@@ -109,7 +169,6 @@ func Notify_broadcaster(req *jrpc2.Request) {
 		NotifyHeightChange.L.Lock()
 		NotifyHeightChange.Broadcast()
 		NotifyHeightChange.L.Unlock()
-		go test_connectivity()
 	case "MiniBlock": // we can skip this
 	default:
 		logger.V(1).Info("Notification received", "method", req.Method())
@@ -119,44 +178,85 @@ func Notify_broadcaster(req *jrpc2.Request) {
 
 var Daemon_Endpoint string
 var Daemon_Endpoint_Active string
+var daemonEndpointMu sync.RWMutex
+
+func setDaemonEndpointActive(value string) {
+	daemonEndpointMu.Lock()
+	Daemon_Endpoint_Active = value
+	daemonEndpointMu.Unlock()
+}
+
+func getDaemonEndpointActive() string {
+	daemonEndpointMu.RLock()
+	defer daemonEndpointMu.RUnlock()
+	return Daemon_Endpoint_Active
+}
+
+// daemonWebsocketURL normalizes the configured daemon endpoint for the wallet
+// websocket API without appending a duplicate /ws path.
+func daemonWebsocketURL(value string) string {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		value = "wss://" + value[len("https://"):]
+	case strings.HasPrefix(lower, "http://"):
+		value = "ws://" + value[len("http://"):]
+	case strings.HasPrefix(lower, "wss://"), strings.HasPrefix(lower, "ws://"):
+	default:
+		value = "ws://" + value
+	}
+	value = strings.TrimSuffix(value, "/")
+	if !strings.HasSuffix(strings.ToLower(value), "/ws") {
+		value += "/ws"
+	}
+	return value
+}
 
 func get_daemon_address() string {
+	active := getDaemonEndpointActive()
 	if globals.Arguments["--remote"] == true && globals.IsMainnet() {
-		Daemon_Endpoint_Active = config.REMOTE_DAEMON // + fmt.Sprintf(":%d", config.Mainnet.RPC_Default_Port)
+		active = config.REMOTE_DAEMON // + fmt.Sprintf(":%d", config.Mainnet.RPC_Default_Port)
 	}
 
 	// if user provided endpoint has error, use default
-	if Daemon_Endpoint_Active == "" {
-		Daemon_Endpoint_Active = "127.0.0.1:" + fmt.Sprintf("%d", config.Mainnet.RPC_Default_Port)
+	if active == "" {
+		active = "127.0.0.1:" + fmt.Sprintf("%d", config.Mainnet.RPC_Default_Port)
 		if !globals.IsMainnet() {
-			Daemon_Endpoint_Active = "127.0.0.1:" + fmt.Sprintf("%d", config.Testnet.RPC_Default_Port)
+			active = "127.0.0.1:" + fmt.Sprintf("%d", config.Testnet.RPC_Default_Port)
 		}
 	}
 
 	if globals.Arguments["--daemon-address"] != nil {
-		Daemon_Endpoint_Active = globals.Arguments["--daemon-address"].(string)
+		active = globals.Arguments["--daemon-address"].(string)
 	}
-
-	return Daemon_Endpoint_Active
+	setDaemonEndpointActive(active)
+	return active
 }
 
 // tests connectivity when connectivity to daemon
-func test_connectivity() (err error) {
+func test_connectivity() error {
+	return test_connectivity_with_context(context.Background())
+}
+
+func test_connectivity_with_context(ctx context.Context) (err error) {
 	var result string
 
 	// Issue a call with a response.
-	if err = rpc_client.Call("DERO.Echo", []string{"hello", "world"}, &result); err != nil {
+	if err = rpc_client.CallWithContext(ctx, "DERO.Echo", []string{"hello", "world"}, &result); err != nil {
 		logger.V(1).Error(err, "DERO.Echo Call failed:")
-		Connected = false
+		setConnected(false)
+		setDaemonHeights(0, 0)
 		return
 	}
 	//fmt.Println(result)
 
 	var info rpc.GetInfo_Result
 	// Issue a call with a response.
-	if err = rpc_client.Call("DERO.GetInfo", nil, &info); err != nil {
+	if err = rpc_client.CallWithContext(ctx, "DERO.GetInfo", nil, &info); err != nil {
 		logger.V(1).Error(err, "DERO.GetInfo Call failed:")
-		Connected = false
+		setConnected(false)
+		setDaemonHeights(0, 0)
 		return
 	}
 
@@ -166,6 +266,8 @@ func test_connectivity() (err error) {
 	if info.Testnet != !globals.IsMainnet() {
 		err = fmt.Errorf("Mainnet/TestNet  is different between wallet/daemon.Please run daemon/wallet without --testnet")
 		logger.Error(err, "Mainnet/Testnet mismatch")
+		setConnected(false)
+		setDaemonHeights(0, 0)
 		return
 	}
 
@@ -173,58 +275,171 @@ func test_connectivity() (err error) {
 		simulator = true
 	}
 
-	daemon_height = info.Height
-	daemon_topoheight = info.TopoHeight
+	setDaemonHeights(info.Height, info.TopoHeight)
 	//	logger.Info("connection is maintained")
 	return nil
 }
 
 // triggers syncing with wallet every 5 seconds
-func (w *Wallet_Memory) sync_loop() {
-	//logger = globals.Logger
+func (w *Wallet_Memory) sync_loop(ctx context.Context, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+
 	for {
 		select {
+		case <-stop:
+			return
 		case <-w.Quit:
-			break
+			return
 		default:
 		}
 
-		if w.account.lastsaved.IsZero() || time.Since(w.account.lastsaved) > w.account.SaveChangesEvery {
+		if w.shouldSave() {
 			w.save_if_disk() // save wallet()
+			w.Lock()
 			w.account.lastsaved = time.Now()
+			w.Unlock()
 			//	w.db.Sync()
 		}
 
-		if IsDaemonOnline() && test_connectivity() != nil {
-			time.Sleep(timeout) // wait 5 seconds
+		if IsDaemonOnline() && test_connectivity_with_context(ctx) != nil {
+			select {
+			case <-stop:
+				return
+			case <-time.After(timeout):
+			}
 			continue
 		}
 
 		var zerohash crypto.Hash
-		if len(w.account.EntriesNative) == 0 {
-			if err := w.Sync_Wallet_Memory_With_Daemon(); err != nil {
-				logger.Error(err, "wallet syncing err")
-			}
-		} else {
-			for k := range w.account.EntriesNative {
-				err := w.Sync_Wallet_Memory_With_Daemon_internal(k)
-				if k == zerohash && err != nil {
-					logger.Error(err, "wallet syncing err")
-				}
-			}
+		// The zero-SCID balance is the wallet's primary sync indicator. Token
+		// balances and history are refreshed on demand by their API callers.
+		if err := w.Sync_Wallet_Memory_With_Daemon_internal(zerohash); err != nil {
+			logger.Error(err, "wallet syncing err")
 		}
 
-		time.Sleep(timeout) // wait 5 seconds
+		select {
+		case <-stop:
+			return
+		case <-time.After(timeout):
+		}
 	}
 }
 
-func (cli *Client) Call(method string, params interface{}, result interface{}) error {
-	return cli.RPC.CallResult(context.Background(), method, params, result)
+var (
+	rpcCallTimeoutMu sync.RWMutex
+	rpcCallTimeout   = 10 * time.Second
+)
+
+// SetRPCCallTimeout changes the maximum duration of a wallet daemon RPC call.
+// A non-positive duration is rejected because it would disable the protection
+// against calls stuck on a half-open websocket connection.
+func SetRPCCallTimeout(timeout time.Duration) error {
+	if timeout <= 0 {
+		return fmt.Errorf("RPC call timeout must be positive")
+	}
+	rpcCallTimeoutMu.Lock()
+	rpcCallTimeout = timeout
+	rpcCallTimeoutMu.Unlock()
+	return nil
 }
+
+func (cli *Client) Call(method string, params interface{}, result interface{}) error {
+	return cli.CallWithContext(context.Background(), method, params, result)
+}
+
+// CallResponseWithContext is the response-returning counterpart to CallWithContext
+// for callers that need to inspect the raw jrpc2 response.
+func (cli *Client) CallResponseWithContext(ctx context.Context, method string, params interface{}) (*jrpc2.Response, error) {
+	if cli == nil {
+		return nil, fmt.Errorf("daemon RPC client is unavailable")
+	}
+
+	cli.lifecycleMu.RLock()
+
+	cli.mu.RLock()
+	rpc := cli.RPC
+	cli.mu.RUnlock()
+	if rpc == nil {
+		cli.lifecycleMu.RUnlock()
+		return nil, fmt.Errorf("daemon RPC client is unavailable")
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, currentRPCCallTimeout())
+	defer cancel()
+
+	response, err := rpc.Call(callCtx, method, params)
+	cli.lifecycleMu.RUnlock()
+	if err != nil {
+		if cli == rpc_client && isRPCTransportFailure(err) {
+			invalidateRPCClient(cli, rpc)
+		}
+		return nil, err
+	}
+	return response, nil
+}
+
+// CallWithContext performs a wallet daemon RPC call with the configured upper
+// bound, while still honoring an earlier deadline supplied by the caller.
+func (cli *Client) CallWithContext(ctx context.Context, method string, params interface{}, result interface{}) error {
+	if cli == nil {
+		return fmt.Errorf("daemon RPC client is unavailable")
+	}
+
+	cli.lifecycleMu.RLock()
+
+	cli.mu.RLock()
+	rpc := cli.RPC
+	cli.mu.RUnlock()
+	if rpc == nil {
+		cli.lifecycleMu.RUnlock()
+		return fmt.Errorf("daemon RPC client is unavailable")
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, currentRPCCallTimeout())
+	defer cancel()
+
+	err := rpc.CallResult(callCtx, method, params, result)
+	cli.lifecycleMu.RUnlock()
+	if err != nil {
+		if cli == rpc_client && isRPCTransportFailure(err) {
+			invalidateRPCClient(cli, rpc)
+		}
+		return err
+	}
+	return nil}
 
 // returns whether wallet was online some time ago
 func (w *Wallet_Memory) IsDaemonOnlineCached() bool {
-	return Connected
+	return isConnected() && IsDaemonOnline()
+}
+
+func (w *Wallet_Memory) rpcContext() context.Context {
+	w.sync_context_mu.RLock()
+	ctx := w.sync_loop_ctx
+	w.sync_context_mu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func currentRPCCallTimeout() time.Duration {
+	rpcCallTimeoutMu.RLock()
+	defer rpcCallTimeoutMu.RUnlock()
+	return rpcCallTimeout
+}
+
+func isRPCTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rpcErr *jrpc2.Error
+	if errors.As(err, &rpcErr) {
+		return false
+	}
+	// jrpc2 reports application errors as *jrpc2.Error. Other errors are
+	// transport/lifecycle failures and must not leave a dead client online.
+	return true
 }
 
 // currently process url  with compatibility for older ip address
@@ -240,10 +455,9 @@ func buildurl(endpoint string) string {
 // single threaded communication to get the daemon status and height
 // this will tell whether the wallet can connection successfully to  daemon or not
 func IsDaemonOnline() bool {
-	if rpc_client.WS == nil || rpc_client.RPC == nil {
-		return false
-	}
-	return true
+	rpc_client.mu.RLock()
+	defer rpc_client.mu.RUnlock()
+	return rpc_client.WS != nil && rpc_client.RPC != nil
 }
 
 // sync the wallet with daemon, this is instantaneous and can be done with a single call
@@ -251,16 +465,15 @@ func IsDaemonOnline() bool {
 func (w *Wallet_Memory) Sync_Wallet_Memory_With_Daemon_internal(scid crypto.Hash) (err error) {
 
 	if !IsDaemonOnline() {
-		daemon_height = 0
-		daemon_topoheight = 0
+		setDaemonHeights(0, 0)
+
 		return fmt.Errorf("Daemon is offline")
 	} else {
-		if daemon_topoheight > last_event_topoheight_tracked {
-			last_event_topoheight_tracked = daemon_topoheight
-			if listeners, ok := w.account.EventListeners[rpc.NewTopoheight]; ok {
-				for _, listener := range listeners {
-					listener(daemon_topoheight)
-				}
+		_, daemonTopoHeight := getDaemonHeights()
+		if trackDaemonTopoHeight(daemonTopoHeight) {
+			listeners := w.listeners(rpc.NewTopoheight)
+			for _, listener := range listeners {
+				listener(daemonTopoHeight)
 			}
 		}
 		//w.random_ring_members()
@@ -268,27 +481,39 @@ func (w *Wallet_Memory) Sync_Wallet_Memory_With_Daemon_internal(scid crypto.Hash
 		previous := w.getEncryptedBalanceresult(scid).Data
 
 		if _, _, _, e, err := w.GetEncryptedBalanceAtTopoHeight(scid, -1, w.GetAddress().String()); err == nil {
+			if scid.IsZero() {
+				// The native refresh completed against the daemon tip reported
+				// by this response. Keep this progress marker separate from the
+				// balance snapshot metadata used by history synchronization.
+				daemonHeight, daemonTopoHeight := getDaemonHeights()
+				w.markNativeSync(daemonHeight, daemonTopoHeight)
+			}
 
 			//fmt.Printf("data '%s' previous '%s' scid %s\n", w.account.Balance_Result[scid].Data, previous, scid)
 			if w.getEncryptedBalanceresult(scid).Data != previous {
-				b := w.DecodeEncryptedBalance_Memory(e, w.account.Balance[scid]) // try to decode balance
+				matureBalance, _ := w.Get_Balance_scid(scid)
+				b := w.DecodeEncryptedBalance_Memory(e, matureBalance) // try to decode balance
 
 				// Call all listeners registered
 				// TODO scid
-				if listeners, ok := w.account.EventListeners[rpc.NewBalance]; ok {
-					for _, listener := range listeners {
-						listener(rpc.BalanceChange{Balance: b, Scid: scid})
-					}
+				listeners := w.listeners(rpc.NewBalance)
+				for _, listener := range listeners {
+					listener(rpc.BalanceChange{Balance: b, Scid: scid})
 				}
 
 				if scid.IsZero() {
 					// Event sender
+					w.Lock()
 					w.account.Balance_Mature = b
+					w.Unlock()
 				}
 				w.Lock()
+				if w.account.Balance == nil {
+					w.account.Balance = map[crypto.Hash]uint64{}
+				}
 				w.account.Balance[scid] = b
 				w.Unlock()
-				w.SyncHistory(scid) // also update statement
+				w.scheduleSyncHistory(scid)
 			}
 
 			w.save_if_disk() // save wallet
@@ -317,7 +542,7 @@ func (w *Wallet_Memory) NameToAddress(name string) (addr string, err error) {
 	}
 
 	var result rpc.NameToAddress_Result
-	if err = rpc_client.Call("DERO.NameToAddress", rpc.NameToAddress_Params{Name: name, TopoHeight: -1}, &result); err != nil {
+	if err = rpc_client.CallWithContext(w.rpcContext(), "DERO.NameToAddress", rpc.NameToAddress_Params{Name: name, TopoHeight: -1}, &result); err != nil {
 		return
 	}
 
@@ -346,7 +571,7 @@ func (w *Wallet_Memory) SendTransaction(tx *transaction.Transaction) (err error)
 	params := rpc.SendRawTransaction_Params{Tx_as_hex: hex.EncodeToString(tx.Serialize())}
 	var result rpc.SendRawTransaction_Result
 
-	if err := rpc_client.Call("DERO.SendRawTransaction", params, &result); err != nil {
+	if err := rpc_client.CallWithContext(w.rpcContext(), "DERO.SendRawTransaction", params, &result); err != nil {
 		return err
 	}
 
@@ -364,7 +589,7 @@ func (w *Wallet_Memory) SendTransaction(tx *transaction.Transaction) (err error)
 func (w *Wallet_Memory) DecodeEncryptedBalanceNow(el *crypto.ElGamal) uint64 {
 
 	balance_point := new(bn256.G1).Add(el.Left, new(bn256.G1).Neg(new(bn256.G1).ScalarMult(el.Right, w.account.Keys.Secret.BigInt())))
-	return Balance_lookup_table.Lookup(balance_point, w.account.Balance_Mature)
+	return Balance_lookup_table.Lookup(balance_point, w.getBalanceMature())
 }
 
 func (w *Wallet_Memory) GetSelfEncryptedBalanceAtTopoHeight(scid crypto.Hash, topoheight int64) (r rpc.GetEncryptedBalance_Result, err error) {
@@ -375,7 +600,7 @@ func (w *Wallet_Memory) GetSelfEncryptedBalanceAtTopoHeight(scid crypto.Hash, to
 		}
 	}()
 
-	err = rpc_client.Call("DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: w.GetAddress().String(), TopoHeight: topoheight}, &r)
+	err = rpc_client.CallWithContext(w.rpcContext(), "DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: w.GetAddress().String(), TopoHeight: topoheight}, &r)
 	return
 }
 
@@ -385,6 +610,10 @@ func (w *Wallet_Memory) GetSelfEncryptedBalanceAtTopoHeight(scid crypto.Hash, to
 // TODO in order to stop privacy leaks we must guess this information somehow on client side itself
 // maybe the server can broadcast a bloomfilter or something else from the mempool keyimages
 func (w *Wallet_Memory) GetEncryptedBalanceAtTopoHeight(scid crypto.Hash, topoheight int64, accountaddr string) (bits int, lastused uint64, blid crypto.Hash, e *crypto.ElGamal, err error) {
+	return w.getEncryptedBalanceAtTopoHeightWithContext(w.rpcContext(), scid, topoheight, accountaddr)
+}
+
+func (w *Wallet_Memory) getEncryptedBalanceAtTopoHeightWithContext(ctx context.Context, scid crypto.Hash, topoheight int64, accountaddr string) (bits int, lastused uint64, blid crypto.Hash, e *crypto.ElGamal, err error) {
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -407,11 +636,13 @@ func (w *Wallet_Memory) GetEncryptedBalanceAtTopoHeight(scid crypto.Hash, topohe
 	var result rpc.GetEncryptedBalance_Result
 
 	// Issue a call with a response.
-	if err = rpc_client.Call("DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: accountaddr, TopoHeight: topoheight}, &result); err != nil {
+	if err = rpc_client.CallWithContext(ctx, "DERO.GetEncryptedBalance", rpc.GetEncryptedBalance_Params{SCID: scid, Address: accountaddr, TopoHeight: topoheight}, &result); err != nil {
 		logger.Error(err, "DERO.GetEncryptedBalance Call failed:")
 
 		if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(errormsg.ErrAccountUnregistered.Error())) && accountaddr == w.GetAddress().String() && scid.IsZero() {
+			w.Lock()
 			w.Error = errormsg.ErrAccountUnregistered
+			w.Unlock()
 			//fmt.Printf("setting unregisterd111 err %s scid %s topoheight %d\n",err,scid, topoheight)
 			//fmt.Printf("debug stack %s\n",debug.Stack())
 
@@ -438,10 +669,14 @@ func (w *Wallet_Memory) GetEncryptedBalanceAtTopoHeight(scid crypto.Hash, topohe
 	//		fmt.Printf("GetEncryptedBalance result  %+v\n", result)
 	if scid.IsZero() && accountaddr == w.GetAddress().String() {
 		if result.Status == errormsg.ErrAccountUnregistered.Error() {
+			w.Lock()
 			w.Error = errormsg.ErrAccountUnregistered
 			w.account.Registered = false
+			w.Unlock()
 		} else {
+			w.Lock()
 			w.account.Registered = true
+			w.Unlock()
 		}
 	}
 
@@ -453,27 +688,28 @@ func (w *Wallet_Memory) GetEncryptedBalanceAtTopoHeight(scid crypto.Hash, topohe
 	}
 
 	if topoheight == -1 {
-		daemon_height = result.DHeight
-		daemon_topoheight = result.DTopoheight
+		setDaemonHeights(result.DHeight, result.DTopoheight)
 
-		if daemon_topoheight > last_event_topoheight_tracked {
-			last_event_topoheight_tracked = daemon_topoheight
-			// Call all listeners registered
-			if listeners, ok := w.account.EventListeners[rpc.NewTopoheight]; ok {
-				for _, listener := range listeners {
-					listener(result.Topoheight)
-				}
+		if trackDaemonTopoHeight(result.DTopoheight) {
+			listeners := w.listeners(rpc.NewTopoheight)
+			for _, listener := range listeners {
+				listener(result.Topoheight)
 			}
 		}
 
+		w.Lock()
 		w.Merkle_Balance_TreeHash = result.DMerkle_Balance_TreeHash
+		w.Unlock()
 	}
 
 	if topoheight == -1 && accountaddr == w.GetAddress().String() {
-		//fmt.Printf("topoheight %d accountaddr '%s' waddress '%s'\n ",topoheight,accountaddr,w.GetAddress().String())
-
+		// Cache the daemon response unchanged: Height/Topoheight identify the
+		// balance snapshot used by history synchronization. The live daemon tip
+		// is tracked separately in daemon_height/daemon_topoheight.
 		w.setEncryptedBalanceresult(scid, result)
+		w.Lock()
 		w.account.TopoHeight = result.Topoheight
+		w.Unlock()
 	}
 
 	if scid.IsZero() && result.Status != "OK" {
@@ -487,7 +723,9 @@ func (w *Wallet_Memory) GetEncryptedBalanceAtTopoHeight(scid crypto.Hash, topohe
 	}
 
 	if accountaddr == w.GetAddress().String() && scid.IsZero() {
+		w.Lock()
 		w.Error = nil
+		w.Unlock()
 	}
 
 	var nb crypto.NonceBalance
@@ -518,7 +756,7 @@ func (w *Wallet_Memory) Random_ring_members(scid crypto.Hash) (alist []string) {
 	//fmt.Printf("getting ring members %s  %s\n",scid.String(), debug.Stack())
 
 	// Issue a call with a response.
-	if err := rpc_client.Call("DERO.GetRandomAddress", rpc.GetRandomAddress_Params{SCID: scid}, &result); err != nil {
+	if err := rpc_client.CallWithContext(w.rpcContext(), "DERO.GetRandomAddress", rpc.GetRandomAddress_Params{SCID: scid}, &result); err != nil {
 		logger.V(1).Error(err, "DERO.GetRandomAddress Call failed:")
 		return
 	}
@@ -534,30 +772,134 @@ func (w *Wallet_Memory) Random_ring_members(scid crypto.Hash) (alist []string) {
 }
 
 // sync history of wallet from blockchain
-var sync_multilock sync.Mutex // make sync history single threaded
+var sync_multilock sync.Mutex // serialize daemon history scans across wallets
+
+// scheduleSyncHistory coalesces balance notifications while a history scan is
+// running. This keeps the balance polling loop responsive without allowing
+// concurrent scans to mutate EntriesNative or the encrypted-balance cache.
+// SyncHistoryAsync refreshes a tracked token balance, then schedules a
+// coalesced background history scan. RPC callers do not wait for the scan.
+func (w *Wallet_Memory) SyncHistoryAsync(scid crypto.Hash) error {
+	if err := w.Sync_Wallet_Memory_With_Daemon_internal(scid); err != nil {
+		return err
+	}
+	// Explicit transfer refreshes must scan even when the encrypted balance is
+	// unchanged: a new transfer can preserve the wallet's final balance.
+	w.scheduleSyncHistory(scid)
+	return nil
+}
+
+func (w *Wallet_Memory) scheduleSyncHistory(scid crypto.Hash) {
+	w.sync_in_progress.Lock()
+	if w.sync_history_running == nil {
+		w.sync_history_running = map[crypto.Hash]bool{}
+	}
+	if w.sync_history_pending == nil {
+		w.sync_history_pending = map[crypto.Hash]bool{}
+	}
+	if w.sync_history_running[scid] {
+		w.sync_history_pending[scid] = true
+		w.sync_in_progress.Unlock()
+		return
+	}
+	w.sync_history_running[scid] = true
+	w.sync_in_progress.Unlock()
+
+	ctx := w.rpcContext()
+	go func() {
+		for {
+			if err := w.syncHistoryWithContext(scid, ctx); err != nil {
+				logger.Error(err, "wallet history syncing failed", "scid", scid.String())
+			}
+
+			w.sync_in_progress.Lock()
+			// A wallet session can end while this scan is in flight. Do not
+			// reuse its canceled context for a pending scan; release the
+			// schedule state so the next online refresh can create a new run.
+			if ctx.Err() != nil {
+				if w.sync_history_pending[scid] && w.GetMode() {
+					// A new online session queued work while the old scan was
+					// unwinding. Adopt the new session context instead of
+					// dropping that refresh with the canceled session.
+					ctx = w.rpcContext()
+					w.sync_history_pending[scid] = false
+					w.sync_in_progress.Unlock()
+					continue
+				}
+				delete(w.sync_history_pending, scid)
+				delete(w.sync_history_running, scid)
+				w.sync_in_progress.Unlock()
+				return
+			}
+			if w.sync_history_pending[scid] {
+				w.sync_history_pending[scid] = false
+				w.sync_in_progress.Unlock()
+				continue
+			}
+			delete(w.sync_history_running, scid)
+			w.sync_in_progress.Unlock()
+			return
+		}
+	}()
+}
+
+// SyncHistoryWithError exposes history-sync failures to callers that need to
+// distinguish a completed scan from a failed daemon request.
+func (w *Wallet_Memory) SyncHistoryWithError(scid crypto.Hash) error {
+	return w.syncHistory(scid)
+}
+
+// SyncHistory is kept as a compatibility wrapper for existing callers.
 func (w *Wallet_Memory) SyncHistory(scid crypto.Hash) (balance uint64) {
+	_ = w.SyncHistoryWithError(scid)
+	return 0
+}
+
+func (w *Wallet_Memory) replaceHistoryIfUnchanged(scid crypto.Hash, previous, replacement []rpc.Entry) bool {
+	w.Lock()
+	defer w.Unlock()
+	if !reflect.DeepEqual(w.account.EntriesNative[scid], previous) {
+		return false
+	}
+	if w.account.EntriesNative == nil {
+		w.account.EntriesNative = map[crypto.Hash][]rpc.Entry{}
+	}
+	w.account.EntriesNative[scid] = append([]rpc.Entry(nil), replacement...)
+	return true
+}
+
+func (w *Wallet_Memory) syncHistory(scid crypto.Hash) error {
+	return w.syncHistoryWithContext(scid, w.rpcContext())
+}
+
+func (w *Wallet_Memory) syncHistoryWithContext(scid crypto.Hash, ctx context.Context) (err error) {
 	sync_multilock.Lock()
 	defer sync_multilock.Unlock()
 
 	defer func() {
 		if r := recover(); r != nil {
+			err = fmt.Errorf("history sync panic: %v", r)
 			logger.V(1).Error(nil, "Recovered while syncing connecting", "r", r, "stack", debug.Stack())
 		}
 	}()
 
 	if w.getEncryptedBalanceresult(scid).Registration < 0 { // unregistered so skip
-		return
+		return nil
 	}
 
 	last_topo_height := int64(-1)
+	historyReplaced := false
 
 	//fmt.Printf("finding sync point  ( Registration point %d)\n", w.getEncryptedBalanceresult(scid).Registration)
 
-	entries := w.account.EntriesNative[scid]
+	w.RLock()
+	originalEntries := append([]rpc.Entry(nil), w.account.EntriesNative[scid]...)
+	entries := append([]rpc.Entry(nil), originalEntries...)
+	w.RUnlock()
 
 	logger.Info("syncing loop ", "total_entries", len(entries))
 
-	defer func() { logger.Info("syncing loop completed", "total_entries", len(w.account.EntriesNative[scid])) }()
+	defer func() { logger.Info("syncing loop completed", "total_entries", len(w.entriesForSCID(scid))) }()
 
 	// we need to find a sync point, to minimize traffic
 	for i := len(entries) - 1; i >= 0; {
@@ -572,14 +914,15 @@ func (w *Wallet_Memory) SyncHistory(scid crypto.Hash) (balance uint64) {
 		var result rpc.GetBlockHeaderByHeight_Result
 
 		// Issue a call with a response.
-		if err := rpc_client.Call("DERO.GetBlockHeaderByTopoHeight", rpc.GetBlockHeaderByTopoHeight_Params{TopoHeight: uint64(entries[i].TopoHeight)}, &result); err != nil {
+		if err := rpc_client.CallWithContext(ctx, "DERO.GetBlockHeaderByTopoHeight", rpc.GetBlockHeaderByTopoHeight_Params{TopoHeight: uint64(entries[i].TopoHeight)}, &result); err != nil {
 			logger.V(1).Error(err, "DERO.GetBlockHeaderByTopoHeight Call failed:")
-			return 0
+			return err
 		}
 
 		if result.Status != "OK" {
-			logger.Error(nil, "syncing loop status failed", "Status", result.Status, "topo", entries[i].TopoHeight)
-			return
+			err = fmt.Errorf("history header lookup failed: %s", result.Status)
+			logger.Error(err, "syncing loop status failed", "Status", result.Status, "topo", entries[i].TopoHeight)
+			return err
 		}
 
 		// wallet previous synced onto a side block chain / revert
@@ -594,13 +937,21 @@ func (w *Wallet_Memory) SyncHistory(scid crypto.Hash) (balance uint64) {
 				}
 			}
 			entries = entries[:i]
+			if !w.replaceHistoryIfUnchanged(scid, originalEntries, entries) {
+				err = fmt.Errorf("history changed while resolving reorg")
+				return err
+			}
+			originalEntries = append([]rpc.Entry(nil), entries...)
+			historyReplaced = true
 			i--
-			w.account.EntriesNative[scid] = entries
 			logger.Info("syncing loop skipped ", "i", i, "skip", skip)
 		}
 
 		if i <= 0 {
-			w.account.EntriesNative[scid] = entries[:0] // discard all entries
+			if !historyReplaced && !w.replaceHistoryIfUnchanged(scid, originalEntries, entries[:0]) {
+				err = fmt.Errorf("history changed while discarding entries")
+				return err
+			}
 			logger.Info("syncing loop discarding all entries", "i", i)
 			break
 		}
@@ -609,8 +960,7 @@ func (w *Wallet_Memory) SyncHistory(scid crypto.Hash) (balance uint64) {
 		if result.Block_Header.Hash == entries[i].BlockHash {
 			logger.Info("syncing loop from pos", "i", i, "start_topo", entries[i].TopoHeight+1, "end_topo", w.getEncryptedBalanceresult(scid).Topoheight)
 
-			w.synchistory_internal(scid, entries[i].TopoHeight+1, w.getEncryptedBalanceresult(scid).Topoheight)
-			return
+			return w.synchistory_internal(ctx, scid, entries[i].TopoHeight+1, w.getEncryptedBalanceresult(scid).Topoheight)
 		}
 
 		return
@@ -620,7 +970,7 @@ func (w *Wallet_Memory) SyncHistory(scid crypto.Hash) (balance uint64) {
 	logger.Info("syncing loop using Registration", "registraion", w.getEncryptedBalanceresult(scid).Registration)
 
 	// if we reached here, means we should sync from scratch
-	w.synchistory_internal(scid, w.getEncryptedBalanceresult(scid).Registration, w.getEncryptedBalanceresult(scid).Topoheight)
+	return w.synchistory_internal(ctx, scid, w.getEncryptedBalanceresult(scid).Registration, w.getEncryptedBalanceresult(scid).Topoheight)
 
 	//if w.account.Registration >= 0 {
 	// err :=
@@ -629,41 +979,39 @@ func (w *Wallet_Memory) SyncHistory(scid crypto.Hash) (balance uint64) {
 	// }
 	// fmt.Printf("syncing err %s\n",err)
 	// fmt.Printf("entries %+v\n", w.account.Entries)
-
-	return 0
 }
 
 // sync history
-func (w *Wallet_Memory) synchistory_internal(scid crypto.Hash, start_topo, end_topo int64) error {
+func (w *Wallet_Memory) synchistory_internal(ctx context.Context, scid crypto.Hash, start_topo, end_topo int64) error {
 	var err error
 	var start_balance_e *crypto.ElGamal
 
 	logger.Info("syncing loop  starting internal ", "start_topo", start_topo, "end_topo", end_topo)
 
-	if w.account.TrackRecentBlocks > 0 && daemon_topoheight >= w.account.TrackRecentBlocks {
-		start_topo = daemon_topoheight - w.account.TrackRecentBlocks
+	if trackRecentBlocks := w.getTrackRecentBlocks(); trackRecentBlocks > 0 && getDaemonTopoHeight() >= trackRecentBlocks {
+		start_topo = getDaemonTopoHeight() - trackRecentBlocks
 	}
 	if start_topo == w.getEncryptedBalanceresult(scid).Registration {
 		start_balance_e = crypto.ConstructElGamal(w.account.Keys.Public.G1(), crypto.ElGamal_BASE_G)
 	} else {
-		_, _, _, start_balance_e, err = w.GetEncryptedBalanceAtTopoHeight(scid, start_topo, w.GetAddress().String())
+		_, _, _, start_balance_e, err = w.getEncryptedBalanceAtTopoHeightWithContext(ctx, scid, start_topo, w.GetAddress().String())
 		if err != nil {
 			logger.Error(err, "syncing info failed", "start_topo", start_topo)
 			return err
 		}
 	}
 
-	_, _, _, end_balance_e, err := w.GetEncryptedBalanceAtTopoHeight(scid, end_topo, w.GetAddress().String())
+	_, _, _, end_balance_e, err := w.getEncryptedBalanceAtTopoHeightWithContext(ctx, scid, end_topo, w.GetAddress().String())
 	if err != nil {
 		logger.Error(err, "syncing info failed", "end_topo", end_topo)
 		return err
 	}
 
-	return w.synchistory_internal_binary_search(0, scid, start_topo, start_balance_e, end_topo, end_balance_e)
+	return w.synchistory_internal_binary_search(ctx, 0, scid, start_topo, start_balance_e, end_topo, end_balance_e)
 
 }
 
-func (w *Wallet_Memory) synchistory_internal_binary_search(level int, scid crypto.Hash, start_topo int64, start_balance_e *crypto.ElGamal, end_topo int64, end_balance_e *crypto.ElGamal) error {
+func (w *Wallet_Memory) synchistory_internal_binary_search(ctx context.Context, level int, scid crypto.Hash, start_topo int64, start_balance_e *crypto.ElGamal, end_topo int64, end_balance_e *crypto.ElGamal) error {
 
 	var err error
 
@@ -685,21 +1033,21 @@ func (w *Wallet_Memory) synchistory_internal_binary_search(level int, scid crypt
 		median := (start_topo + end_topo) / 2
 		//	fmt.Printf("%slevel %d low %d high %d median %d\n", strings.Repeat("\t", level), level, start_topo, end_topo, median)
 		if start_topo == median {
-			if err = w.synchistory_block(scid, start_topo); err != nil {
+			if err = w.synchistory_block(ctx, scid, start_topo); err != nil {
 				logger.Error(err, "syncing block failed", "start_topo", start_topo)
 				return err
 			}
 		}
 
 		if end_topo-start_topo <= 1 {
-			if err = w.synchistory_block(scid, end_topo); err != nil {
+			if err = w.synchistory_block(ctx, scid, end_topo); err != nil {
 				logger.Error(err, "syncing block failed", "end_topo", end_topo)
 				return err
 			}
 			return nil
 		}
 
-		_, _, _, median_balance_e, err := w.GetEncryptedBalanceAtTopoHeight(scid, median, w.GetAddress().String())
+		_, _, _, median_balance_e, err := w.getEncryptedBalanceAtTopoHeightWithContext(ctx, scid, median, w.GetAddress().String())
 		if err != nil {
 			logger.Error(err, "syncing block getting balance failed", "median", median)
 			return err
@@ -708,7 +1056,7 @@ func (w *Wallet_Memory) synchistory_internal_binary_search(level int, scid crypt
 		// check if there is a change in lower section, if yes process more
 		//fmt.Printf("%slevel %d checking lower\n", strings.Repeat("\t", level), level)
 		if start_topo == w.getEncryptedBalanceresult(scid).Registration || bytes.Compare(start_balance_e.Serialize(), median_balance_e.Serialize()) != 0 {
-			err = w.synchistory_internal_binary_search(level+1, scid, start_topo, start_balance_e, median, median_balance_e)
+			err = w.synchistory_internal_binary_search(ctx, level+1, scid, start_topo, start_balance_e, median, median_balance_e)
 			if err != nil {
 				logger.Error(err, "syncing block synchistory_internal_binary_search failed", "level+1", level+1, "start_topo", start_topo, "median", median)
 				return err
@@ -718,7 +1066,7 @@ func (w *Wallet_Memory) synchistory_internal_binary_search(level int, scid crypt
 		// check if there is a change in higher section, if yes process more
 		//fmt.Printf("%slevel %d checking higher\n", strings.Repeat("\t", level), level)
 		if bytes.Compare(median_balance_e.Serialize(), end_balance_e.Serialize()) != 0 {
-			err = w.synchistory_internal_binary_search(level+1, scid, median, median_balance_e, end_topo, end_balance_e)
+			err = w.synchistory_internal_binary_search(ctx, level+1, scid, median, median_balance_e, end_topo, end_balance_e)
 			if err != nil {
 				logger.Error(err, "syncing block synchistory_internal_binary_search failed", "level+1", level+1, "median", median, "end_topo", end_topo)
 				return err
@@ -734,7 +1082,7 @@ func (w *Wallet_Memory) synchistory_internal_binary_search(level int, scid crypt
 // Todo we should expose an API to get all txs which have the specific address as ring member
 // for a particular block
 // for the entire chain
-func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err error) {
+func (w *Wallet_Memory) synchistory_block(ctx context.Context, scid crypto.Hash, topo int64) (err error) {
 
 	var local_entries []rpc.Entry
 
@@ -746,21 +1094,21 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 	if topo <= 0 || w.getEncryptedBalanceresult(scid).Registration == topo {
 		previous_balance_e = crypto.ConstructElGamal(w.account.Keys.Public.G1(), crypto.ElGamal_BASE_G)
 	} else {
-		_, _, _, previous_balance_e, err = w.GetEncryptedBalanceAtTopoHeight(scid, topo-1, w.GetAddress().String())
+		_, _, _, previous_balance_e, err = w.getEncryptedBalanceAtTopoHeightWithContext(ctx, scid, topo-1, w.GetAddress().String())
 		if err != nil {
 			return err
 		}
 	}
 
 	//logger.Info("syncing block", "topo", topo)
-	_, _, _, current_balance_e, err = w.GetEncryptedBalanceAtTopoHeight(scid, topo, w.GetAddress().String())
+	_, _, _, current_balance_e, err = w.getEncryptedBalanceAtTopoHeightWithContext(ctx, scid, topo, w.GetAddress().String())
 	if err != nil {
 		return err
 	}
 
 	var bl block.Block
 	var bresult rpc.GetBlock_Result
-	if err = rpc_client.Call("DERO.GetBlock", rpc.GetBlock_Params{Height: uint64(topo)}, &bresult); err != nil {
+	if err = rpc_client.CallWithContext(ctx, "DERO.GetBlock", rpc.GetBlock_Params{Height: uint64(topo)}, &bresult); err != nil {
 		return fmt.Errorf("getblock rpc failed")
 	}
 
@@ -797,7 +1145,7 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 
 			//fmt.Printf("Requesting tx data %s\n", bl.Tx_hashes[i].String())
 
-			if err = rpc_client.Call("DERO.GetTransaction", tx_params, &tx_result); err != nil {
+			if err = rpc_client.CallWithContext(ctx, "DERO.GetTransaction", tx_params, &tx_result); err != nil {
 				return fmt.Errorf("gettransa rpc failed %s", err)
 			}
 

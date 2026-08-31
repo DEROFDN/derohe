@@ -23,7 +23,6 @@ import "testing"
 
 import "path/filepath"
 
-import "github.com/deroproject/derohe/globals"
 import "github.com/deroproject/derohe/config"
 import "github.com/deroproject/derohe/rpc"
 import "github.com/deroproject/derohe/blockchain"
@@ -69,12 +68,16 @@ func Test_Creation_TX_morecheck(t *testing.T) {
 	config.Mainnet.Genesis_Block_Hash = genesis_block.GetHash()
 
 	chain, rpcserver, params := simulator_chain_start()
-	defer simulator_chain_stop(chain, rpcserver)
+	defer func() {
+		wgenesis.Close_Encrypted_Wallet()
+		wsrc.Close_Encrypted_Wallet()
+		wdst.Close_Encrypted_Wallet()
+		simulator_chain_stop(chain, rpcserver)
+	}()
 	_ = params
 
-	globals.Arguments["--daemon-address"] = rpcport
-
-	go Keep_Connectivity()
+	connectivity := Start_Connectivity()
+	defer connectivity.Stop()
 
 	t.Logf("src %s\n", wsrc.GetAddress())
 	t.Logf("dst %s\n", wdst.GetAddress())
@@ -155,8 +158,9 @@ func Test_Creation_TX_morecheck(t *testing.T) {
 	//fmt.Printf("balance wdst %v ringsize %d\n", wdst.account.Balance_Mature, wdst.account.Ringsize)
 	//fmt.Printf("balance wdst2 %v\n", wdst2.account.Balance_Mature)
 
-	if wdst.account.Balance_Mature != 1500000 {
-		t.Fatalf("failed balance check, expected 1500000 actual %d", wdst.account.Balance_Mature)
+	expectedReceiverBalance := expectedSimulatorRegistrationBalance + 700000
+	if wdst.account.Balance_Mature != expectedReceiverBalance {
+		t.Fatalf("failed balance check, expected %d actual %d", expectedReceiverBalance, wdst.account.Balance_Mature)
 	}
 
 }
