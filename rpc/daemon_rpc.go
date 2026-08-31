@@ -260,6 +260,32 @@ type (
 		Address []string `json:"address"` // daemon will return around 20 address in 1 go
 		Status  string   `json:"status"`
 	}
+
+	// GetRandomAddressBatch_Params: batch decoy selection (K1/K2 fix).
+	// The daemon returns real registered accounts WITH their encrypted
+	// balances in one response, so the wallet never queries per-candidate
+	// (which leaked the ring to the daemon). count is capped at 512.
+	GetRandomAddressBatch_Params struct {
+		SCID               crypto.Hash `json:"scid"`                 // asset tree; zero = base DERO
+		Count              int         `json:"count"`                // desired batch size (cap 512)
+		ExcludeRecentBlock bool        `json:"exclude_recent_block"` // weak floor: exclude only the CURRENT block's touched set (default true; NOT the 5-block filter)
+		StateVersion       uint64      `json:"state_version"`        // optional: pin the balance-tree state version to sample from
+	}
+
+	// GetRandomAddressBatch_Candidate: one verified registered account
+	// with its encrypted balance, so the wallet never re-queries it.
+	GetRandomAddressBatch_Candidate struct {
+		Address          string `json:"address"`           // full deto1... address
+		Registered       bool   `json:"registered"`        // verified present in the balance tree
+		EncryptedBalance string `json:"encrypted_balance"` // serialized ElGamal ciphertext (hex)
+	}
+
+	GetRandomAddressBatch_Result struct {
+		StateVersion uint64                            `json:"state_version"` // balance-tree state version the batch is from
+		TopoHeight   uint64                            `json:"topoheight"`    // so the wallet can cross-check state
+		Candidates   []GetRandomAddressBatch_Candidate `json:"candidates"`    // verified, balance-carrying accounts
+		Status       string                            `json:"status"`
+	}
 )
 
 type (

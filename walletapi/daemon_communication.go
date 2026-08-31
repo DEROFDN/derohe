@@ -533,6 +533,63 @@ func (w *Wallet_Memory) Random_ring_members(scid crypto.Hash) (alist []string) {
 	return
 }
 
+// Random_ring_members_batch fetches a batch of REAL registered accounts
+// WITH their encrypted balances in ONE RPC call (the K1/K2 fix), so the
+// daemon never learns which candidates become the ring (no per-candidate
+// GetEncryptedBalance queries) and decoys include recently-active
+// accounts (no 5-block active-account narrowing).
+//
+// The caller picks the final ring from the returned candidates with its
+// own CSPRNG — the daemon's posterior over the ring is 1/C(B,R).
+func (w *Wallet_Memory) Random_ring_members_batch(scid crypto.Hash, count int) ([]rpc.GetRandomAddressBatch_Candidate, error) {
+	var result rpc.GetRandomAddressBatch_Result
+
+	if count <= 0 {
+		count = 512 // cap: rings max at 128, plenty of headroom
+	}
+	if count > 512 {
+		count = 512
+	}
+
+	params := rpc.GetRandomAddressBatch_Params{
+		SCID:               scid,
+		Count:              count,
+		ExcludeRecentBlock: true, // weak floor: current block only, NOT the 5-block filter
+	}
+
+	if err := rpc_client.Call("DERO.GetRandomAddressBatch", params, &result); err != nil {
+		logger.V(1).Error(err, "DERO.GetRandomAddressBatch Call failed:")
+		return nil, err
+	}
+
+	return filterBatchCandidates(result.Candidates, w.GetAddress().String()), nil
+}
+
+// filterBatchCandidates is the fail-closed client-side verification of a
+// decoy batch: every candidate must be registered, carry a balance, not be
+// the sender, and parse as a valid address. Rejects ghost/zero-balance
+// injection (K3). Pure function — unit-testable without a daemon.
+func filterBatchCandidates(candidates []rpc.GetRandomAddressBatch_Candidate, self string) []rpc.GetRandomAddressBatch_Candidate {
+	verified := make([]rpc.GetRandomAddressBatch_Candidate, 0, len(candidates))
+	for _, c := range candidates {
+		if !c.Registered {
+			continue
+		}
+		if len(c.EncryptedBalance) == 0 {
+			continue
+		}
+		if c.Address == self {
+			continue // never use self as a decoy
+		}
+		// valid address format check
+		if _, err := rpc.NewAddress(c.Address); err != nil {
+			continue
+		}
+		verified = append(verified, c)
+	}
+	return verified
+}
+
 // sync history of wallet from blockchain
 var sync_multilock sync.Mutex // make sync history single threaded
 func (w *Wallet_Memory) SyncHistory(scid crypto.Hash) (balance uint64) {
