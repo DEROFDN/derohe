@@ -109,7 +109,6 @@ func Notify_broadcaster(req *jrpc2.Request) {
 		NotifyHeightChange.L.Lock()
 		NotifyHeightChange.Broadcast()
 		NotifyHeightChange.L.Unlock()
-		go test_connectivity()
 	case "MiniBlock": // we can skip this
 	default:
 		logger.V(1).Info("Notification received", "method", req.Method())
