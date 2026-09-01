@@ -28,7 +28,7 @@ package walletapi
 
 import "time"
 
-var timeout = 5 * time.Second
+var timeout = 3 * time.Second
 var timer = time.NewTimer(time.Millisecond)
 
 // this function continously turns connectivity online/offline
