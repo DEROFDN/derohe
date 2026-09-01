@@ -47,6 +47,14 @@ type sync_progress struct {
 
 var state sync_progress
 
+func GetSyncProgress() (height, chunk int64, step uint) {
+	return state.Height, state.Chunk, state.Step
+}
+
+func IsBootstrapActive() bool {
+	return state.Height != 0 || state.Step != 0
+}
+
 func (connection *Connection) bootstrap_fail(msg error) {
 	connection.logger.Error(msg, "Bootstrap failed")
 	connection.exit()
