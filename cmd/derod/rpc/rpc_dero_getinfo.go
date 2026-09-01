@@ -105,5 +105,10 @@ func GetInfo(ctx context.Context) (result rpc.GetInfo_Result, err error) {
 	result.HashrateEstimatePercent_1day = uint64((float64(chain.Get_Network_HashRate()) * HashrateEstimatePercent_1day()) / 100)
 	result.HashrateEstimatePercent_7day = uint64((float64(chain.Get_Network_HashRate()) * HashrateEstimatePercent_7day()) / 100)
 
+	result.ClockOffsetNTP_ms = globals.GetOffsetNTP().Milliseconds()
+	result.ClockOffsetP2P_ms = globals.GetOffsetP2P().Milliseconds()
+	offset := globals.GetOffsetNTP()
+	result.TimeInSync = globals.TimeIsInSyncNTP && offset > -time.Second && offset < time.Second
+
 	return result, nil
 }

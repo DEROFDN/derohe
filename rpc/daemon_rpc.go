@@ -313,6 +313,10 @@ type (
 		HashrateEstimatePercent_1day uint64 `json:"hashrate_1d"`
 		HashrateEstimatePercent_7day uint64 `json:"hashrate_7d"`
 
+		ClockOffsetNTP_ms int64 `json:"clock_offset_ntp_ms"`
+		ClockOffsetP2P_ms int64 `json:"clock_offset_p2p_ms"`
+		TimeInSync        bool  `json:"time_in_sync"`
+
 		Status string `json:"status"`
 	}
 )
