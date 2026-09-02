@@ -30,6 +30,7 @@ import "math"
 import "runtime/debug"
 import "github.com/blang/semver/v4"
 import "github.com/deroproject/derohe/cryptography/crypto"
+import "github.com/deroproject/graviton"
 
 //import "github.com/deroproject/derohe/rpc"
 
@@ -425,6 +426,17 @@ type Shared_State struct {
 	// transfers are only processed after the contract has terminated successfully
 
 	RamStore map[Variable]Variable
+
+	// DataTree is the SC data tree (C6 cross-contract calls): lets the DVM
+	// resolve and execute a target contract in a nested invocation sharing
+	// this state (same tx, same gas, same commit point).
+	DataTree *Tree_Wrapper
+
+	// TreeCache + Snapshot give call_sc access to ANY contract's own tree
+	// (each SC's code lives in its per-SCID tree; the DataTree only wraps
+	// the caller's). Populated from the executing chain/simulator.
+	TreeCache map[crypto.Hash]*graviton.Tree
+	Snapshot *graviton.Snapshot
 
 	RND   *RND        // this is initialized only once  while invoking entrypoint
 	Store *TX_Storage // mechanism to access a data store, can discard changes

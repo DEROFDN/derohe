@@ -108,6 +108,8 @@ func init() {
 		"min":       {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 5000, StorageCost: 0, PtrU: dvm_min}},
 		"strlen":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrU: dvm_strlen}},
 		"substr":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrS: dvm_substr}},
+		// Cross-Contract Calls (fork)
+		"call_sc": {{Range: semver.MustParseRange(">=10.0.0"), ComputeCost: 10000, StorageCost: 0, PtrU: dvm_call_sc}},
 	}
 }
 
@@ -642,4 +644,264 @@ func dvm_max(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uin
 func dvm_panic(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
 	panic("panic function called")
 	return true, uint64(0)
+}
+
+func dvm_call_sc(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
+	// args: scid, entrypoint, then name/value pairs (even count after idx 2)
+	if len(expr.Args) < 2 || (len(expr.Args)-2)%2 != 0 {
+		panic("call_sc: expected scid, entrypoint, then name/value pairs")
+	}
+	scid_hex, ok := dvm.eval(expr.Args[0]).(string)
+	if !ok {
+		panic("call_sc: scid must be a hex string")
+	}
+	entrypoint, ok := dvm.eval(expr.Args[1]).(string)
+	if !ok {
+		panic("call_sc: entrypoint must be a string")
+	}
+
+	var target crypto.Hash
+	// The fork's simulator addresses SCs by their hex-string form; accept
+	// the target as raw 32 bytes (DataHash path) OR proper 64-char hex.
+	if len(scid_hex) == 32 {
+		copy(target[:], []byte(scid_hex))
+	} else if scid_bytes, err := hex.DecodeString(scid_hex); err == nil && len(scid_bytes) == 32 {
+		copy(target[:], scid_bytes)
+	} else {
+		return true, uint64(2)
+	}
+
+	// recursion cap: 8 nested levels
+	if dvm.State.Monitor_recursion >= 8 {
+		return true, uint64(2) // recursion depth exceeded — fail cleanly
+	}
+	if dvm.State.DataTree == nil {
+		return true, uint64(3) // no data tree (unit-test context) — fail cleanly
+	}
+
+	// resolve the target SC from ITS OWN tree (each SC's code lives in its
+	// per-SCID tree; the caller's DataTree only wraps the caller)
+	var targetTree *Tree_Wrapper
+	if dvm.State.Snapshot != nil {
+		targetTree = Wrapped_tree(dvm.State.TreeCache, dvm.State.Snapshot, target)
+	} else if dvm.State.DataTree != nil {
+		targetTree = dvm.State.DataTree // fallback: shared tree (unit tests)
+	} else {
+		return true, uint64(3)
+	}
+	_, targetSC, found := ReadSC(nil, targetTree, target)
+	if !found {
+		return true, uint64(4) // target not found
+	}
+	if _, ok := targetSC.Functions[entrypoint]; !ok {
+		return true, uint64(5) // entrypoint not found
+	}
+
+	// build the callee's params from the name/value pairs.
+	// Reserved names "value" / "assetvalue" / "asset" forward incoming
+	// funds: the callee sees DEROVALUE()/ASSETVALUE() == the forwarded
+	// amount; the caller leftover is reduced on success.
+	params := map[string]interface{}{}
+	var fwdDERO uint64
+	var fwdAsset crypto.Hash
+	var fwdAssetAmt uint64
+	haveAsset := false
+	for i := 2; i+1 < len(expr.Args); i += 2 {
+		name, ok := dvm.eval(expr.Args[i]).(string)
+		if !ok {
+			return true, uint64(2)
+		}
+		val := dvm.eval(expr.Args[i+1])
+		switch strings.ToLower(name) {
+		case "value":
+			n, ok := callScAsUint64(val)
+			if !ok {
+				return true, uint64(2)
+			}
+			fwdDERO = n
+			params[name] = fmt.Sprintf("%d", fwdDERO)
+		case "assetvalue":
+			n, ok := callScAsUint64(val)
+			if !ok {
+				return true, uint64(2)
+			}
+			fwdAssetAmt = n
+			params[name] = fmt.Sprintf("%d", fwdAssetAmt)
+		case "asset":
+			as, ok := val.(string)
+			if !ok {
+				return true, uint64(2)
+			}
+			if len(as) == 32 {
+				copy(fwdAsset[:], []byte(as))
+			} else if b, err := hex.DecodeString(as); err == nil && len(b) == 32 {
+				copy(fwdAsset[:], b)
+			} else {
+				return true, uint64(2)
+			}
+			haveAsset = true
+			params[name] = as
+		default:
+			switch v := val.(type) {
+			case uint64:
+				params[name] = fmt.Sprintf("%d", v)
+			case int64:
+				params[name] = fmt.Sprintf("%d", v)
+			case string:
+				params[name] = v
+			default:
+				return true, uint64(2)
+			}
+		}
+	}
+
+	// snapshot for rollback on failure
+	state := dvm.State
+	snapAssets := make(map[crypto.Hash]uint64, len(state.Assets))
+	for k, v := range state.Assets {
+		snapAssets[k] = v
+	}
+	snapRawKeys := make(map[string][]byte, len(state.Store.RawKeys))
+	for k, v := range state.Store.RawKeys {
+		snapRawKeys[k] = v
+	}
+	snapTransfers := make(map[crypto.Hash]SC_Transfers, len(state.Store.Transfers))
+	for k, v := range state.Store.Transfers {
+		snapTransfers[k] = v
+	}
+	snapAssetsTransfer := make(map[string]map[string]uint64, len(state.Assets_Transfer))
+	for k, v := range state.Assets_Transfer {
+		cp := make(map[string]uint64, len(v))
+		for kk, vv := range v {
+			cp[kk] = vv
+		}
+		snapAssetsTransfer[k] = cp
+	}
+	snapSCIDSELF := state.SCIDSELF
+	snapChainSCID := state.Chain_inputs.SCID
+	snapStore := state.Store
+
+	if fwdDERO > 0 && state.Assets[state.SCIDZERO] < fwdDERO {
+		return true, uint64(2)
+	}
+	if haveAsset && fwdAssetAmt > 0 && state.Assets[fwdAsset] < fwdAssetAmt {
+		return true, uint64(2)
+	}
+
+	// switch SCIDSELF AND Chain_inputs.SCID to the target for the nested
+	// call (LOAD/STORE route by Chain_inputs.SCID; SCIDSELF is the address)
+	state.SCIDSELF = target
+	state.Chain_inputs.SCID = target
+
+	// callee sees ONLY the forwarded incoming value (not the caller's pot)
+	if fwdDERO > 0 || haveAsset {
+		state.Assets = map[crypto.Hash]uint64{}
+		if fwdDERO > 0 {
+			state.Assets[state.SCIDZERO] = fwdDERO
+		}
+		if haveAsset && fwdAssetAmt > 0 {
+			state.Assets[fwdAsset] = fwdAssetAmt
+		}
+	}
+
+	// build a target-bound store so the nested LOAD/STORE reads/writes the
+	// TARGET's tree (the caller's Store DiskLoader wraps the caller tree)
+	if state.Snapshot != nil {
+		targetTree = Wrapped_tree(state.TreeCache, state.Snapshot, target)
+		nestedStore := Initialize_TX_store()
+		nestedStore.SCID = target
+		nestedStore.State = state
+		nestedStore.DiskLoader = func(key DataKey, found *uint64) (result Variable) {
+			var exists bool
+			if result, exists = LoadSCValue(targetTree, key.SCID, key.MarshalBinaryPanic()); exists {
+				*found = uint64(1)
+			}
+			return
+		}
+		nestedStore.BalanceLoader = func(key DataKey) uint64 {
+			result, _ := LoadSCAssetValue(targetTree, key.SCID, key.Asset)
+			return result
+		}
+		nestedStore.DiskLoaderRaw = func(key []byte) (value []byte, found bool) {
+			var err error
+			value, err = targetTree.Get(key[:])
+			if err != nil {
+				return nil, false
+			}
+			return value, true
+		}
+		state.Store = nestedStore
+	}
+
+	// run the nested entrypoint (shares state; bumps Monitor_recursion)
+	nestedResult, runErr := runSmartContract_internal(&targetSC, entrypoint, state, params)
+	// a nonzero RETURN is the callee's failure convention (0 = success),
+	// so it must roll back exactly like an execution error
+	if runErr != nil || nestedResult.Type != Uint64 || nestedResult.ValueUint64 != 0 {
+		// rollback the nested call's writes
+		state.Store = snapStore
+		state.Store.RawKeys = snapRawKeys
+		state.Store.Transfers = snapTransfers
+		state.Assets_Transfer = snapAssetsTransfer
+		state.Assets = snapAssets
+		state.SCIDSELF = snapSCIDSELF
+		state.Chain_inputs.SCID = snapChainSCID
+		return true, uint64(2)
+	}
+
+	// surface the callee's return (0 = success). Commit the nested call's
+	// writes directly to the TARGET's graviton tree — the top-level
+	// deferred-commit loop only flushes the CALLER's tree wrapper, but the
+	// target lives in its own per-SCID tree. Safe under the snapshot:
+	// a failing top-level tx rolls the snapshot back.
+	if targetTree != nil {
+		for k, v := range state.Store.RawKeys {
+			if len(v) > 0 {
+				targetTree.Tree.Put([]byte(k), v)
+			} else {
+				targetTree.Tree.Delete([]byte(k))
+			}
+		}
+	}
+	state.SCIDSELF = snapSCIDSELF
+	state.Chain_inputs.SCID = snapChainSCID
+	state.Store = snapStore
+	if fwdDERO > 0 || (haveAsset && fwdAssetAmt > 0) {
+		restored := make(map[crypto.Hash]uint64, len(snapAssets))
+		for k, v := range snapAssets {
+			restored[k] = v
+		}
+		if fwdDERO > 0 {
+			restored[state.SCIDZERO] -= fwdDERO
+		}
+		if haveAsset && fwdAssetAmt > 0 {
+			restored[fwdAsset] -= fwdAssetAmt
+		}
+		state.Assets = restored
+	}
+
+	if nestedResult.Type == Uint64 {
+		return true, nestedResult.ValueUint64
+	}
+	return true, uint64(2)
+}
+
+func callScAsUint64(val interface{}) (uint64, bool) {
+	switch v := val.(type) {
+	case uint64:
+		return v, true
+	case int64:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case string:
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
 }

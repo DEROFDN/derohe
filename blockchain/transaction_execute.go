@@ -346,7 +346,7 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 
 		balance, sc_parsed, found := dvm.ReadSC(w_sc_tree, w_sc_data_tree, scid)
 		if found {
-			gascompute, gasstorage, err = dvm.Execute_sc_function(w_sc_tree, w_sc_data_tree, scid, bl_height, bl_topoheight, bl_timestamp, blid, txhash, sc_parsed, entrypoint, 1, balance, signer, incoming_value, tx.SCDATA, tx.Fees(), chain.simulator)
+			gascompute, gasstorage, err = dvm.Execute_sc_function(w_sc_tree, w_sc_data_tree, scid, bl_height, bl_topoheight, bl_timestamp, blid, txhash, sc_parsed, entrypoint, 1, balance, signer, incoming_value, tx.SCDATA, tx.Fees(), chain.simulator, cache, ss)
 		} else {
 			logger.V(1).Error(nil, "SC not found", "scid", scid)
 			err = fmt.Errorf("SC not found %s", scid)
@@ -382,7 +382,7 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 
 		balance, sc_parsed, found := dvm.ReadSC(w_sc_tree, w_sc_data_tree, scid)
 		if found {
-			gascompute, gasstorage, err = dvm.Execute_sc_function(w_sc_tree, w_sc_data_tree, scid, bl_height, bl_topoheight, bl_timestamp, blid, txhash, sc_parsed, entrypoint, 1, balance, signer, incoming_value, tx.SCDATA, tx.Fees(), chain.simulator)
+			gascompute, gasstorage, err = dvm.Execute_sc_function(w_sc_tree, w_sc_data_tree, scid, bl_height, bl_topoheight, bl_timestamp, blid, txhash, sc_parsed, entrypoint, 1, balance, signer, incoming_value, tx.SCDATA, tx.Fees(), chain.simulator, cache, ss)
 		} else {
 			logger.V(1).Error(nil, "SC not found", "scid", scid)
 			err = fmt.Errorf("SC not found %s", scid)

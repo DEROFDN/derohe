@@ -119,7 +119,7 @@ func Wrapped_tree(cache map[crypto.Hash]*graviton.Tree, ss *graviton.Snapshot, i
 // this will process the SC transaction
 // the tx should only be processed , if it has been processed
 
-func Execute_sc_function(w_sc_tree *Tree_Wrapper, data_tree *Tree_Wrapper, scid crypto.Hash, bl_height, bl_topoheight, bl_timestamp uint64, blid crypto.Hash, txid crypto.Hash, sc_parsed SmartContract, entrypoint string, hard_fork_version_current int64, balance_at_start uint64, signer [33]byte, incoming_value map[crypto.Hash]uint64, SCDATA rpc.Arguments, gasstorage_incoming uint64, simulator bool) (gascompute, gasstorage uint64, err error) {
+func Execute_sc_function(w_sc_tree *Tree_Wrapper, data_tree *Tree_Wrapper, scid crypto.Hash, bl_height, bl_topoheight, bl_timestamp uint64, blid crypto.Hash, txid crypto.Hash, sc_parsed SmartContract, entrypoint string, hard_fork_version_current int64, balance_at_start uint64, signer [33]byte, incoming_value map[crypto.Hash]uint64, SCDATA rpc.Arguments, gasstorage_incoming uint64, simulator bool, tree_cache map[crypto.Hash]*graviton.Tree, snapshot *graviton.Snapshot) (gascompute, gasstorage uint64, err error) {
 	defer func() {
 		if r := recover(); r != nil { // safety so if anything wrong happens, verification fails
 			if err == nil {
@@ -181,6 +181,9 @@ func Execute_sc_function(w_sc_tree *Tree_Wrapper, data_tree *Tree_Wrapper, scid 
 		Assets:   map[crypto.Hash]uint64{},
 		RamStore: map[Variable]Variable{},
 		SCIDSELF: scid,
+		DataTree: data_tree, // C6: cross-contract calls need the data tree
+		TreeCache: tree_cache,
+		Snapshot:  snapshot,
 		Chain_inputs: &Blockchain_Input{
 			BL_HEIGHT:     bl_height,
 			BL_TOPOHEIGHT: uint64(bl_topoheight),
