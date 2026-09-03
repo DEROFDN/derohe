@@ -451,6 +451,10 @@ func getwork(wallet_address string) {
 func mineblock(tid int) {
 	var diff big.Int
 	var work [block.MINIBLOCK_SIZE]byte
+	// workB is only used past MAJOR_HF2_HEIGHT (astrobwtv3.AstroBWTv3Pair
+	// hashes two nonces at once, see below); synced from work each time a
+	// new job arrives, then its own nonce bytes are driven independently.
+	var workB [block.MINIBLOCK_SIZE]byte
 
 	var random_buf [12]byte
 
@@ -458,9 +462,14 @@ func mineblock(tid int) {
 
 	scratch := astrobwt_fast.Pool.Get().(*astrobwt_fast.ScratchData)
 
-	time.Sleep(5 * time.Second)
+	// Staggered by tid so threads pin and ramp to full boost one at a time
+	// instead of every core waking simultaneously -- a synchronized wake
+	// across many cores is a much sharper current spike than the same cores
+	// reaching full load a few milliseconds apart.
+	time.Sleep(5*time.Second + time.Duration(tid)*15*time.Millisecond)
 
-	nonce_buf := work[block.MINIBLOCK_SIZE-5:] //since slices are linked, it modifies parent
+	nonce_buf := work[block.MINIBLOCK_SIZE-5:]   //since slices are linked, it modifies parent
+	nonce_bufB := workB[block.MINIBLOCK_SIZE-5:] //same relationship to workB
 	runtime.LockOSThread()
 	threadaffinity()
 
@@ -485,6 +494,15 @@ func mineblock(tid int) {
 
 		copy(work[block.MINIBLOCK_SIZE-12:], random_buf[:]) // add more randomization in the mix
 		work[block.MINIBLOCK_SIZE-1] = byte(tid)
+
+		// Sync workB to the same job template (only consumed past
+		// MAJOR_HF2_HEIGHT, below) -- harmless to do unconditionally here,
+		// keeps the sync next to the job-decode it depends on rather than
+		// duplicating the decode/randomize/tid-byte steps a second time.
+		// The nonce region copied along with it is stale/irrelevant: both
+		// nonce_buf and nonce_bufB get overwritten independently before
+		// every hash in the loop below.
+		copy(workB[:], work[:])
 
 		diff.SetString(myjob.Difficulty, 10)
 
@@ -515,20 +533,40 @@ func mineblock(tid int) {
 			}
 		} else {
 
+			// Two nonces per iteration, hashed together through
+			// AstroBWTv3Pair: on SHA-NI-capable hardware this shares the
+			// final SHA-256 stage's instruction latency between both,
+			// recovering throughput a single-hash loop can't. On hardware
+			// without SHA-NI, AstroBWTv3Pair falls back to two ordinary
+			// hashes internally (see astrobwtv3.AstroBWTv3Pair's doc
+			// comment) -- correct either way, no capability check needed
+			// here.
 			for local_job_counter == job_counter { // update job when it comes, expected rate 1 per second
 				i++
 				binary.BigEndian.PutUint32(nonce_buf, i)
+				i++
+				binary.BigEndian.PutUint32(nonce_bufB, i)
 
-				powhash := astrobwtv3.AstroBWTv3(work[:])
-				atomic.AddUint64(&counter, 1)
+				powhashA, powhashB := astrobwtv3.AstroBWTv3Pair(work[:], workB[:])
+				atomic.AddUint64(&counter, 2)
 
-				if CheckPowHashBig(powhash, &diff) == true { // note we are doing a local, NW might have moved meanwhile
+				if CheckPowHashBig(powhashA, &diff) == true { // note we are doing a local, NW might have moved meanwhile
 					logger.V(1).Info("Successfully found DERO miniblock (going to submit)", "difficulty", myjob.Difficulty, "height", myjob.Height)
 					func() {
 						defer globals.Recover(1)
 						connection_mutex.Lock()
 						defer connection_mutex.Unlock()
 						connection.WriteJSON(rpc.SubmitBlock_Params{JobID: myjob.JobID, MiniBlockhashing_blob: fmt.Sprintf("%x", work[:])})
+					}()
+
+				}
+				if CheckPowHashBig(powhashB, &diff) == true {
+					logger.V(1).Info("Successfully found DERO miniblock (going to submit)", "difficulty", myjob.Difficulty, "height", myjob.Height)
+					func() {
+						defer globals.Recover(1)
+						connection_mutex.Lock()
+						defer connection_mutex.Unlock()
+						connection.WriteJSON(rpc.SubmitBlock_Params{JobID: myjob.JobID, MiniBlockhashing_blob: fmt.Sprintf("%x", workB[:])})
 					}()
 
 				}

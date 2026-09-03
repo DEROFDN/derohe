@@ -16,31 +16,95 @@
 
 package main
 
-import "runtime"
-import "sync/atomic"
-import "golang.org/x/sys/unix"
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"golang.org/x/sys/unix"
+)
 
 var processor int32
 
-// sets thread affinity to avoid cache collision and thread migration
-func threadaffinity() {
-	var cpuset unix.CPUSet
+// coreOrder maps a 0-based thread slot to a logical CPU so that slots
+// [0, physicalCores) land one per distinct physical core before any core's
+// SMT sibling is used, and slots beyond that fill each core's sibling(s) in
+// the same round-robin order -- instead of assuming siblings are adjacent or
+// evenly/oddly split by CPU number, which does not hold on every platform.
+// This AMD box pairs siblings as core0={0,8}, core1={1,9}, ..., not the
+// interleaved core0={0,1}, core1={2,3}, ... layout some code assumes; get the
+// pairing wrong and threads silently stack two-deep on a handful of cores
+// while others sit idle, then a jump in thread count wakes several idle
+// cores to full boost at once instead of one at a time.
+var (
+	coreOrderOnce sync.Once
+	coreOrder     []int
+)
 
-	lock_on_cpu := atomic.AddInt32(&processor, 1)
-	if lock_on_cpu >= int32(runtime.GOMAXPROCS(0)) { // threads are more than cpu, we do not know what to do
-		return
+func buildCoreOrder() []int {
+	count := runtime.GOMAXPROCS(0)
+	identity := func() []int {
+		order := make([]int, count)
+		for i := range order {
+			order[i] = i
+		}
+		return order
 	}
-	cpuset.Zero()
-	cpuset.Set(int(avoidHT(int(lock_on_cpu))))
 
-	unix.SchedSetaffinity(0, &cpuset)
+	var coreIDs []int
+	siblingsOf := map[int][]int{}
+	for cpu := 0; cpu < count; cpu++ {
+		id, err := readCoreID(cpu)
+		if err != nil {
+			// topology unreadable (container, restricted /sys, etc): fall
+			// back to identity order rather than guessing a pairing that
+			// might be wrong.
+			return identity()
+		}
+		if _, seen := siblingsOf[id]; !seen {
+			coreIDs = append(coreIDs, id)
+		}
+		siblingsOf[id] = append(siblingsOf[id], cpu)
+	}
+
+	order := make([]int, 0, count)
+	for _, id := range coreIDs { // first pass: one thread per physical core
+		order = append(order, siblingsOf[id][0])
+	}
+	for pass := 1; len(order) < count; pass++ { // later passes: siblings, round-robin
+		for _, id := range coreIDs {
+			if pass < len(siblingsOf[id]) {
+				order = append(order, siblingsOf[id][pass])
+			}
+		}
+	}
+	return order
 }
 
-func avoidHT(i int) int {
-	count := runtime.GOMAXPROCS(0)
-	if i < count/2 {
-		return i * 2
-	} else {
-		return (i-count/2)*2 + 1
+func readCoreID(cpu int) (int, error) {
+	b, err := os.ReadFile(filepath.Join("/sys/devices/system/cpu", "cpu"+strconv.Itoa(cpu), "topology", "core_id"))
+	if err != nil {
+		return 0, err
 	}
+	return strconv.Atoi(strings.TrimSpace(string(b)))
+}
+
+// sets thread affinity to avoid cache collision and thread migration
+func threadaffinity() {
+	coreOrderOnce.Do(func() { coreOrder = buildCoreOrder() })
+
+	slot := int(atomic.AddInt32(&processor, 1)) - 1 // 0-based
+	if slot < 0 || slot >= len(coreOrder) {          // more threads than CPUs, leave unpinned
+		return
+	}
+
+	var cpuset unix.CPUSet
+	cpuset.Zero()
+	cpuset.Set(coreOrder[slot])
+
+	unix.SchedSetaffinity(0, &cpuset)
 }
