@@ -708,9 +708,16 @@ func trigger_sync() {
 					metrics.Set.GetOrCreateCounter("blockchain_sync_total").Inc() // tracks number of syncs
 
 					if chain.Sync {
-						//fmt.Printf("chain send chain request disabled\n")
-						connection.sync_chain()
-						connection.logger.V(1).Info("sync done")
+						// fan out the catch-up batch across all currently-lagging
+						// peers concurrently. Falls back to the original
+						// single-connection sync_chain() when fan-out's own
+						// preconditions aren't met (e.g. only one real peer).
+						if !fanout_sync(clist) {
+							connection.sync_chain()
+							connection.logger.V(1).Info("sync done (single-peer fallback)")
+						} else {
+							connection.logger.V(1).Info("sync done (fanout)")
+						}
 
 					} else { // we need a state only sync, bootstrap without history but verified chain
 						if err := connection.bootstrap_chain(); err != nil {
