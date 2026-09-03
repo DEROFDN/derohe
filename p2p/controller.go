@@ -71,6 +71,51 @@ var ClockOffset time.Duration //Clock Offset related to all the peer2 connected
 var backoff = map[string]int64{} // if server receives a connection, then it will not initiate connection to that ip for another 60 secs
 var backoff_mutex = sync.Mutex{}
 
+// per-IP incoming connection rate limiting -- the global accept_limiter alone means
+// broad legitimate churn from many different peers can starve out any single new
+// connection attempt; this gives each source IP its own budget, with the global
+// limiter retained as a looser ceiling against a genuine multi-source flood
+type ip_limiter_entry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+var per_ip_limiters = map[string]*ip_limiter_entry{}
+var per_ip_limiters_mutex = sync.Mutex{}
+
+func get_per_ip_limiter(ip string) *rate.Limiter {
+	per_ip_limiters_mutex.Lock()
+	defer per_ip_limiters_mutex.Unlock()
+	entry, ok := per_ip_limiters[ip]
+	if !ok {
+		entry = &ip_limiter_entry{limiter: rate.NewLimiter(1.0, 5)} // 1/sec sustained, burst of 5
+		per_ip_limiters[ip] = entry
+	}
+	entry.lastSeen = time.Now()
+	return entry.limiter
+}
+
+// bound memory on a long-running node by evicting IPs that haven't tried to connect in a while
+func cleanup_per_ip_limiters() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-Exit_Event:
+			return
+		case <-ticker.C:
+			per_ip_limiters_mutex.Lock()
+			cutoff := time.Now().Add(-15 * time.Minute)
+			for ip, entry := range per_ip_limiters {
+				if entry.lastSeen.Before(cutoff) {
+					delete(per_ip_limiters, ip)
+				}
+			}
+			per_ip_limiters_mutex.Unlock()
+		}
+	}
+}
+
 var Min_Peers = int64(31) // we need to expose this to be modifieable at runtime without taking daemon offline
 var Max_Peers = int64(101)
 
@@ -499,7 +544,8 @@ func maintain_connection_to_peers() {
 
 func P2P_Server_v2() {
 
-	var accept_limiter = rate.NewLimiter(10.0, 40) // 10 incoming per sec, burst of 40 is okay
+	var accept_limiter = rate.NewLimiter(20.0, 60) // global ceiling against a genuine multi-source flood; per-IP fairness is the primary gate below
+	go cleanup_per_ip_limiters()
 
 	default_address := "0.0.0.0:0" // be default choose a random port
 	if _, ok := globals.Arguments["--p2p-bind"]; ok && globals.Arguments["--p2p-bind"] != nil {
@@ -585,12 +631,14 @@ func P2P_Server_v2() {
 			continue
 		}
 
-		if !accept_limiter.Allow() { // if rate limiter allows, then only add else drop the connection
+		raddr := conn.RemoteAddr().(*net.UDPAddr)
+
+		// per-IP limiter is the primary gate (protects legitimate new peers from being
+		// starved by unrelated churn); the global limiter is a looser ceiling behind it
+		if !get_per_ip_limiter(ParseIPNoError(raddr.IP.String())).Allow() || !accept_limiter.Allow() {
 			conn.Close()
 			continue
 		}
-
-		raddr := conn.RemoteAddr().(*net.UDPAddr)
 
 		backoff_mutex.Lock()
 		backoff[ParseIPNoError(raddr.String())] = time.Now().Unix() + globals.Global_Random.Int63n(200) // random backing of upto 200 secs
