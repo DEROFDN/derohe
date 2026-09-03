@@ -195,12 +195,16 @@ func main() {
 		return
 	}
 
+	chain.SetIntegratorAddress(genesis_wallet.GetAddress()) // default integrator (globals.Config.Dev_Address) isn't registered on a fresh simulator chain; genesis wallet always is
+
 	params["chain"] = chain
 
 	logger.Info("Disabled P2P server since we are a simulator")
 	p2p.P2P_Init(params)
 
 	rpcserver, _ := derodrpc.RPCServer_Start(params)
+
+	go derodrpc.Getwork_server() // expose the miner-facing getwork websocket, same as derod, so external miners can connect for testing
 
 	register_wallets(chain)                               // setup 22 wallets
 	Mine_block_single(chain, genesis_wallet.GetAddress()) //mine single block to confirm all 22 registrations
