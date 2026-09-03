@@ -17,14 +17,17 @@
 package dvm
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"go/ast"
+	"math/big"
 	"strconv"
 	"strings"
 
 	"github.com/blang/semver/v4"
+	"github.com/deroproject/derohe/cryptography/bn256"
 	"github.com/deroproject/derohe/cryptography/crypto"
 	"github.com/deroproject/derohe/rpc"
 	"golang.org/x/crypto/sha3"
@@ -108,6 +111,15 @@ func init() {
 		"min":       {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 5000, StorageCost: 0, PtrU: dvm_min}},
 		"strlen":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrU: dvm_strlen}},
 		"substr":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrS: dvm_substr}},
+		// Confidential Settlement & Auth (fork intrinsics)
+		"verify_sig":      {{Range: semver.MustParseRange(">=9.0.0"), ComputeCost: 250000, StorageCost: 0, PtrU: dvm_verify_sig}},
+		"hash_to_point":   {{Range: semver.MustParseRange(">=9.0.0"), ComputeCost: 30000, StorageCost: 0, PtrS: dvm_hash_to_point}},
+		"pedersen_commit": {{Range: semver.MustParseRange(">=9.0.0"), ComputeCost: 45000, StorageCost: 0, PtrS: dvm_pedersen_commit}},
+		"verify_commit":   {{Range: semver.MustParseRange(">=9.0.0"), ComputeCost: 45000, StorageCost: 0, PtrU: dvm_verify_commit}},
+		"asset_balance":   {{Range: semver.MustParseRange(">=9.0.0"), ComputeCost: 2000, StorageCost: 0, PtrU: dvm_asset_balance}},
+		"ec_add":          {{Range: semver.MustParseRange(">=9.0.0"), ComputeCost: 15000, StorageCost: 0, PtrS: dvm_ec_add}},
+		"ec_mul":          {{Range: semver.MustParseRange(">=9.0.0"), ComputeCost: 30000, StorageCost: 0, PtrS: dvm_ec_mul}},
+		"verify_adaptor":  {{Range: semver.MustParseRange(">=10.0.0"), ComputeCost: 250000, StorageCost: 0, PtrU: dvm_verify_adaptor}},
 	}
 }
 
@@ -641,5 +653,360 @@ func dvm_max(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uin
 
 func dvm_panic(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
 	panic("panic function called")
+	return true, uint64(0)
+}
+
+// ---- fork intrinsics handlers (liqdmetal) ----
+
+func dvm_verify_sig(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
+	checkargscount(3, len(expr.Args)) // pubkey, message, signature
+
+	pubkey_arg := dvm.eval(expr.Args[0])
+	pubkey_hex, ok := pubkey_arg.(string)
+	if !ok {
+		panic("verify_sig: pubkey must be a string (hex)")
+	}
+
+	message, ok := dvm.eval(expr.Args[1]).(string)
+	if !ok {
+		panic("verify_sig: message must be a string")
+	}
+
+	sig_arg := dvm.eval(expr.Args[2])
+	sig_hex, ok := sig_arg.(string)
+	if !ok {
+		panic("verify_sig: signature must be a string (hex)")
+	}
+
+	pubkey_bytes, err := hex.DecodeString(pubkey_hex)
+	if err != nil || len(pubkey_bytes) != ed25519.PublicKeySize {
+		return true, uint64(0) // malformed pubkey -> invalid
+	}
+	sig_bytes, err := hex.DecodeString(sig_hex)
+	if err != nil || len(sig_bytes) != ed25519.SignatureSize {
+		return true, uint64(0) // malformed sig -> invalid
+	}
+
+	if ed25519.Verify(ed25519.PublicKey(pubkey_bytes), []byte(message), sig_bytes) {
+		return true, uint64(1)
+	}
+	return true, uint64(0)
+}
+
+// dvm_hash_to_point hashes a string into a curve point (bn256 G1),
+// hex-encoded compressed (33 bytes).
+// hash_to_point(input String) -> String
+//
+// P0-2 (spec dvm-basic-improvements.md): enables self-contained Pedersen
+// commitments inside the VM (commit = v·G + r·HashToPoint(nonce)) without
+// trusting an external oracle — the dvm_functions.go:35-38 comment's trust
+// assumption becomes a language primitive. Deterministic across nodes:
+// HashToPoint(HashtoNumber(input)) has no randomness.
+//
+// strictDecodeG1 decodes a 33-byte compressed bn256 G1 point with STRICT
+// encoding validation: x must be < p (the base-field modulus). Go's
+// DecodeCompressed accepts x >= p (xToY computes y from x mod p but the
+// raw x is stored), which is a chain-split class divergence — a strict
+// decoder (the clean-room Rust port) REJECTS such encodings. All point
+// intrinsics must accept and reject identically across implementations,
+// so every caller-supplied compressed point goes through this.
+
+func strictDecodeG1(b []byte) (*bn256.G1, error) {
+	if len(b) != 33 {
+		return nil, fmt.Errorf("point must be 33 bytes")
+	}
+	xi := new(big.Int).SetBytes(b[0:32])
+	if xi.Cmp(bn256.P) >= 0 {
+		return nil, fmt.Errorf("point x >= field modulus p (non-canonical encoding)")
+	}
+	pt := &bn256.G1{}
+	if err := pt.DecodeCompressed(b); err != nil {
+		return nil, err
+	}
+	return pt, nil
+}
+
+// dvm_hash_to_point hashes input to a protocol point (P0-4). Deterministic
+// across nodes: HashToPoint(HashtoNumber(input)) has no randomness.
+
+func dvm_hash_to_point(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result string) {
+	checkargscount(1, len(expr.Args))
+	input, ok := dvm.eval(expr.Args[0]).(string)
+	if !ok {
+		panic("hash_to_point: input must be a string")
+	}
+	pt := crypto.HashToPoint(crypto.HashtoNumber([]byte(input)))
+	return true, hex.EncodeToString(pt.EncodeCompressed())
+}
+
+// dvm_pedersen_commit commits a uint64 value with a caller-supplied 32-byte
+// blind (hex string): commit = v·G + r·H, where G/H are the NUMS base
+// generators (algebra_pedersen.go:33-35). Returns the compressed G1 point
+// as hex (33 bytes / 66 chars).
+// pedersen_commit(value Uint64, blind_hex String) -> String
+//
+// P0-3 (spec dvm-basic-improvements.md): the confidential-settlement
+// primitive — a contract can commit a quantity on-chain and later verify a
+// reveal off-chain without the chain learning the value. Deterministic
+// given (value, blind): the same inputs ALWAYS produce the same point, so
+// verify_commit can recompute. Hiding: 256-bit blind (32 bytes).
+// Binding: H has unknown discrete log w.r.t. G (NUMS, G3).
+
+func dvm_pedersen_commit(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result string) {
+	checkargscount(2, len(expr.Args)) // value, blind
+
+	value, ok := dvm.eval(expr.Args[0]).(uint64)
+	if !ok {
+		panic("pedersen_commit: value must be uint64")
+	}
+	blind_hex, ok := dvm.eval(expr.Args[1]).(string)
+	if !ok {
+		panic("pedersen_commit: blind must be a hex string (32 bytes)")
+	}
+	blind_bytes, err := hex.DecodeString(blind_hex)
+	if err != nil || len(blind_bytes) > 32 {
+		panic("pedersen_commit: blind must be valid hex, at most 32 bytes")
+	}
+	blind := new(big.Int).SetBytes(blind_bytes)
+
+	g := crypto.G
+	h := new(bn256.G1).ScalarMult(crypto.HashToPoint(crypto.HashtoNumber([]byte(crypto.PROTOCOL_CONSTANT+"H"))), blind)
+	point := new(bn256.G1).Add(new(bn256.G1).ScalarMult(g, new(big.Int).SetUint64(value)), h)
+	return true, hex.EncodeToString(point.EncodeCompressed())
+}
+
+// dvm_verify_commit verifies a Pedersen commitment against a revealed
+// (value, blind): recomputes v·G + r·H and compares to the committed point.
+// verify_commit(value Uint64, blind_hex String, commit_hex String) -> Uint64 (0/1)
+//
+// P0-3 companion. Malformed inputs return 0 (never panic).
+
+func dvm_verify_commit(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
+	checkargscount(3, len(expr.Args)) // value, blind, commit
+
+	value, ok := dvm.eval(expr.Args[0]).(uint64)
+	if !ok {
+		panic("verify_commit: value must be uint64")
+	}
+	blind_hex, ok := dvm.eval(expr.Args[1]).(string)
+	if !ok {
+		panic("verify_commit: blind must be a hex string (32 bytes)")
+	}
+	commit_hex, ok := dvm.eval(expr.Args[2]).(string)
+	if !ok {
+		panic("verify_commit: commit must be a hex string")
+	}
+
+	blind_bytes, err := hex.DecodeString(blind_hex)
+	if err != nil || len(blind_bytes) > 32 {
+		return true, uint64(0)
+	}
+	commit_bytes, err := hex.DecodeString(commit_hex)
+	if err != nil || len(commit_bytes) != 33 {
+		return true, uint64(0)
+	}
+	commit_pt, err := strictDecodeG1(commit_bytes)
+	if err != nil {
+		return true, uint64(0) // non-canonical / off-curve encoding rejected (strict)
+	}
+
+	blind := new(big.Int).SetBytes(blind_bytes)
+	h := new(bn256.G1).ScalarMult(crypto.HashToPoint(crypto.HashtoNumber([]byte(crypto.PROTOCOL_CONSTANT+"H"))), blind)
+	point := new(bn256.G1).Add(new(bn256.G1).ScalarMult(crypto.G, new(big.Int).SetUint64(value)), h)
+
+	if point.String() == commit_pt.String() {
+		return true, uint64(1)
+	}
+	return true, uint64(0)
+}
+
+// dvm_asset_balance reads the smart contract's OWN stored balance for any
+// asset (including DERO, the zero hash), from the consensus data tree.
+// asset_balance(asset_hex String) -> Uint64
+//
+// Gap: derovalue()/assetvalue() only report the value arriving *in the
+// current tx* (dvm.State.Assets). Nothing could read the SC's persisted
+// holding — which LoadSCAssetValue stores and SanityCheckExternalTransfers
+// enforces on payout. This closes that gap: a contract can now know how
+// much DERO or asset it actually holds before deciding to pay out.
+
+func dvm_asset_balance(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
+	checkargscount(1, len(expr.Args))
+
+	asset_hex, ok := dvm.eval(expr.Args[0]).(string)
+	if !ok {
+		panic("asset_balance: asset must be a hex string (32 bytes)")
+	}
+	asset_bytes, err := hex.DecodeString(asset_hex)
+	if err != nil || len(asset_bytes) != 32 {
+		panic("asset_balance: asset must be a hex string of 32 bytes")
+	}
+	var asset crypto.Hash
+	copy(asset[:], asset_bytes)
+
+	// BalanceLoader is wired to LoadSCAssetValue(data_tree, key.SCID, key.Asset)
+	// in sc.go — reading the SC's own persisted balance (SCIDSELF).
+	return true, dvm.State.Store.BalanceLoader(GetBalanceKey(dvm.State.SCIDSELF, asset))
+}
+
+// dvm_ec_add adds two compressed bn256 G1 points (33-byte DERO encoding),
+// returning the compressed sum. Homomorphic accumulation of commitments:
+// pedersen_commit(v1,b1) + pedersen_commit(v2,b2) == pedersen_commit(v1+v2,b1+b2),
+// so a contract can update a stored commitment without revealing the delta.
+// ec_add(p1_hex String, p2_hex String) -> String (33-byte compressed point, hex)
+
+func dvm_ec_add(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result string) {
+	checkargscount(2, len(expr.Args))
+
+	p1_hex, ok := dvm.eval(expr.Args[0]).(string)
+	if !ok {
+		panic("ec_add: p1 must be a hex string (33-byte compressed point)")
+	}
+	p2_hex, ok := dvm.eval(expr.Args[1]).(string)
+	if !ok {
+		panic("ec_add: p2 must be a hex string (33-byte compressed point)")
+	}
+	p1_bytes, err := hex.DecodeString(p1_hex)
+	if err != nil || len(p1_bytes) != 33 {
+		panic("ec_add: p1 must be a hex string of 33 bytes")
+	}
+	p2_bytes, err := hex.DecodeString(p2_hex)
+	if err != nil || len(p2_bytes) != 33 {
+		panic("ec_add: p2 must be a hex string of 33 bytes")
+	}
+
+	p1pt, err := strictDecodeG1(p1_bytes)
+	if err != nil {
+		panic("ec_add: p1 is not a valid compressed point")
+	}
+	p2pt, err := strictDecodeG1(p2_bytes)
+	if err != nil {
+		panic("ec_add: p2 is not a valid compressed point")
+	}
+
+	sum := new(bn256.G1).Add(p1pt, p2pt)
+	return true, hex.EncodeToString(sum.EncodeCompressed())
+}
+
+// dvm_ec_mul multiplies a compressed bn256 G1 point by a scalar (uint64).
+// ec_mul(point_hex String, scalar Uint64) -> String (33-byte compressed point, hex)
+//
+// I3: point scalar multiplication for point derivation and key blinding —
+// the homomorphic counterpart to ec_add (I2). Combined, a contract can
+// build and accumulate commitments entirely in-VM.
+
+func dvm_ec_mul(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result string) {
+	checkargscount(2, len(expr.Args))
+
+	point_hex, ok := dvm.eval(expr.Args[0]).(string)
+	if !ok {
+		panic("ec_mul: point must be a hex string (33-byte compressed point)")
+	}
+	scalar, ok := dvm.eval(expr.Args[1]).(uint64)
+	if !ok {
+		panic("ec_mul: scalar must be Uint64")
+	}
+
+	point_bytes, err := hex.DecodeString(point_hex)
+	if err != nil || len(point_bytes) != 33 {
+		panic("ec_mul: point must be a hex string of 33 bytes")
+	}
+
+	pt, err := strictDecodeG1(point_bytes)
+	if err != nil {
+		panic("ec_mul: not a valid compressed point")
+	}
+
+	mul := new(bn256.G1).ScalarMult(pt, new(big.Int).SetUint64(scalar))
+	return true, hex.EncodeToString(mul.EncodeCompressed())
+}
+
+// dvm_verify_adaptor verifies a TRUE Schnorr adaptor signature on bn256 (I4):
+// the cross-chain atomic primitive. verify_adaptor(pubkey_hex, message_hex,
+// adaptor_sig_hex) -> 0/1 where adaptor_sig = s'(64) || R(33) || T(33) (130B).
+// Proves "the holder of x can sign m once tweak t is revealed" WITHOUT
+// revealing t: s'*G == R - T + e*P,  e = ReducedHash(R || P || m),  T = t*G.
+// Revealing t completes the signature: s = s' + t satisfies s*G == R + e*P.
+// The tweak point T is a separate commitment — the old "adaptor" folded t
+// into R'/s' with no T, so nothing could actually be revealed. Strict point
+// decode (x < p) + low-s scalar (non-malleable, unique encoding).
+
+func dvm_verify_adaptor(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
+	checkargscount(3, len(expr.Args))
+
+	pub_hex, ok := dvm.eval(expr.Args[0]).(string)
+	if !ok {
+		panic("verify_adaptor: pubkey must be a hex string (33-byte compressed point)")
+	}
+	msg_hex, ok := dvm.eval(expr.Args[1]).(string)
+	if !ok {
+		panic("verify_adaptor: message must be a hex string")
+	}
+	sig_hex, ok := dvm.eval(expr.Args[2]).(string)
+	if !ok {
+		panic("verify_adaptor: adaptor sig must be a hex string (130 bytes)")
+	}
+
+	pub_bytes, err := hex.DecodeString(pub_hex)
+	if err != nil || len(pub_bytes) != 33 {
+		return true, uint64(0)
+	}
+	msg_bytes, err := hex.DecodeString(msg_hex)
+	if err != nil {
+		return true, uint64(0)
+	}
+	sig_bytes, err := hex.DecodeString(sig_hex)
+	if err != nil || len(sig_bytes) != 130 {
+		return true, uint64(0)
+	}
+
+	P := &bn256.G1{}
+	// STRICT decode (chain-split class, see I3/v9 wargame): DecodeCompressed
+	// accepts x >= p encodings (computes y from x mod p, stores raw x); a
+	// strict decoder rejects them. Canonicalize the boundary: x must be < p.
+	if xi := new(big.Int).SetBytes(pub_bytes[0:32]); xi.Cmp(bn256.P) >= 0 {
+		return true, uint64(0)
+	}
+	if err := P.DecodeCompressed(pub_bytes); err != nil {
+		return true, uint64(0)
+	}
+	R := &bn256.G1{}
+	if xi := new(big.Int).SetBytes(sig_bytes[64:96]); xi.Cmp(bn256.P) >= 0 {
+		return true, uint64(0)
+	}
+	if err := R.DecodeCompressed(sig_bytes[64:97]); err != nil {
+		return true, uint64(0)
+	}
+	T := &bn256.G1{}
+	if xi := new(big.Int).SetBytes(sig_bytes[97:129]); xi.Cmp(bn256.P) >= 0 {
+		return true, uint64(0)
+	}
+	if err := T.DecodeCompressed(sig_bytes[97:130]); err != nil {
+		return true, uint64(0)
+	}
+	s := new(big.Int).SetBytes(sig_bytes[:64])
+	// LOW-S / canonical scalar (wargame: malleability): s must be < n (group
+	// order). Without this, s and s+n both verify (ScalarMult reduces mod n
+	// internally) — a signature is malleable. Reject s >= n so the encoded
+	// signature is unique.
+	if s.Cmp(bn256.Order) >= 0 {
+		return true, uint64(0)
+	}
+
+	// e = ReducedHash(R || P || m)  (scalar mod n)
+	hash_input := append([]byte{}, R.EncodeCompressed()...)
+	hash_input = append(hash_input, P.EncodeCompressed()...)
+	hash_input = append(hash_input, msg_bytes...)
+	e := crypto.ReducedHash(hash_input)
+
+	// s'*G == R - T + e*P ?   (the tweak commitment T is subtractive;
+	// R - T = R + Neg(T), bn256 has no G1.Sub)
+	lhs := new(bn256.G1).ScalarMult(crypto.G, s)
+	negT := new(bn256.G1).Neg(T)
+	rt := new(bn256.G1).Add(R, negT)
+	rhs := new(bn256.G1).Add(rt, new(bn256.G1).ScalarMult(P, e))
+	if lhs.String() == rhs.String() {
+		return true, uint64(1)
+	}
 	return true, uint64(0)
 }
