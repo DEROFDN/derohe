@@ -8,18 +8,26 @@ import "github.com/deroproject/derohe/cryptography/crypto"
 
 // fill the common part from our chain
 func fill_common(common *Common_Struct) {
-	var err error
 	common.Height = chain.Get_Height()
 	//common.StableHeight = chain.Get_Stable_Height()
 	common.TopoHeight = chain.Load_TOPO_HEIGHT()
 
-	version, err := chain.ReadBlockSnapshotVersion(chain.Get_Top_ID())
-	if err != nil {
-		panic(err)
-	}
-
-	if common.StateHash, err = chain.Load_Merkle_Hash(version); err != nil {
-		panic(err)
+	// Get_Top_ID returns the zero hash when the topo store has no non-clean
+	// entry yet (chain not ready) - a state Get_Top_ID's own doc treats as
+	// legitimate, also reachable transiently while another connection's
+	// bootstrap_chain() is mid-write through its placeholder topo entries.
+	// ReadBlockSnapshotVersion has no real answer for the zero hash (no
+	// block ever hashes to it), so skip the lookup and leave StateHash at
+	// its zero value rather than treating "not ready yet" as fatal.
+	var zerohash crypto.Hash
+	if top_id := chain.Get_Top_ID(); top_id != zerohash {
+		version, err := chain.ReadBlockSnapshotVersion(top_id)
+		if err != nil {
+			panic(err)
+		}
+		if common.StateHash, err = chain.Load_Merkle_Hash(version); err != nil {
+			panic(err)
+		}
 	}
 
 	common.Top_Version = uint64(chain.Get_Current_Version_at_Height(int64(common.Height))) // this must be taken from the hardfork

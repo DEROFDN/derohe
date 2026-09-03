@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"math/big"
 	"math/bits"
+	"runtime"
 	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/rpc2"
 	"github.com/deroproject/derohe/block"
 	"github.com/deroproject/derohe/config"
 	"github.com/deroproject/derohe/cryptography/crypto" //import "net"
@@ -94,6 +96,22 @@ func (connection *Connection) bootstrap_chain() error {
 
 	commit_version := uint64(0)
 
+	// pipeline a window of concurrent TreeSection requests instead of
+	// waiting for each chunk's round-trip before firing the next one.
+	// results are drained in COMPLETION order (not index order) so one slow
+	// chunk can't head-of-line-block chunks that already finished -- chunk
+	// writes are commutative (disjoint key ranges into the same tree), so
+	// there is no ordering requirement here, unlike sync_chain's block adds.
+	pipeline, threads := 0, runtime.GOMAXPROCS(0) // N.B. Optimize by profiling hardware
+	switch {
+	case threads < 1:
+		pipeline = 1
+	case threads > 32:
+		pipeline = 32
+	default:
+		pipeline = threads
+	}
+
 	{ // fetch and commit balance tree
 
 		chunksize := int64(640)
@@ -110,51 +128,91 @@ func (connection *Connection) bootstrap_chain() error {
 			path_length = 1
 		}
 
-		var section [8]byte
-
 		total_keys := 0
 
 		if state.Step < 2 {
-			for i := state.Chunk; i < chunks; i++ {
-				state.Chunk = i
+
+			type indexed_result struct {
+				index int64
+				call  *rpc2.Call
+			}
+			results := make(chan indexed_result, pipeline)
+
+			fire := func(i int64) {
+				var section [8]byte
 				binary.BigEndian.PutUint64(section[:], bits.Reverse64(uint64(i))) // place reverse path
-				ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.BALANCE_TREE), Section: section[:], SectionLength: uint64(path_length)}
-				var ts_response Response_Tree_Section_Struct
+				ts_request := &Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.BALANCE_TREE), Section: section[:], SectionLength: uint64(path_length)}
 				fill_common(&ts_request.Common)
-				if err = connection.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
-					return err
-				} else {
-					// now we must write all the state changes to gravition
-					var balance_tree *graviton.Tree
-					if ss, err := chain.Store.Balance_store.LoadSnapshot(0); err != nil {
-						panic(err)
-					} else if balance_tree, err = ss.GetTree(config.BALANCE_TREE); err != nil {
-						panic(err)
-					}
+				done := make(chan *rpc2.Call, 1)
+				call := connection.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
+				go func() {
+					<-done
+					results <- indexed_result{index: i, call: call}
+				}()
+			}
 
-					if len(ts_response.Keys) != len(ts_response.Values) {
-						//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
-						return fmt.Errorf("mismatched key and value count")
-					}
-					//rlog.Debugf("chunk %d Will write %d keys\n", i, len(ts_response.Keys))
+			next_fire := state.Chunk
+			inflight_count := int64(0)
+			tx_pipeline := int64(pipeline)
+			for ; next_fire < chunks && inflight_count < tx_pipeline; next_fire++ {
+				fire(next_fire)
+				inflight_count++
+			}
 
-					for j := range ts_response.Keys {
-						balance_tree.Put(ts_response.Keys[j], ts_response.Values[j])
-					}
-					total_keys += len(ts_response.Keys)
+			completed := make(map[int64]bool)
+			low_water_mark := state.Chunk
+			total_to_do := chunks - state.Chunk
 
-					commit_version, err = graviton.Commit(balance_tree)
-					if err != nil {
-						panic(err)
-					}
-
-					h, err := balance_tree.Hash()
-					_ = h
-					_ = err
-					//rlog.Debugf("total keys %d hash %x err %s\n", total_keys, h, err)
-
+			for done_count := int64(0); done_count < total_to_do; done_count++ {
+				res := <-results
+				inflight_count--
+				if res.call.Error != nil {
+					return res.call.Error
 				}
-				connection.logger.Info("Bootstrap in progress(step1)", "percent", float32(i*100)/float32(chunks))
+				ts_response := res.call.Reply.(*Response_Tree_Section_Struct)
+
+				// now we must write all the state changes to gravition
+				var balance_tree *graviton.Tree
+				if ss, err := chain.Store.Balance_store.LoadSnapshot(0); err != nil {
+					panic(err)
+				} else if balance_tree, err = ss.GetTree(config.BALANCE_TREE); err != nil {
+					panic(err)
+				}
+
+				if len(ts_response.Keys) != len(ts_response.Values) {
+					//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
+					return fmt.Errorf("mismatched key and value count")
+				}
+				//rlog.Debugf("chunk %d Will write %d keys\n", res.index, len(ts_response.Keys))
+
+				for j := range ts_response.Keys {
+					balance_tree.Put(ts_response.Keys[j], ts_response.Values[j])
+				}
+				total_keys += len(ts_response.Keys)
+
+				commit_version, err = graviton.Commit(balance_tree)
+				if err != nil {
+					panic(err)
+				}
+
+				h, err := balance_tree.Hash()
+				_ = h
+				_ = err
+				//rlog.Debugf("total keys %d hash %x err %s\n", total_keys, h, err)
+
+				completed[res.index] = true
+				for completed[low_water_mark] {
+					delete(completed, low_water_mark)
+					low_water_mark++
+				}
+				state.Chunk = low_water_mark
+				connection.logger.Info("Bootstrap in progress(step1)", "percent", float32(res.index*100)/float32(chunks))
+
+				if next_fire < chunks {
+					fire(next_fire)
+					next_fire++
+					inflight_count++
+				}
 			}
 			state.Step = 2
 			state.Chunk = 0
@@ -176,19 +234,63 @@ func (connection *Connection) bootstrap_chain() error {
 			path_length = 1
 		}
 
-		var section [8]byte
-
 		total_keys := 0
 
-		for i := state.Chunk; i < chunks; i++ {
-			state.Chunk = i
+		// pipeline the OUTER SC-meta chunk fetch too (same fire-ahead pattern
+		// as the balance tree above): this loop was left fully sequential
+		// (one blocking Client.Call per chunk) when the balance-tree loop
+		// and the nested per-SC fetches below were pipelined, making step 2
+		// visibly slower per-unit than step 1.
+		//
+		// Deliberately a SEPARATE, SMALLER window than `pipeline` (capped at
+		// 4), not reusing it directly: each outer chunk here also spins up
+		// its own nested per-SC pipeline (up to `pipeline` concurrent
+		// requests) below. An unbounded outer window would compound against
+		// that nested one (outer x inner), not just add to it.
+		outer_pipeline := int64(pipeline)
+		if outer_pipeline > 4 {
+			outer_pipeline = 4
+		}
+
+		type sc_meta_indexed_result struct {
+			index int64
+			call  *rpc2.Call
+		}
+		sc_meta_results := make(chan sc_meta_indexed_result, outer_pipeline)
+
+		fire_sc_meta := func(i int64) {
+			var section [8]byte
 			binary.BigEndian.PutUint64(section[:], bits.Reverse64(uint64(i))) // place reverse path
-			ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.SC_META), Section: section[:], SectionLength: uint64(path_length)}
-			var ts_response Response_Tree_Section_Struct
+			ts_request := &Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.SC_META), Section: section[:], SectionLength: uint64(path_length)}
 			fill_common(&ts_request.Common)
-			if err = connection.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
-				return err
-			} else {
+			done := make(chan *rpc2.Call, 1)
+			call := connection.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
+			go func() {
+				<-done
+				sc_meta_results <- sc_meta_indexed_result{index: i, call: call}
+			}()
+		}
+
+		next_fire := state.Chunk
+		inflight_count := int64(0)
+		for ; next_fire < chunks && inflight_count < outer_pipeline; next_fire++ {
+			fire_sc_meta(next_fire)
+			inflight_count++
+		}
+
+		completed := make(map[int64]bool)
+		low_water_mark := state.Chunk
+		total_to_do := chunks - state.Chunk
+
+		for done_count := int64(0); done_count < total_to_do; done_count++ {
+			res := <-sc_meta_results
+			inflight_count--
+			if res.call.Error != nil {
+				return res.call.Error
+			}
+			ts_response := *res.call.Reply.(*Response_Tree_Section_Struct)
+			i := res.index
+			{
 				// now we must write all the state changes to gravition
 				var changed_trees []*graviton.Tree
 				var sc_tree *graviton.Tree
@@ -208,63 +310,104 @@ func (connection *Connection) bootstrap_chain() error {
 
 				for j := range ts_response.Keys {
 					sc_tree.Put(ts_response.Keys[j], ts_response.Values[j])
+				}
 
-					// we must fetch each individual SC tree
+				// fetch each discovered SC's own data tree concurrently instead of one at a
+				// time -- only the network round-trips run in worker goroutines (already
+				// proven safe for concurrent use by rpc2.Client); every graviton GetTree/Put
+				// call stays on this single goroutine, so there's no concurrent access to
+				// graviton's Snapshot/Tree at all, just parallel network I/O
+				type sc_fetch_result struct {
+					key          []byte
+					keys, values [][]byte
+					err          error
+				}
 
-					sc_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: ts_response.Keys[j], Section: section[:], SectionLength: uint64(0)}
+				fetch_one_sc := func(key []byte) sc_fetch_result {
+					var section [8]byte
+					sc_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: section[:], SectionLength: uint64(0)}
 					var sc_response Response_Tree_Section_Struct
 					fill_common(&sc_request.Common)
-					if err = connection.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
-						return err
-					} else {
-
-						var sc_data_tree *graviton.Tree
-						if sc_data_tree, err = ss.GetTree(string(ts_response.Keys[j])); err != nil {
-							panic(err)
-						} else if sc_response.KeyCount < 4096 {
-							for k := range sc_response.Keys {
-								sc_data_tree.Put(sc_response.Keys[k], sc_response.Values[k])
-							}
-						} else { // tree is a huge tree, get it in chunks
-							sc_chunks_estm := sc_response.KeyCount / chunksize
-							sc_chunks := int64(1) // chunks need to be in power of 2
-							sc_path_length := 0
-							for sc_chunks < sc_chunks_estm {
-								sc_chunks = sc_chunks * 2
-								sc_path_length++
-							}
-
-							if sc_chunks < 2 {
-								sc_chunks = 2
-								sc_path_length = 1
-							}
-
-							var sc_section [8]byte
-							for k := int64(0); k < sc_chunks; k++ {
-								binary.BigEndian.PutUint64(sc_section[:], bits.Reverse64(uint64(k))) // place reverse path
-								sc_ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: ts_response.Keys[j], Section: sc_section[:], SectionLength: uint64(sc_path_length)}
-								var sc_ts_response Response_Tree_Section_Struct
-								fill_common(&sc_ts_request.Common)
-								if err = connection.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
-									return err
-								} else { // request was successfull
-
-									if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
-										return fmt.Errorf("mismatched key and value count")
-									}
-									//fmt.Printf("writing SC chunk %d/%d (%d)  writing %d keys %x\n", k, sc_chunks, sc_response.KeyCount, len(sc_ts_response.Keys), ts_response.Keys[j])
-									for l := range sc_ts_response.Keys {
-										sc_data_tree.Put(sc_ts_response.Keys[l], sc_ts_response.Values[l])
-									}
-								}
-
-							}
-						}
-						changed_trees = append(changed_trees, sc_data_tree)
-
+					if err := connection.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
+						return sc_fetch_result{key: key, err: err}
 					}
 
+					if sc_response.KeyCount < 4096 {
+						return sc_fetch_result{key: key, keys: sc_response.Keys, values: sc_response.Values}
+					}
+
+					// huge tree -- fetch remaining chunks sequentially within this goroutine
+					// (still only network calls; still no graviton access here)
+					sc_chunks_estm := sc_response.KeyCount / chunksize
+					sc_chunks := int64(1) // chunks need to be in power of 2
+					sc_path_length := 0
+					for sc_chunks < sc_chunks_estm {
+						sc_chunks = sc_chunks * 2
+						sc_path_length++
+					}
+
+					if sc_chunks < 2 {
+						sc_chunks = 2
+						sc_path_length = 1
+					}
+
+					all_keys := append([][]byte{}, sc_response.Keys...)
+					all_values := append([][]byte{}, sc_response.Values...)
+
+					var sc_section [8]byte
+					for k := int64(0); k < sc_chunks; k++ {
+						binary.BigEndian.PutUint64(sc_section[:], bits.Reverse64(uint64(k))) // place reverse path
+						sc_ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: sc_section[:], SectionLength: uint64(sc_path_length)}
+						var sc_ts_response Response_Tree_Section_Struct
+						fill_common(&sc_ts_request.Common)
+						if err := connection.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
+							return sc_fetch_result{key: key, err: err}
+						}
+						if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
+							return sc_fetch_result{key: key, err: fmt.Errorf("mismatched key and value count")}
+						}
+						all_keys = append(all_keys, sc_ts_response.Keys...)
+						all_values = append(all_values, sc_ts_response.Values...)
+					}
+					return sc_fetch_result{key: key, keys: all_keys, values: all_values}
 				}
+
+				sc_results := make(chan sc_fetch_result, pipeline)
+				launch := func(idx int) {
+					go func() { sc_results <- fetch_one_sc(ts_response.Keys[idx]) }()
+				}
+
+				sc_next := 0
+				sc_inflight := 0
+				sc_pipeline := int(pipeline)
+				for ; sc_next < len(ts_response.Keys) && sc_inflight < sc_pipeline; sc_next++ {
+					launch(sc_next)
+					sc_inflight++
+				}
+
+				for done := 0; done < len(ts_response.Keys); done++ {
+					res := <-sc_results
+					sc_inflight--
+					if res.err != nil {
+						return res.err
+					}
+
+					sc_data_tree, terr := ss.GetTree(string(res.key))
+					if terr != nil {
+						panic(terr)
+					}
+					for k := range res.keys {
+						sc_data_tree.Put(res.keys[k], res.values[k])
+					}
+					changed_trees = append(changed_trees, sc_data_tree)
+
+					if sc_next < len(ts_response.Keys) {
+						launch(sc_next)
+						sc_next++
+						sc_inflight++
+					}
+				}
+
 				total_keys += len(ts_response.Keys)
 				changed_trees = append(changed_trees, sc_tree)
 				commit_version, err = graviton.Commit(changed_trees...)
@@ -278,7 +421,21 @@ func (connection *Connection) bootstrap_chain() error {
 				//rlog.Debugf("total SC keys %d hash %x err %s\n", total_keys, h, err)
 
 			}
+
+			completed[i] = true
+			for completed[low_water_mark] {
+				delete(completed, low_water_mark)
+				low_water_mark++
+			}
+			state.Chunk = low_water_mark
+
 			connection.logger.Info("Bootstrap in progress(step 2)", "percent", float32(i*100)/float32(chunks))
+
+			if next_fire < chunks {
+				fire_sc_meta(next_fire)
+				next_fire++
+				inflight_count++
+			}
 		}
 	}
 
