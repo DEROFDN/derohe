@@ -5,19 +5,23 @@
 package nbhttp
 
 import (
-	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lesismal/nbio/mempool"
 )
 
 var (
-	emptyRequest  = http.Request{}
+	// used to reset a http.Request to empty value.
+	emptyRequest = http.Request{}
+	// used to reset a Response to empty value.
 	emptyResponse = Response{}
+	// used to reset a http.Response to empty value.
+	emptyClientResponse = http.Response{}
 
 	requestPool = sync.Pool{
 		New: func() interface{} {
@@ -30,14 +34,29 @@ var (
 			return &Response{}
 		},
 	}
+
+	clientResponsePool = sync.Pool{
+		New: func() interface{} {
+			return &http.Response{}
+		},
+	}
 )
 
-func releaseRequest(req *http.Request) {
+//go:norace
+func releaseRequest(req *http.Request, retainHTTPBody bool) {
 	if req != nil {
 		if req.Body != nil {
-			br := req.Body.(*BodyReader)
-			br.close()
-			bodyReaderPool.Put(br)
+			if br, ok := req.Body.(*BodyReader); ok {
+				if retainHTTPBody {
+					// do not release the body
+				} else {
+					_ = br.Close()
+					*br = emptyBodyReader
+					bodyReaderPool.Put(br)
+				}
+			} else if !retainHTTPBody {
+				_ = req.Body.Close()
+			}
 		}
 		// fast gc for fields
 		*req = emptyRequest
@@ -45,64 +64,67 @@ func releaseRequest(req *http.Request) {
 	}
 }
 
+//go:norace
 func releaseResponse(res *Response) {
 	if res != nil {
+		if res.buffer != nil {
+			mempool.Free(res.buffer)
+		}
+		if res.bodyBuffer != nil {
+			mempool.Free(res.bodyBuffer)
+		}
 		*res = emptyResponse
 		responsePool.Put(res)
 	}
 }
 
-// func releaseStdResponse(res *http.Response) {
-// 	if res != nil {
-// 		*res = emptyStdResponse
-// 		stdResponsePool.Put(res)
-// 	}
-// }
+//go:norace
+func releaseClientResponse(res *http.Response) {
+	if res != nil {
+		if res.Body != nil {
+			br := res.Body.(*BodyReader)
+			_ = br.Close()
+			*br = emptyBodyReader
+			bodyReaderPool.Put(br)
+		}
+		*res = emptyClientResponse
+		clientResponsePool.Put(res)
+	}
+}
 
 // Processor .
 type Processor interface {
-	Conn() net.Conn
-	OnMethod(method string)
-	OnURL(uri string) error
-	OnProto(proto string) error
-	OnStatus(code int, status string)
-	OnHeader(key, value string)
-	OnContentLength(contentLength int)
-	OnBody(data []byte)
-	OnTrailerHeader(key, value string)
+	OnMethod(parser *Parser, method string)
+	OnURL(parser *Parser, uri string) error
+	OnProto(parser *Parser, proto string) error
+	OnStatus(parser *Parser, code int, status string)
+	OnHeader(parser *Parser, key, value string)
+	OnContentLength(parser *Parser, contentLength int)
+	OnBody(parser *Parser, data []byte) error
+	OnTrailerHeader(parser *Parser, key, value string)
 	OnComplete(parser *Parser)
-	Close(p *Parser, err error)
+	Close(parser *Parser, err error)
+	Clean(parser *Parser)
 }
 
-// ServerProcessor .
+var (
+	emptyServerProcessor = ServerProcessor{}
+	emptyClientProcessor = ClientProcessor{}
+)
+
+// ServerProcessor is used for server side connection.
 type ServerProcessor struct {
-	// active int32
-
-	// mux     sync.Mutex
-	conn    net.Conn
-	parser  *Parser
 	request *http.Request
-	handler http.Handler
-	// executor func(index int, f func())
-
-	// resQueue       []*Response
-	keepaliveTime  time.Duration
-	enableSendfile bool
-	// isUpgrade      bool
-	remoteAddr string
-}
-
-// Conn .
-func (p *ServerProcessor) Conn() net.Conn {
-	return p.conn
 }
 
 // OnMethod .
-func (p *ServerProcessor) OnMethod(method string) {
+//
+//go:norace
+func (p *ServerProcessor) OnMethod(parser *Parser, method string) {
 	if p.request == nil {
 		p.request = requestPool.Get().(*http.Request)
-		if p.parser != nil {
-			*p.request = *p.parser.Engine.emptyRequest
+		if parser != nil {
+			*p.request = *parser.Engine.emptyRequest
 		}
 		p.request.Method = method
 		p.request.Header = http.Header{}
@@ -112,18 +134,32 @@ func (p *ServerProcessor) OnMethod(method string) {
 }
 
 // OnURL .
-func (p *ServerProcessor) OnURL(uri string) error {
-	u, err := url.ParseRequestURI(uri)
+//
+//go:norace
+func (p *ServerProcessor) OnURL(parser *Parser, rawurl string) error {
+	p.request.RequestURI = rawurl
+
+	justAuthority := p.request.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
+	if justAuthority {
+		rawurl = "http://" + rawurl
+	}
+
+	u, err := url.ParseRequestURI(rawurl)
 	if err != nil {
 		return err
 	}
+	if justAuthority {
+		u.Scheme = ""
+	}
+
 	p.request.URL = u
-	p.request.RequestURI = uri
 	return nil
 }
 
 // OnProto .
-func (p *ServerProcessor) OnProto(proto string) error {
+//
+//go:norace
+func (p *ServerProcessor) OnProto(parser *Parser, proto string) error {
 	protoMajor, protoMinor, ok := http.ParseHTTPVersion(proto)
 	if !ok {
 		return fmt.Errorf("%s %q", "malformed HTTP version", proto)
@@ -135,12 +171,16 @@ func (p *ServerProcessor) OnProto(proto string) error {
 }
 
 // OnStatus .
-func (p *ServerProcessor) OnStatus(code int, status string) {
+//
+//go:norace
+func (p *ServerProcessor) OnStatus(parser *Parser, code int, status string) {
 
 }
 
 // OnHeader .
-func (p *ServerProcessor) OnHeader(key, value string) {
+//
+//go:norace
+func (p *ServerProcessor) OnHeader(parser *Parser, key, value string) {
 	values := p.request.Header[key]
 	values = append(values, value)
 	p.request.Header[key] = values
@@ -148,21 +188,26 @@ func (p *ServerProcessor) OnHeader(key, value string) {
 }
 
 // OnContentLength .
-func (p *ServerProcessor) OnContentLength(contentLength int) {
+//
+//go:norace
+func (p *ServerProcessor) OnContentLength(parser *Parser, contentLength int) {
 	p.request.ContentLength = int64(contentLength)
 }
 
 // OnBody .
-func (p *ServerProcessor) OnBody(data []byte) {
+//
+//go:norace
+func (p *ServerProcessor) OnBody(parser *Parser, data []byte) error {
 	if p.request.Body == nil {
-		p.request.Body = NewBodyReader(data)
-	} else {
-		p.request.Body.(*BodyReader).Append(data)
+		p.request.Body = NewBodyReader(parser.Engine)
 	}
+	return p.request.Body.(*BodyReader).append(data)
 }
 
 // OnTrailerHeader .
-func (p *ServerProcessor) OnTrailerHeader(key, value string) {
+//
+//go:norace
+func (p *ServerProcessor) OnTrailerHeader(parser *Parser, key, value string) {
 	if p.request.Trailer == nil {
 		p.request.Trailer = http.Header{}
 	}
@@ -170,18 +215,21 @@ func (p *ServerProcessor) OnTrailerHeader(key, value string) {
 }
 
 // OnComplete .
+//
+//go:norace
 func (p *ServerProcessor) OnComplete(parser *Parser) {
-	// p.mux.Lock()
 	request := p.request
 	p.request = nil
-	// p.mux.Unlock()
 
 	if request == nil {
 		return
 	}
 
-	if p.conn != nil {
-		request.RemoteAddr = p.remoteAddr
+	engine := parser.Engine
+	conn := parser.Conn
+	request.RemoteAddr = conn.RemoteAddr().String()
+	if parser.Engine.WriteTimeout > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(engine.WriteTimeout))
 	}
 
 	if request.URL.Host == "" {
@@ -221,102 +269,105 @@ func (p *ServerProcessor) OnComplete(parser *Parser) {
 	// }
 
 	if request.Body == nil {
-		request.Body = NewBodyReader(nil)
+		request.Body = NewBodyReader(engine)
 	}
 
-	response := NewResponse(p.parser, request, p.enableSendfile)
-	parser.Execute(func() {
-		p.handler.ServeHTTP(response, request)
-		p.flushResponse(response)
-	})
+	response := NewResponse(parser, request)
+
+	if engine.OnRequest != nil {
+		engine.OnRequest(response, request)
+	}
+	if !parser.Execute(func() {
+		engine.Handler.ServeHTTP(response, request)
+		p.flushResponse(parser, response)
+	}) {
+		releaseRequest(request, engine.RetainHTTPBody)
+	}
 }
 
-func (p *ServerProcessor) flushResponse(res *Response) {
-	if p.conn != nil {
+//go:norace
+func (p *ServerProcessor) flushResponse(parser *Parser, res *Response) {
+	conn := parser.Conn
+	engine := parser.Engine
+	if conn != nil {
 		req := res.request
 		if !res.hijacked {
+			res.WriteHeader(http.StatusOK)
+			res.checkChunked()
 			res.eoncodeHead()
-			if err := res.flushTrailer(p.conn); err != nil {
-				p.conn.Close()
-				releaseRequest(req)
+			if err := res.flush(conn); err != nil {
+				_ = conn.Close()
+				releaseRequest(req, engine.RetainHTTPBody)
 				releaseResponse(res)
 				return
 			}
+			if req.Close {
+				// the data may still in the send queue
+				_ = conn.Close()
+			} else if parser.ParserCloser == nil {
+				_ = conn.SetReadDeadline(time.Now().Add(engine.KeepaliveTime))
+			}
 		}
-		if req.Close {
-			// the data may still in the send queue
-			p.conn.Close()
-		} else if p.parser == nil || p.parser.ConnState == nil {
-			p.conn.SetReadDeadline(time.Now().Add(p.keepaliveTime))
-		}
-		releaseRequest(req)
+		releaseRequest(req, engine.RetainHTTPBody)
 		releaseResponse(res)
 	}
 }
 
-// Close .
-func (p *ServerProcessor) Close(parser *Parser, err error) {
+// Clean .
+//
+//go:norace
+func (p *ServerProcessor) Clean(parser *Parser) {
+	if p.request != nil {
+		releaseRequest(p.request, parser.Engine.RetainHTTPBody)
+		p.request = nil
+	}
+	*p = emptyServerProcessor
+}
 
+// Close .
+//
+//go:norace
+func (p *ServerProcessor) Close(parser *Parser, err error) {
+	p.Clean(parser)
 }
 
 // NewServerProcessor .
-func NewServerProcessor(conn net.Conn, handler http.Handler, keepaliveTime time.Duration, enableSendfile bool) Processor {
-	if handler == nil {
-		panic(errors.New("invalid handler for ServerProcessor: nil"))
-	}
-	// p := serverProcessorPool.Get().(*ServerProcessor)
-	// p.conn = conn
-	// p.handler = handler
-	// p.executor = executor
-	// p.keepaliveTime = keepaliveTime
-	// p.enableSendfile = enableSendfile
-	// p.remoteAddr = conn.RemoteAddr().String()
-	p := &ServerProcessor{
-		conn:           conn,
-		handler:        handler,
-		keepaliveTime:  keepaliveTime,
-		enableSendfile: enableSendfile,
-	}
-	if conn != nil {
-		p.remoteAddr = conn.RemoteAddr().String()
-	}
-
-	return p
+//
+//go:norace
+func NewServerProcessor() Processor {
+	return &ServerProcessor{}
 }
 
-// ClientProcessor .
+// ClientProcessor is used for client side connection.
 type ClientProcessor struct {
 	conn     *ClientConn
 	response *http.Response
 	handler  func(res *http.Response, err error)
 }
 
-// Conn .
-func (p *ClientProcessor) Conn() net.Conn {
-	return p.conn.conn
-}
-
 // OnMethod .
-func (p *ClientProcessor) OnMethod(method string) {
+//
+//go:norace
+func (p *ClientProcessor) OnMethod(parser *Parser, method string) {
 }
 
 // OnURL .
-func (p *ClientProcessor) OnURL(uri string) error {
+//
+//go:norace
+func (p *ClientProcessor) OnURL(parser *Parser, uri string) error {
 	return nil
 }
 
 // OnProto .
-func (p *ClientProcessor) OnProto(proto string) error {
+//
+//go:norace
+func (p *ClientProcessor) OnProto(parser *Parser, proto string) error {
 	protoMajor, protoMinor, ok := http.ParseHTTPVersion(proto)
 	if !ok {
 		return fmt.Errorf("%s %q", "malformed HTTP version", proto)
 	}
 	if p.response == nil {
-		// p.response = &http.Response{
-		// 	Proto:  proto,
-		// 	Header: http.Header{},
-		// }
-		p.response = &http.Response{}
+		p.response = clientResponsePool.Get().(*http.Response)
 		p.response.Proto = proto
 		p.response.Header = http.Header{}
 	} else {
@@ -328,32 +379,41 @@ func (p *ClientProcessor) OnProto(proto string) error {
 }
 
 // OnStatus .
-func (p *ClientProcessor) OnStatus(code int, status string) {
+//
+//go:norace
+func (p *ClientProcessor) OnStatus(parser *Parser, code int, status string) {
 	p.response.StatusCode = code
 	p.response.Status = status
 }
 
 // OnHeader .
-func (p *ClientProcessor) OnHeader(key, value string) {
+//
+//go:norace
+func (p *ClientProcessor) OnHeader(parser *Parser, key, value string) {
 	p.response.Header.Add(key, value)
 }
 
 // OnContentLength .
-func (p *ClientProcessor) OnContentLength(contentLength int) {
+//
+//go:norace
+func (p *ClientProcessor) OnContentLength(parser *Parser, contentLength int) {
 	p.response.ContentLength = int64(contentLength)
 }
 
 // OnBody .
-func (p *ClientProcessor) OnBody(data []byte) {
+//
+//go:norace
+func (p *ClientProcessor) OnBody(parser *Parser, data []byte) error {
 	if p.response.Body == nil {
-		p.response.Body = NewBodyReader(data)
-	} else {
-		p.response.Body.(*BodyReader).Append(data)
+		p.response.Body = NewBodyReader(parser.Engine)
 	}
+	return p.response.Body.(*BodyReader).append(data)
 }
 
 // OnTrailerHeader .
-func (p *ClientProcessor) OnTrailerHeader(key, value string) {
+//
+//go:norace
+func (p *ClientProcessor) OnTrailerHeader(parser *Parser, key, value string) {
 	if p.response.Trailer == nil {
 		p.response.Trailer = http.Header{}
 	}
@@ -361,20 +421,53 @@ func (p *ClientProcessor) OnTrailerHeader(key, value string) {
 }
 
 // OnComplete .
+//
+//go:norace
 func (p *ClientProcessor) OnComplete(parser *Parser) {
 	res := p.response
 	p.response = nil
-	parser.Execute(func() {
+
+	// Fix #225
+	// Handle upgrade handshake response in the io goroutine to avoid concurrent issue:
+	// 1. when the server may send a message together with handshake response
+	// 2. we handle the handshake response in another goroutine
+	// 3. poller continue reading data using http parser(the upgrader reader hasn't been set before 2)
+	// then we got parsing errors or panic.
+	if res.StatusCode == http.StatusSwitchingProtocols {
 		p.handler(res, nil)
-	})
+		releaseClientResponse(res)
+		return
+	}
+
+	if !parser.Execute(func() {
+		p.handler(res, nil)
+		releaseClientResponse(res)
+	}) {
+		releaseClientResponse(res)
+	}
+}
+
+// Clean .
+//
+//go:norace
+func (p *ClientProcessor) Clean(parser *Parser) {
+	if p.response != nil {
+		releaseClientResponse(p.response)
+	}
+	*p = emptyClientProcessor
 }
 
 // Close .
+//
+//go:norace
 func (p *ClientProcessor) Close(parser *Parser, err error) {
 	p.conn.CloseWithError(err)
+	p.Clean(parser)
 }
 
 // NewClientProcessor .
+//
+//go:norace
 func NewClientProcessor(conn *ClientConn, handler func(res *http.Response, err error)) Processor {
 	return &ClientProcessor{
 		conn:    conn,
@@ -385,62 +478,86 @@ func NewClientProcessor(conn *ClientConn, handler func(res *http.Response, err e
 // EmptyProcessor .
 type EmptyProcessor struct{}
 
-// Conn .
-func (p *EmptyProcessor) Conn() net.Conn {
-	return nil
-}
-
 // OnMethod .
-func (p *EmptyProcessor) OnMethod(method string) {
+//
+//go:norace
+func (p *EmptyProcessor) OnMethod(parser *Parser, method string) {
 
 }
 
 // OnURL .
-func (p *EmptyProcessor) OnURL(uri string) error {
+//
+//go:norace
+func (p *EmptyProcessor) OnURL(parser *Parser, uri string) error {
 	return nil
 }
 
 // OnProto .
-func (p *EmptyProcessor) OnProto(proto string) error {
+//
+//go:norace
+func (p *EmptyProcessor) OnProto(parser *Parser, proto string) error {
 	return nil
 }
 
 // OnStatus .
-func (p *EmptyProcessor) OnStatus(code int, status string) {
+//
+//go:norace
+func (p *EmptyProcessor) OnStatus(parser *Parser, code int, status string) {
 
 }
 
 // OnHeader .
-func (p *EmptyProcessor) OnHeader(key, value string) {
+//
+//go:norace
+func (p *EmptyProcessor) OnHeader(parser *Parser, key, value string) {
 
 }
 
 // OnContentLength .
-func (p *EmptyProcessor) OnContentLength(contentLength int) {
+//
+//go:norace
+func (p *EmptyProcessor) OnContentLength(parser *Parser, contentLength int) {
 
 }
 
 // OnBody .
-func (p *EmptyProcessor) OnBody(data []byte) {
-
+//
+//go:norace
+func (p *EmptyProcessor) OnBody(parser *Parser, data []byte) error {
+	return nil
 }
 
 // OnTrailerHeader .
-func (p *EmptyProcessor) OnTrailerHeader(key, value string) {
+//
+//go:norace
+func (p *EmptyProcessor) OnTrailerHeader(parser *Parser, key, value string) {
 
 }
 
 // OnComplete .
+//
+//go:norace
 func (p *EmptyProcessor) OnComplete(parser *Parser) {
 
 }
 
+// Clean .
+//
+//go:norace
+func (p *EmptyProcessor) Clean(parser *Parser) {
+
+}
+
 // Close .
+//
+//go:norace
 func (p *EmptyProcessor) Close(parser *Parser, err error) {
 
 }
 
 // NewEmptyProcessor .
+//
+//go:norace
 func NewEmptyProcessor() Processor {
 	return &EmptyProcessor{}
 }

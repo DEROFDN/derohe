@@ -43,12 +43,16 @@ type ClientConn struct {
 
 	TLSClientConfig *tls.Config
 
+	Dial func(network, addr string) (net.Conn, error)
+
 	Proxy func(*http.Request) (*url.URL, error)
 
 	CheckRedirect func(req *http.Request, via []*http.Request) error
 }
 
-// Reset .
+// Reset resets itself as new created.
+//
+//go:norace
 func (c *ClientConn) Reset() {
 	c.mux.Lock()
 	if c.closed {
@@ -59,27 +63,23 @@ func (c *ClientConn) Reset() {
 	c.mux.Unlock()
 }
 
-// OnClose .
+// OnClose registers a callback for closing.
+//
+//go:norace
 func (c *ClientConn) OnClose(h func()) {
-	if h == nil {
-		return
-	}
-
-	pre := c.onClose
-	c.onClose = func() {
-		if pre != nil {
-			pre()
-		}
-		h()
-	}
+	c.onClose = h
 }
 
-// Close .
+// Close closes underlayer connection with EOF.
+//
+//go:norace
 func (c *ClientConn) Close() {
 	c.CloseWithError(io.EOF)
 }
 
-// CloseWithError .
+// CloseWithError closes underlayer connection with error.
+//
+//go:norace
 func (c *ClientConn) CloseWithError(err error) {
 	c.mux.Lock()
 	defer c.mux.Unlock()
@@ -89,6 +89,7 @@ func (c *ClientConn) CloseWithError(err error) {
 	}
 }
 
+//go:norace
 func (c *ClientConn) closeWithErrorWithoutLock(err error) {
 	if err == nil {
 		err = io.EOF
@@ -98,7 +99,19 @@ func (c *ClientConn) closeWithErrorWithoutLock(err error) {
 	}
 	c.handlers = nil
 	if c.conn != nil {
-		c.conn.Close()
+		nbc, ok := c.conn.(*nbio.Conn)
+		if !ok {
+			if tlsConn, ok2 := c.conn.(*tls.Conn); ok2 {
+				nbc, ok = tlsConn.Conn().(*nbio.Conn)
+			}
+		}
+		if ok {
+			key, _ := conn2Array(nbc)
+			c.Engine.mux.Lock()
+			delete(c.Engine.dialerConns, key)
+			c.Engine.mux.Unlock()
+		}
+		_ = c.conn.Close()
 		c.conn = nil
 	}
 	if c.onClose != nil {
@@ -106,6 +119,7 @@ func (c *ClientConn) closeWithErrorWithoutLock(err error) {
 	}
 }
 
+//go:norace
 func (c *ClientConn) onResponse(res *http.Response, err error) {
 	c.mux.Lock()
 	defer c.mux.Unlock()
@@ -124,13 +138,13 @@ func (c *ClientConn) onResponse(res *http.Response, err error) {
 					c.closeWithErrorWithoutLock(ErrClientTimeout)
 				}
 			} else {
-				c.conn.SetReadDeadline(deadline)
+				_ = c.conn.SetReadDeadline(deadline)
 			}
 		} else {
 			if c.IdleConnTimeout > 0 {
-				c.conn.SetReadDeadline(time.Now().Add(c.IdleConnTimeout))
+				_ = c.conn.SetReadDeadline(time.Now().Add(c.IdleConnTimeout))
 			} else {
-				c.conn.SetReadDeadline(time.Time{})
+				_ = c.conn.SetReadDeadline(time.Time{})
 			}
 		}
 		if len(c.handlers) == 0 {
@@ -139,7 +153,14 @@ func (c *ClientConn) onResponse(res *http.Response, err error) {
 	}
 }
 
-// Do .
+// Do sends an HTTP request and returns an HTTP response.
+// Notice:
+//  1. It's blocking when Dial to the server;
+//  2. It's non-blocking for waiting for the response;
+//  3. It calls the handler when the response is received
+//     or other errors occur, such as timeout.
+//
+//go:norace
 func (c *ClientConn) Do(req *http.Request, handler func(res *http.Response, conn net.Conn, err error)) {
 	c.mux.Lock()
 	defer func() {
@@ -168,6 +189,9 @@ func (c *ClientConn) Do(req *http.Request, handler func(res *http.Response, conn
 	}
 
 	sendRequest := func() {
+		if c.Engine.WriteTimeout > 0 {
+			_ = c.conn.SetWriteDeadline(time.Now().Add(c.Engine.WriteTimeout))
+		}
 		err := req.Write(c.conn)
 		if err != nil {
 			c.closeWithErrorWithoutLock(err)
@@ -177,7 +201,7 @@ func (c *ClientConn) Do(req *http.Request, handler func(res *http.Response, conn
 
 	if c.conn != nil {
 		if confTimeout > 0 && len(c.handlers) == 1 {
-			c.conn.SetReadDeadline(deadline)
+			_ = c.conn.SetReadDeadline(deadline)
 		}
 		sendRequest()
 	} else {
@@ -192,22 +216,38 @@ func (c *ClientConn) Do(req *http.Request, handler func(res *http.Response, conn
 
 		strs := strings.Split(req.URL.Host, ":")
 		host := strs[0]
-		port := req.URL.Scheme
+		port := "80"
 		if len(strs) >= 2 {
 			port = strs[1]
+		} else {
+			switch req.URL.Scheme {
+			case "http":
+				port = "80"
+			case "https":
+				port = "443"
+			}
 		}
 		addr := host + ":" + port
 
+		var dialer = c.Dial
 		var netDial netDialerFunc
 		if confTimeout <= 0 {
+			if dialer == nil {
+				dialer = net.Dial
+			}
 			netDial = func(network, addr string) (net.Conn, error) {
-				return net.Dial(network, addr)
+				return dialer(network, addr)
 			}
 		} else {
+			if dialer == nil {
+				dialer = func(network, addr string) (net.Conn, error) {
+					return net.DialTimeout(network, addr, timeout)
+				}
+			}
 			netDial = func(network, addr string) (net.Conn, error) {
-				conn, err := net.DialTimeout(network, addr, timeout)
+				conn, err := dialer(network, addr)
 				if err == nil {
-					conn.SetReadDeadline(deadline)
+					_ = conn.SetReadDeadline(deadline)
 				}
 				return conn, err
 			}
@@ -244,18 +284,21 @@ func (c *ClientConn) Do(req *http.Request, handler func(res *http.Response, conn
 				return
 			}
 
+			key, _ := conn2Array(nbc)
+			engine.mux.Lock()
+			engine.dialerConns[key] = struct{}{}
+			engine.mux.Unlock()
+
 			c.conn = nbc
 			processor := NewClientProcessor(c, c.onResponse)
-			parser := NewParser(processor, true, engine.ReadLimit, nbc.Execute)
-			parser.Conn = nbc
-			parser.Engine = engine
+			parser := NewParser(nbc, engine, processor, true, nbc.Execute)
 			parser.OnClose(func(p *Parser, err error) {
 				c.CloseWithError(err)
 			})
 			nbc.SetSession(parser)
 
 			nbc.OnData(engine.DataHandler)
-			engine.AddConn(nbc)
+			_, _ = engine.AddConn(nbc)
 		case "https":
 			tlsConfig := c.TLSClientConfig
 			if tlsConfig == nil {
@@ -263,7 +306,9 @@ func (c *ClientConn) Do(req *http.Request, handler func(res *http.Response, conn
 			} else {
 				tlsConfig = tlsConfig.Clone()
 			}
-			tlsConfig.ServerName = req.URL.Host
+			if tlsConfig.ServerName == "" {
+				tlsConfig.ServerName = host
+			}
 			tlsConn := tls.NewConn(netConn, tlsConfig, true, false, mempool.DefaultMemPool)
 			err = tlsConn.Handshake()
 			if err != nil {
@@ -283,13 +328,24 @@ func (c *ClientConn) Do(req *http.Request, handler func(res *http.Response, conn
 				return
 			}
 
+			key, err := conn2Array(nbc)
+			if err != nil {
+				logging.Error("add dialer conn failed: %v", err)
+				c.closeWithErrorWithoutLock(err)
+				return
+			}
+			engine.mux.Lock()
+			engine.dialerConns[key] = struct{}{}
+			engine.mux.Unlock()
+
 			isNonblock := true
 			tlsConn.ResetConn(nbc, isNonblock)
 
-			c.conn = tlsConn
+			nbhttpConn := &Conn{Conn: tlsConn}
+			c.conn = nbhttpConn
 			processor := NewClientProcessor(c, c.onResponse)
-			parser := NewParser(processor, true, engine.ReadLimit, nbc.Execute)
-			parser.Conn = tlsConn
+			parser := NewParser(nbhttpConn, engine, processor, true, nbc.Execute)
+			parser.Conn = nbhttpConn
 			parser.Engine = engine
 			parser.OnClose(func(p *Parser, err error) {
 				c.CloseWithError(err)
