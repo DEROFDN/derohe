@@ -140,12 +140,13 @@ func Connection_Delete(c *Connection) {
 func Connection_Pending_Clear() {
 	connection_map.Range(func(k, value interface{}) bool {
 		v := value.(*Connection)
-		if atomic.LoadUint32(&v.State) == HANDSHAKE_PENDING && time.Now().Sub(v.Created) > 10*time.Second { //and skip ourselves
+		if atomic.LoadUint32(&v.State) == HANDSHAKE_PENDING && time.Since(v.Created) > 10*time.Second { //and skip ourselves
 			v.exit()
+			Connection_Delete(v)
 			v.logger.V(3).Info("Cleaning pending connection")
 		}
 
-		if time.Now().Sub(v.update_received).Round(time.Second).Seconds() > 20 {
+		if time.Since(v.update_received).Round(time.Second).Seconds() > 20 {
 			v.exit()
 			Connection_Delete(v)
 			v.logger.V(1).Info("Purging connection due since idle")
