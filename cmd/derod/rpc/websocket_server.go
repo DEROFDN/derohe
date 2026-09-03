@@ -29,7 +29,6 @@ import "sync/atomic"
 import "context"
 import "strings"
 import "runtime/debug"
-import "encoding/json"
 
 import "github.com/deroproject/derohe/config"
 import "github.com/deroproject/derohe/globals"
@@ -52,9 +51,16 @@ import "github.com/creachadair/jrpc2/jhttp"
 // all components requiring access to blockchain must use , this struct to communicate
 // this structure must be update while mutex
 type RPCServer struct {
-	srv        *http.Server
-	mux        *http.ServeMux
-	Exit_Event chan bool // blockchain is shutting down and we must quit ASAP
+	srv         *http.Server
+	mux         *http.ServeMux
+	chain       *blockchain.Blockchain
+	clients     sync.Map
+	connections sync.Map
+	clientWait  sync.WaitGroup
+	stop        chan struct{}
+	stopping    bool
+	Exit_Event  chan bool // blockchain is shutting down and we must quit ASAP
+	stopOnce    sync.Once
 	sync.RWMutex
 }
 
@@ -64,9 +70,9 @@ var logger logr.Logger
 
 var client_connections sync.Map
 
-var options = &jrpc2.ServerOptions{AllowPush: true, RPCLog: metrics_generator{}, DecodeContext: func(ctx context.Context, method string, param json.RawMessage) (context.Context, json.RawMessage, error) {
+var options = &jrpc2.ServerOptions{AllowPush: true, RPCLog: metrics_generator{}, NewContext: func() context.Context {
 	t := time.Now()
-	return context.WithValue(ctx, "start_time", &t), param, nil
+	return context.WithValue(context.Background(), "start_time", &t)
 }}
 
 type metrics_generator struct{}
@@ -93,8 +99,31 @@ func (metrics_generator) LogResponse(ctx context.Context, resp *jrpc2.Response) 
 }
 
 // this function triggers notification to all clients that they should repoll
-func Notify_Block_Addition() {
+func (r *RPCServer) notifyBlockAddition() {
+	for {
+		r.chain.RPC_NotifyNewBlock.L.Lock()
+		select {
+		case <-r.stop:
+			r.chain.RPC_NotifyNewBlock.L.Unlock()
+			return
+		default:
+		}
+		r.chain.RPC_NotifyNewBlock.Wait()
+		select {
+		case <-r.stop:
+			r.chain.RPC_NotifyNewBlock.L.Unlock()
+			return
+		default:
+		}
+		r.chain.RPC_NotifyNewBlock.L.Unlock()
 
+		go r.notifyClients("Block")
+	}
+}
+
+// Notify_Block_Addition retains the original package-level behavior for legacy
+// callers. RPCServer instances use their own cancellable notification loop.
+func Notify_Block_Addition() {
 	for {
 		chain.RPC_NotifyNewBlock.L.Lock()
 		chain.RPC_NotifyNewBlock.Wait()
@@ -109,9 +138,45 @@ func Notify_Block_Addition() {
 	}
 }
 
-// this function triggers notification to all clients that they should repoll
-func Notify_MiniBlock_Addition() {
+func (r *RPCServer) notifyClients(method string) {
+	defer globals.Recover(2)
+	r.clients.Range(func(key, value interface{}) bool {
+		key.(*jrpc2.Server).Notify(context.Background(), method, nil)
+		return true
+	})
+}
 
+// this function triggers notification to all clients that they should repoll
+func (r *RPCServer) notifyMiniBlockAddition() {
+	for {
+		r.chain.RPC_NotifyNewMiniBlock.L.Lock()
+		select {
+		case <-r.stop:
+			r.chain.RPC_NotifyNewMiniBlock.L.Unlock()
+			return
+		default:
+		}
+		r.chain.RPC_NotifyNewMiniBlock.Wait()
+		select {
+		case <-r.stop:
+			r.chain.RPC_NotifyNewMiniBlock.L.Unlock()
+			return
+		default:
+		}
+		r.chain.RPC_NotifyNewMiniBlock.L.Unlock()
+
+		if globals.Arguments["--simulator"] == nil || (globals.Arguments["--simulator"] != nil && globals.Arguments["--simulator"].(bool) == false) {
+			go func() {
+				defer globals.Recover(2)
+				SendJob()
+			}()
+		}
+	}
+}
+
+// Notify_MiniBlock_Addition retains the original package-level behavior for
+// legacy callers. RPCServer instances use their own cancellable loop.
+func Notify_MiniBlock_Addition() {
 	for {
 		chain.RPC_NotifyNewMiniBlock.L.Lock()
 		chain.RPC_NotifyNewMiniBlock.Wait()
@@ -126,13 +191,35 @@ func Notify_MiniBlock_Addition() {
 	}
 }
 
-func Notify_Height_Changes() {
+func (r *RPCServer) notifyHeightChanges() {
+	for {
+		r.chain.RPC_NotifyNewBlock.L.Lock()
+		select {
+		case <-r.stop:
+			r.chain.RPC_NotifyNewBlock.L.Unlock()
+			return
+		default:
+		}
+		r.chain.RPC_NotifyNewBlock.Wait()
+		select {
+		case <-r.stop:
+			r.chain.RPC_NotifyNewBlock.L.Unlock()
+			return
+		default:
+		}
+		r.chain.RPC_NotifyNewBlock.L.Unlock()
 
+		go r.notifyClients("Height")
+	}
+}
+
+// Notify_Height_Changes retains the original package-level behavior for
+// legacy callers. RPCServer instances use their own cancellable loop.
+func Notify_Height_Changes() {
 	for {
 		chain.RPC_NotifyNewBlock.L.Lock()
 		chain.RPC_NotifyNewBlock.Wait()
 		chain.RPC_NotifyNewBlock.L.Unlock()
-
 		go func() {
 			defer globals.Recover(2)
 			client_connections.Range(func(key, value interface{}) bool {
@@ -156,9 +243,11 @@ func RPCServer_Start(params map[string]interface{}) (*RPCServer, error) {
 	})
 
 	r.Exit_Event = make(chan bool)
+	r.stop = make(chan struct{})
 
 	logger = globals.Logger.WithName("RPC") // all components must use this logger
-	chain = params["chain"].(*blockchain.Blockchain)
+	r.chain = params["chain"].(*blockchain.Blockchain)
+	chain = r.chain // legacy handlers still use the active chain
 
 	go r.Run()
 	logger.Info("RPC/Websocket server started")
@@ -169,18 +258,37 @@ func RPCServer_Start(params map[string]interface{}) (*RPCServer, error) {
 
 // shutdown the rpc server component
 func (r *RPCServer) RPCServer_Stop() {
-	r.Lock()
-	defer r.Unlock()
+	r.stopOnce.Do(func() {
+		r.Lock()
+		r.stopping = true
+		close(r.Exit_Event) // send signal to all connections to exit
+		close(r.stop)
+		srv := r.srv
+		r.Unlock()
 
-	close(r.Exit_Event) // send signal to all connections to exit
+		if srv != nil {
+			_ = srv.Shutdown(context.Background()) // shutdown the server
+		}
 
-	if r.srv != nil {
-		r.srv.Shutdown(context.Background()) // shutdown the server
-	}
-	// TODO we  must wait for connections to kill themselves
-	time.Sleep(1 * time.Second)
-	logger.Info("RPC Shutdown")
-	atomic.AddUint32(&globals.Subsystem_Active, ^uint32(0)) // this decrement 1 fom subsystem
+		// Wake notification loops blocked in Cond.Wait so they can observe the
+		// closed exit channel and terminate before the next simulator starts.
+		if r.chain != nil {
+			r.chain.RPC_NotifyNewBlock.L.Lock()
+			r.chain.RPC_NotifyNewBlock.Broadcast()
+			r.chain.RPC_NotifyNewBlock.L.Unlock()
+			r.chain.RPC_NotifyNewMiniBlock.L.Lock()
+			r.chain.RPC_NotifyNewMiniBlock.Broadcast()
+			r.chain.RPC_NotifyNewMiniBlock.L.Unlock()
+		}
+		r.connections.Range(func(key, value interface{}) bool {
+			_ = key.(*websocket.Conn).Close()
+			return true
+		})
+
+		r.clientWait.Wait()
+		logger.Info("RPC Shutdown")
+		atomic.AddUint32(&globals.Subsystem_Active, ^uint32(0)) // this decrement 1 fom subsystem
+	})
 }
 
 // setup handlers
@@ -210,11 +318,15 @@ func (r *RPCServer) Run() {
 
 	logger.Info("RPC will listen", "address", default_address)
 	r.Lock()
+	if r.stopping {
+		r.Unlock()
+		return
+	}
 	r.srv = &http.Server{Addr: default_address, Handler: r.mux}
 	r.Unlock()
 
 	r.mux.HandleFunc("/json_rpc", translate_http_to_jsonrpc_and_vice_versa)
-	r.mux.HandleFunc("/ws", ws_handler)
+	r.mux.HandleFunc("/ws", r.wsHandler)
 	r.mux.HandleFunc("/", hello)
 	r.mux.HandleFunc("/metrics", metrics.WritePrometheus) // register metrics handler
 
@@ -236,9 +348,9 @@ func (r *RPCServer) Run() {
 		logger.Info("runtime profiling disabled on non-loopback bind", "address", default_address)
 	}
 
-	go Notify_Block_Addition()     // process all blocks
-	go Notify_MiniBlock_Addition() // process all blocks
-	go Notify_Height_Changes()     // gives notification of changed height
+	go r.notifyBlockAddition()     // process all blocks
+	go r.notifyMiniBlockAddition() // process all blocks
+	go r.notifyHeightChanges()     // gives notification of changed height
 	if err := r.srv.ListenAndServe(); err != http.ErrServerClosed {
 		logger.Error(err, "ListenAndServe failed")
 	}
@@ -251,9 +363,25 @@ func hello(w http.ResponseWriter, r *http.Request) {
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }} // use default options
 
-func ws_handler(w http.ResponseWriter, r *http.Request) {
+func (r *RPCServer) wsHandler(w http.ResponseWriter, req *http.Request) {
+
+	c, err := upgrader.Upgrade(w, req, nil)
+	if err != nil {
+		return
+	}
+
+	r.RLock()
+	if r.stopping {
+		r.RUnlock()
+		_ = c.Close()
+		return
+	}
+	r.clientWait.Add(1)
+	r.connections.Store(c, struct{}{})
+	r.RUnlock()
 
 	var ws_server *jrpc2.Server
+	defer r.clientWait.Done()
 	defer func() {
 
 		// safety so if anything wrong happens, verification fails
@@ -262,19 +390,19 @@ func ws_handler(w http.ResponseWriter, r *http.Request) {
 		}
 		if ws_server != nil {
 			client_connections.Delete(ws_server)
+			r.clients.Delete(ws_server)
 		}
 
 	}()
 
-	c, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-
-	defer c.Close()
+	defer func() {
+		r.connections.Delete(c)
+		_ = c.Close()
+	}()
 	input_output := rwc.New(c)
 	ws_server = jrpc2.NewServer(d, options).Start(channel.RawJSON(input_output, input_output))
 	client_connections.Store(ws_server, 1)
+	r.clients.Store(ws_server, 1)
 	ws_server.Wait()
 
 }

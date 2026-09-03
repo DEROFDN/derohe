@@ -3,7 +3,6 @@
 package jhttp
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/creachadair/jrpc2"
-	"github.com/creachadair/jrpc2/code"
 	"github.com/creachadair/jrpc2/server"
 )
 
@@ -24,30 +22,28 @@ import (
 // with status 200 (OK). In case of error, the response body is a JSON-RPC
 // error object, and the HTTP status is one of the following:
 //
-//  Condition               HTTP Status
-//  ----------------------- -----------------------------------
-//  Parsing request         400 (Bad request)
-//  Method not found        404 (Not found)
-//  (other errors)          500 (Internal server error)
+//	Condition               HTTP Status
+//	----------------------- -----------------------------------
+//	Parsing request         400 (Bad request)
+//	Method not found        404 (Not found)
+//	(other errors)          500 (Internal server error)
 //
-// By default, the URL path identifies the JSON-RPC method, and the URL query
-// parameters are converted into a JSON object for the parameters. Leading and
-// trailing slashes are stripped from the path, and query values are sent as
-// JSON strings.
+// By default, a Getter uses [ParseBasic] to convert the HTTP request. The URL
+// path identifies the JSON-RPC method, and the URL query parameters are
+// converted into a JSON object for the parameters.  Query values are sent as
+// JSON strings.  For example, this URL:
 //
-// For example, this URL:
+//	http://site.org:2112/some/method?param1=xyzzy&param2=apple
 //
-//    http://site.org:2112/some/method?param1=xyzzy&param2=apple
+// produces the method name "some/method" and this parameter object:
 //
-// would produce the method name "some/method" and this parameter object:
+//	{"param1":"xyzzy", "param2":"apple"}
 //
-//    {"param1":"xyzzy", "param2":"apple"}
-//
-// To override the default behaviour, set a ParseRequest hook in GetterOptions.
-// See also the jhttp.ParseQuery function for a more expressive translation.
+// To override the default behaviour, set a ParseRequest hook in [GetterOptions].
+// See also the [ParseQuery] function for a more expressive translation.
 type Getter struct {
 	local    server.Local
-	parseReq func(*http.Request) (string, interface{}, error)
+	parseReq func(*http.Request) (string, any, error)
 }
 
 // NewGetter constructs a new Getter that starts a server on mux and dispatches
@@ -65,23 +61,22 @@ func NewGetter(mux jrpc2.Assigner, opts *GetterOptions) Getter {
 	}
 }
 
-// ServeHTTP implements the required method of http.Handler.
+// ServeHTTP implements the required method of [http.Handler].
 func (g Getter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	method, params, err := g.parseHTTPRequest(req)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, &jrpc2.Error{
-			Code:    code.ParseError,
+			Code:    jrpc2.ParseError,
 			Message: err.Error(),
 		})
 		return
 	}
 
-	ctx := context.WithValue(req.Context(), httpReqKey{}, req)
 	var result json.RawMessage
-	if err := g.local.Client.CallResult(ctx, method, params, &result); err != nil {
+	if err := g.local.Client.CallResult(req.Context(), method, params, &result); err != nil {
 		var status int
-		switch code.FromError(err) {
-		case code.MethodNotFound:
+		switch jrpc2.ErrorCode(err) {
+		case jrpc2.MethodNotFound:
 			status = http.StatusNotFound
 		default:
 			status = http.StatusInternalServerError
@@ -96,22 +91,11 @@ func (g Getter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // reports its exit status.
 func (g Getter) Close() error { return g.local.Close() }
 
-func (g Getter) parseHTTPRequest(req *http.Request) (string, interface{}, error) {
+func (g Getter) parseHTTPRequest(req *http.Request) (string, any, error) {
 	if g.parseReq != nil {
 		return g.parseReq(req)
 	}
-	if err := req.ParseForm(); err != nil {
-		return "", nil, err
-	}
-	method := strings.Trim(req.URL.Path, "/")
-	if method == "" {
-		return "", nil, errors.New("empty method name")
-	}
-	params := make(map[string]string)
-	for key := range req.Form {
-		params[key] = req.Form.Get(key)
-	}
-	return method, params, nil
+	return ParseBasic(req)
 }
 
 // GetterOptions are optional settings for a Getter. A nil pointer is ready for
@@ -127,7 +111,7 @@ type GetterOptions struct {
 	// parameters from an HTTP request. If this is not set, the default handler
 	// uses the URL path as the method name and the URL query as the method
 	// parameters.
-	ParseRequest func(*http.Request) (string, interface{}, error)
+	ParseRequest func(*http.Request) (string, any, error)
 }
 
 func (o *GetterOptions) clientOptions() *jrpc2.ClientOptions {
@@ -144,14 +128,14 @@ func (o *GetterOptions) serverOptions() *jrpc2.ServerOptions {
 	return o.Server
 }
 
-func (o *GetterOptions) parseRequest() func(*http.Request) (string, interface{}, error) {
+func (o *GetterOptions) parseRequest() func(*http.Request) (string, any, error) {
 	if o == nil {
 		return nil
 	}
 	return o.ParseRequest
 }
 
-func writeJSON(w http.ResponseWriter, code int, obj interface{}) {
+func writeJSON(w http.ResponseWriter, code int, obj any) {
 	bits, err := json.Marshal(obj)
 	if err != nil {
 		// Fallback in case of marshaling error. This should not happen, but
@@ -166,6 +150,27 @@ func writeJSON(w http.ResponseWriter, code int, obj interface{}) {
 	w.Write(bits)
 }
 
+// ParseBasic parses a request URL and query parameters to obtain a method name
+// and parameters. The URL path identifies the method name, with leading and
+// trailing slashes removed. Query values are packed into a map[string]string.
+//
+// This is the default query parser used by a [Getter] if none is specified in
+// its [GetterOptions].
+func ParseBasic(req *http.Request) (string, any, error) {
+	if err := req.ParseForm(); err != nil {
+		return "", nil, err
+	}
+	method := strings.Trim(req.URL.Path, "/")
+	if method == "" {
+		return "", nil, errors.New("empty method name")
+	}
+	params := make(map[string]string)
+	for key := range req.Form {
+		params[key] = req.Form.Get(key)
+	}
+	return method, params, nil
+}
+
 // ParseQuery parses a request URL and constructs a parameter map from the
 // query values encoded in the URL and/or request body.
 //
@@ -175,17 +180,17 @@ func writeJSON(w http.ResponseWriter, code int, obj interface{}) {
 // Double-quoted values are interpreted as JSON string values, with the same
 // encoding and escaping rules (UTF-8 with backslash escapes). Examples:
 //
-//    ""
-//    "foo\nbar"
-//    "a \"string\" of text"
+//	""
+//	"foo\nbar"
+//	"a \"string\" of text"
 //
 // Values that consist of decimal digits and an optional leading sign are
 // treated as either int64 (if there is no decimal point) or float64 values.
 // Examples:
 //
-//    25
-//    -16
-//    3.259
+//	25
+//	-16
+//	3.259
 //
 // The unquoted strings "true" and "false" are converted to the corresponding
 // Boolean values. The unquoted string "null" is converted to nil.
@@ -193,13 +198,13 @@ func writeJSON(w http.ResponseWriter, code int, obj interface{}) {
 // To express arbitrary bytes, use a singly-quoted string encoded in base64.
 // For example:
 //
-//    'aGVsbG8sIHdvcmxk'   -- represents "hello, world"
+//	'aGVsbG8sIHdvcmxk'   -- represents "hello, world"
 //
 // All values not matching any of the above are treated as literal strings.
 //
-// On success, the result has concrete type map[string]interface{} and the
+// On success, the result has concrete type map[string]any and the
 // method name is not empty.
-func ParseQuery(req *http.Request) (string, interface{}, error) {
+func ParseQuery(req *http.Request) (string, any, error) {
 	if err := req.ParseForm(); err != nil {
 		return "", nil, err
 	}
@@ -211,7 +216,7 @@ func ParseQuery(req *http.Request) (string, interface{}, error) {
 		return method, nil, nil
 	}
 
-	params := make(map[string]interface{})
+	params := make(map[string]any)
 	for key := range req.Form {
 		val := req.Form.Get(key)
 		if v, ok, err := parseJSONString(val); err != nil {
@@ -234,22 +239,20 @@ func ParseQuery(req *http.Request) (string, interface{}, error) {
 }
 
 func parseJSONString(s string) (string, bool, error) {
-	if len(s) >= 2 {
-		if s[0] == '"' && s[len(s)-1] == '"' {
-			var dec string
-			err := json.Unmarshal([]byte(s), &dec)
-			if err != nil {
-				return "", false, err
-			}
-			return dec, true, nil
-		} else if s[0] == '"' || s[len(s)-1] == '"' {
-			return "", false, errors.New("missing string quote")
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		var dec string
+		err := json.Unmarshal([]byte(s), &dec)
+		if err != nil {
+			return "", false, err
 		}
+		return dec, true, nil
+	} else if s != "" && (s[0] == '"' || s[len(s)-1] == '"') {
+		return "", false, errors.New("missing string quote")
 	}
 	return "", false, nil
 }
 
-func parseNumber(s string) (interface{}, bool) {
+func parseNumber(s string) (any, bool) {
 	z, err := strconv.ParseInt(s, 10, 64)
 	if err == nil {
 		return z, true
@@ -261,7 +264,7 @@ func parseNumber(s string) (interface{}, bool) {
 	return nil, false
 }
 
-func parseConstant(s string) (interface{}, bool) {
+func parseConstant(s string) (any, bool) {
 	switch s {
 	case "true":
 		return true, true
@@ -275,14 +278,12 @@ func parseConstant(s string) (interface{}, bool) {
 }
 
 func parseQuoted64(s string) ([]byte, bool, error) {
-	if len(s) >= 2 {
-		if s[0] == '\'' && s[len(s)-1] == '\'' {
-			trim := strings.TrimRight(s[1:len(s)-1], "=") // discard base64 padding
-			dec, err := base64.RawStdEncoding.DecodeString(trim)
-			return dec, err == nil, err
-		} else if s[0] == '\'' || s[len(s)-1] == '\'' {
-			return nil, false, errors.New("missing bytes quote")
-		}
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		trim := strings.TrimRight(s[1:len(s)-1], "=") // discard base64 padding
+		dec, err := base64.RawStdEncoding.DecodeString(trim)
+		return dec, err == nil, err
+	} else if s != "" && (s[0] == '\'' || s[len(s)-1] == '\'') {
+		return nil, false, errors.New("missing bytes quote")
 	}
 	return nil, false, nil
 }

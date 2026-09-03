@@ -7,7 +7,6 @@ import "testing"
 import "path/filepath"
 
 import "github.com/deroproject/derohe/config"
-import "github.com/deroproject/derohe/globals"
 import "github.com/deroproject/derohe/rpc"
 import "github.com/deroproject/derohe/blockchain"
 import "github.com/deroproject/derohe/transaction"
@@ -63,10 +62,18 @@ func Test_IntegratedAddress_BuildsTX(t *testing.T) {
 	config.Mainnet.Genesis_Block_Hash = genesis_block.GetHash()
 
 	chain, rpcserver, _ := simulator_chain_start()
-	defer simulator_chain_stop(chain, rpcserver)
+	defer func() {
+		wgenesis.Close_Encrypted_Wallet()
+		wsrc.Close_Encrypted_Wallet()
+		wdst.Close_Encrypted_Wallet()
+		simulator_chain_stop(chain, rpcserver)
+	}()
 
-	globals.Arguments["--daemon-address"] = rpcport
-	go Keep_Connectivity()
+	// simulator_chain_start publishes --daemon-address before RPCServer_Start
+	// launches the goroutine that reads globals.Arguments; writing it again
+	// here races that reader.
+	connectivity := Start_Connectivity()
+	defer connectivity.Stop()
 
 	if err := chain.Add_TX_To_Pool(wsrc.GetRegistrationTX()); err != nil {
 		t.Fatalf("Cannot add src regtx to pool err %s", err)

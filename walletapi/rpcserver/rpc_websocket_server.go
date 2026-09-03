@@ -223,11 +223,11 @@ func (rpcserver *RPCServer) Run(wallet *walletapi.Wallet_Disk) {
 		p.Ringsize = 2        // experts need not use this, they have direct call to do it
 
 		if result, err := Transfer(context.WithValue(context.Background(), "wallet_context", &wallet_apis), p); err != nil {
-			fmt.Fprintf(w, err.Error())
+			fmt.Fprint(w, err.Error())
 			return
 		} else {
 			if err := json.NewEncoder(w).Encode(result); err != nil {
-				fmt.Fprintf(w, err.Error())
+				fmt.Fprint(w, err.Error())
 				return
 			}
 		}

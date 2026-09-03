@@ -9,14 +9,11 @@ import (
 	"log"
 	"runtime"
 	"time"
-
-	"github.com/creachadair/jrpc2/code"
-	"github.com/creachadair/jrpc2/metrics"
 )
 
-// ServerOptions control the behaviour of a server created by NewServer.
-// A nil *ServerOptions provides sensible defaults.
-// It is safe to share server options among multiple server instances.
+// ServerOptions control the behaviour of a server created by [NewServer].  A
+// nil *ServerOptions is valid and provides sensible defaults.  It is safe to
+// share server options among multiple server instances.
 type ServerOptions struct {
 	// If not nil, send debug text logs here.
 	Logger Logger
@@ -46,27 +43,15 @@ type ServerOptions struct {
 	// If unset, the server uses a background context.
 	NewContext func() context.Context
 
-	// If set, this function is called with the method name and encoded request
-	// parameters received from the client, before they are delivered to the
-	// handler. Its return value replaces the context and argument values. This
-	// allows the server to decode context metadata sent by the client.
-	// If unset, context and parameters are used as given.
-	DecodeContext func(context.Context, string, json.RawMessage) (context.Context, json.RawMessage, error)
-
-	// If set, use this value to record server metrics. All servers created
-	// from the same options will share the same metrics collector.  If none is
-	// set, an empty collector will be created for each new server.
-	Metrics *metrics.M
-
 	// If nonzero this value as the server start time; otherwise, use the
 	// current time when Start is called. All servers created from the same
 	// options will share the same start time if one is set.
 	StartTime time.Time
 }
 
-func (s *ServerOptions) logFunc() func(string, ...interface{}) {
+func (s *ServerOptions) logFunc() func(string, ...any) {
 	if s == nil || s.Logger == nil {
-		return func(string, ...interface{}) {}
+		return func(string, ...any) {}
 	}
 	return s.Logger.Printf
 }
@@ -88,29 +73,11 @@ func (s *ServerOptions) startTime() time.Time {
 	return s.StartTime
 }
 
-func (o *ServerOptions) newContext() func() context.Context {
-	if o == nil || o.NewContext == nil {
+func (s *ServerOptions) newContext() func() context.Context {
+	if s == nil || s.NewContext == nil {
 		return context.Background
 	}
-	return o.NewContext
-}
-
-type decoder = func(context.Context, string, json.RawMessage) (context.Context, json.RawMessage, error)
-
-func (s *ServerOptions) decodeContext() decoder {
-	if s == nil || s.DecodeContext == nil {
-		return func(ctx context.Context, method string, params json.RawMessage) (context.Context, json.RawMessage, error) {
-			return ctx, params, nil
-		}
-	}
-	return s.DecodeContext
-}
-
-func (s *ServerOptions) metrics() *metrics.M {
-	if s == nil || s.Metrics == nil {
-		return metrics.New()
-	}
-	return s.Metrics
+	return s.NewContext
 }
 
 func (s *ServerOptions) rpcLog() RPCLogger {
@@ -120,18 +87,11 @@ func (s *ServerOptions) rpcLog() RPCLogger {
 	return s.RPCLog
 }
 
-// ClientOptions control the behaviour of a client created by NewClient.
-// A nil *ClientOptions provides sensible defaults.
+// ClientOptions control the behaviour of a client created by [NewClient].
+// A nil *ClientOptions is valid and provides sensible defaults.
 type ClientOptions struct {
 	// If not nil, send debug text logs here.
 	Logger Logger
-
-	// If set, this function is called with the context, method name, and
-	// encoded request parameters before the request is sent to the server.
-	// Its return value replaces the request parameters. This allows the client
-	// to send context metadata along with the request. If unset, the parameters
-	// are unchanged.
-	EncodeContext func(context.Context, string, json.RawMessage) (json.RawMessage, error)
 
 	// If set, this function is called if a notification is received from the
 	// server. If unset, server notifications are logged and discarded.  At
@@ -151,7 +111,7 @@ type ClientOptions struct {
 	// report a system error back to the server describing the error.
 	//
 	// Server callbacks are a non-standard extension of JSON-RPC.
-	OnCallback func(context.Context, *Request) (interface{}, error)
+	OnCallback Handler
 
 	// If set, this function is called when the context for a request terminates.
 	// The function receives the client and the response that was cancelled.
@@ -160,24 +120,18 @@ type ClientOptions struct {
 	// Note that the hook does not receive the request context, which has
 	// already ended by the time the hook is called.
 	OnCancel func(cli *Client, rsp *Response)
+
+	// If set, this function is called when the client is stopped, either by
+	// calling its Close method or by disconnection of its channel.  The
+	// arguments are the client itself and the error that caused it to stop.
+	OnStop func(cli *Client, err error)
 }
 
-func (c *ClientOptions) logFunc() func(string, ...interface{}) {
+func (c *ClientOptions) logFunc() func(string, ...any) {
 	if c == nil || c.Logger == nil {
-		return func(string, ...interface{}) {}
+		return func(string, ...any) {}
 	}
 	return c.Logger.Printf
-}
-
-type encoder = func(context.Context, string, json.RawMessage) (json.RawMessage, error)
-
-func (c *ClientOptions) encodeContext() encoder {
-	if c == nil || c.EncodeContext == nil {
-		return func(_ context.Context, methods string, params json.RawMessage) (json.RawMessage, error) {
-			return params, nil
-		}
-	}
-	return c.EncodeContext
 }
 
 func (c *ClientOptions) handleNotification() func(*jmessage) {
@@ -193,6 +147,13 @@ func (c *ClientOptions) handleCancel() func(*Client, *Response) {
 		return nil
 	}
 	return c.OnCancel
+}
+
+func (c *ClientOptions) handleStop() func(*Client, error) {
+	if c == nil || c.OnStop == nil {
+		return func(*Client, error) {}
+	}
+	return c.OnStop
 }
 
 func (c *ClientOptions) handleCallback() func(context.Context, *jmessage) []byte {
@@ -211,7 +172,7 @@ func (c *ClientOptions) handleCallback() func(context.Context, *jmessage) []byte
 		//
 		// See https://github.com/creachadair/jrpc2/issues/41.
 		rsp := &jmessage{ID: req.ID}
-		v, err := panicToError(func() (interface{}, error) {
+		v, err := panicToError(func() (any, error) {
 			return cb(ctx, &Request{
 				id:     req.ID,
 				method: req.M,
@@ -226,7 +187,7 @@ func (c *ClientOptions) handleCallback() func(context.Context, *jmessage) []byte
 			if e, ok := err.(*Error); ok {
 				rsp.E = e
 			} else {
-				rsp.E = &Error{Code: code.FromError(err), Message: err.Error()}
+				rsp.E = &Error{Code: ErrorCode(err), Message: err.Error()}
 			}
 		}
 		bits, _ := rsp.toJSON()
@@ -234,7 +195,7 @@ func (c *ClientOptions) handleCallback() func(context.Context, *jmessage) []byte
 	}
 }
 
-func panicToError(f func() (interface{}, error)) (v interface{}, err error) {
+func panicToError(f func() (any, error)) (v any, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("panic in callback handler: %v", p)
@@ -249,14 +210,14 @@ type Logger func(text string)
 
 // Printf writes a formatted message to the logger. If lg == nil, the message
 // is discarded.
-func (lg Logger) Printf(msg string, args ...interface{}) {
+func (lg Logger) Printf(msg string, args ...any) {
 	if lg != nil {
 		lg(fmt.Sprintf(msg, args...))
 	}
 }
 
-// StdLogger adapts a *log.Logger to a Logger. If logger == nil, the returned
-// function sends logs to the default logger.
+// StdLogger adapts a [*log.Logger] to a [Logger]. If logger == nil, the
+// returned function sends logs to the default logger.
 func StdLogger(logger *log.Logger) Logger {
 	if logger == nil {
 		return func(text string) { log.Output(2, text) }

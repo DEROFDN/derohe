@@ -1,0 +1,65 @@
+name: consensus-guard
+
+# This fork is consensus-identical to DEROFDN/derohe community-dev by design.
+# Experimentation belongs in walletapi/, rpc/, cmd/ and tooling — never in the
+# code that decides whether a block or transaction is valid. A node built from
+# this repo must accept and reject exactly what every other DERO node does.
+#
+# p2p is guarded for a second reason: chain_bootstrap.go writes Topo_store,
+# Block_tx_store and balance snapshots directly, without going through
+# Add_Complete_Block. A change there can leave a node whose state differs from
+# the network's while every validity check still passes.
+#
+# vendor/ is deliberately NOT guarded: dependency bumps are ordinary fork
+# maintenance and should not need a guard edit. Know what that costs. p2p
+# compiles against vendored libraries — kcp-go is the transport — so a vendored
+# change can alter how this node behaves on the network while this check stays
+# green. A green check means the guarded source matches upstream, not that the
+# built binary does.
+#
+# The check is a STATE check, not a diff-of-this-PR check: it asserts the
+# consensus tree is identical to upstream's. Merging upstream therefore always
+# passes; only a local edit to a consensus path can fail it.
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  consensus-identical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/DEROFDN/derohe.git
+          git fetch --no-tags upstream community-dev
+
+      - name: Assert consensus paths match upstream
+        run: |
+          PATHS="blockchain dvm cryptography transaction block astrobwt pow premine proof config globals p2p"
+          changed=$(git diff --name-only upstream/community-dev...HEAD -- $PATHS)
+
+          if [ -z "$changed" ]; then
+            echo "consensus paths identical to DEROFDN/derohe community-dev"
+            exit 0
+          fi
+
+          echo "::error::consensus divergence detected"
+          echo
+          echo "These files differ from upstream community-dev:"
+          echo "$changed" | sed 's/^/  /'
+          echo
+          echo "A node built from this branch may accept or reject blocks that the"
+          echo "rest of the DERO network does not, which silently forks it off chain."
+          echo
+          echo "Move the change into walletapi/, rpc/, cmd/ or tooling instead."
+          echo "If divergence is genuinely intended, that is a deliberate decision:"
+          echo "edit .github/workflows/consensus-guard.yml in the same PR so the"
+          echo "choice is visible in review."
+          exit 1

@@ -17,6 +17,7 @@
 package walletapi
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/pem"
@@ -82,6 +83,8 @@ type Account struct {
 }
 
 func (w *Wallet_Memory) AddListener(event rpc.EventType, callback func(interface{})) {
+	w.Lock()
+	defer w.Unlock()
 	if w.account.EventListeners == nil {
 		w.account.EventListeners = map[rpc.EventType][]func(interface{}){}
 	}
@@ -95,7 +98,16 @@ func (w *Wallet_Memory) AddListener(event rpc.EventType, callback func(interface
 	w.account.EventListeners[event] = listeners
 }
 
+func (w *Wallet_Memory) listeners(event rpc.EventType) []func(interface{}) {
+	w.RLock()
+	defer w.RUnlock()
+	return append([]func(interface{}){}, w.account.EventListeners[event]...)
+}
+
 func (w *Wallet_Memory) getEncryptedBalanceresult(scid crypto.Hash) rpc.GetEncryptedBalance_Result {
+	w.RLock()
+	defer w.RUnlock()
+
 	for _, e := range w.account.Balance_Result {
 		if scid == e.SCID {
 			return e
@@ -105,6 +117,9 @@ func (w *Wallet_Memory) getEncryptedBalanceresult(scid crypto.Hash) rpc.GetEncry
 }
 
 func (w *Wallet_Memory) setEncryptedBalanceresult(scid crypto.Hash, entry rpc.GetEncryptedBalance_Result) {
+	w.Lock()
+	defer w.Unlock()
+
 	for i, e := range w.account.Balance_Result {
 		if scid == e.SCID {
 			w.account.Balance_Result[i] = entry
@@ -117,6 +132,8 @@ func (w *Wallet_Memory) setEncryptedBalanceresult(scid crypto.Hash, entry rpc.Ge
 // add a entry in the suitable place
 // this is always single threaded
 func (w *Wallet_Memory) InsertReplace(scid crypto.Hash, e rpc.Entry) {
+	w.Lock()
+
 	var entries []rpc.Entry
 	if _, ok := w.account.EntriesNative[scid]; ok {
 		entries = w.account.EntriesNative[scid]
@@ -126,27 +143,51 @@ func (w *Wallet_Memory) InsertReplace(scid crypto.Hash, e rpc.Entry) {
 		return entries[j].TopoHeight >= e.TopoHeight && entries[j].TransactionPos >= e.TransactionPos && entries[j].Pos >= e.Pos
 	})
 
-	// entry already exists, we are probably rescanning/overwiting, delete anything afterwards
+	// entry already exists, we are probably rescanning/overwriting, delete anything afterwards
 	if i < len(entries) && entries[i].TopoHeight == e.TopoHeight && entries[i].TransactionPos == e.TransactionPos && entries[i].Pos == e.Pos {
 		entries = entries[:i]
-		// x is present at data[i]
-	} else {
-		// x is not present in data,
-		// but i is the index where it would be inserted.
 	}
 	entries = append(entries, e)
-
-	// Notify listeners of this new entry
-	if listeners, ok := w.account.EventListeners[rpc.NewEntry]; ok {
-		for _, listener := range listeners {
-			listener(e)
-		}
-	}
 
 	if w.account.EntriesNative == nil {
 		w.account.EntriesNative = map[crypto.Hash][]rpc.Entry{}
 	}
 	w.account.EntriesNative[scid] = entries
+
+	listeners := append([]func(interface{}){}, w.account.EventListeners[rpc.NewEntry]...)
+	w.Unlock()
+
+	// Notify listeners after releasing the wallet lock so callbacks can safely
+	// query wallet state.
+	for _, listener := range listeners {
+		listener(e)
+	}
+}
+
+func (w *Wallet_Memory) entriesForSCID(scid crypto.Hash) []rpc.Entry {
+	w.RLock()
+	defer w.RUnlock()
+	return append([]rpc.Entry(nil), w.account.EntriesNative[scid]...)
+}
+
+func (w *Wallet_Memory) IsSCIDTracked(scid crypto.Hash) bool {
+	w.RLock()
+	defer w.RUnlock()
+	_, tracked := w.account.EntriesNative[scid]
+	return tracked
+}
+
+// trackedSCIDs returns a snapshot of every SCID the wallet is tracking, so the
+// sync loop can refresh each one without holding the wallet lock across the
+// RPC calls.
+func (w *Wallet_Memory) trackedSCIDs() []crypto.Hash {
+	w.RLock()
+	defer w.RUnlock()
+	scids := make([]crypto.Hash, 0, len(w.account.EntriesNative))
+	for scid := range w.account.EntriesNative {
+		scids = append(scids, scid)
+	}
+	return scids
 }
 
 func (w *Wallet_Memory) TokenAdd(scid crypto.Hash) (err error) {
@@ -255,13 +296,23 @@ func (w *Wallet_Memory) Get_Balance_Rescan() (mature_balance uint64, locked_bala
 // get the unlocked balance ( amounts which are mature and can be spent at this time )
 // offline wallets may get this wrong, since they may not have latest data//
 func (w *Wallet_Memory) Get_Balance_scid(scid crypto.Hash) (mature_balance uint64, locked_balance uint64) {
+	w.RLock()
+	defer w.RUnlock()
 	return w.account.Balance[scid], 0
 }
 
 // get main balance directly
 func (w *Wallet_Memory) Get_Balance() (mature_balance uint64, locked_balance uint64) {
+	w.RLock()
+	defer w.RUnlock()
 	var scid crypto.Hash
 	return w.account.Balance[scid], 0
+}
+
+func (w *Wallet_Memory) getBalanceMature() uint64 {
+	w.RLock()
+	defer w.RUnlock()
+	return w.account.Balance_Mature
 }
 
 // finds all inputs which have been received/spent etc
@@ -392,6 +443,50 @@ func (w *Wallet_Memory) Clean() {
 	w.account.Registered = false
 }
 
+// NativeSyncStatus describes native-balance synchronization without
+// conflating the cached balance snapshot with the live daemon tip.
+//
+// WalletHeight and WalletTopoHeight identify the snapshot represented by the
+// cached native balance. NativeSyncHeight and NativeSyncTopoHeight identify
+// the daemon tip successfully observed by this wallet's latest native refresh.
+// DaemonHeight and DaemonTopoHeight identify the latest tip observed from the
+// daemon. Synchronized is true only when this wallet has successfully refreshed
+// native state against that latest tip.
+type NativeSyncStatus struct {
+	WalletHeight         uint64 `json:"wallet_height"`
+	WalletTopoHeight     int64  `json:"wallet_topoheight"`
+	NativeSyncHeight     uint64 `json:"native_sync_height"`
+	NativeSyncTopoHeight int64  `json:"native_sync_topoheight"`
+	DaemonHeight         uint64 `json:"daemon_height"`
+	DaemonTopoHeight     int64  `json:"daemon_topoheight"`
+	Synchronized         bool   `json:"synchronized"`
+}
+
+// Get_Native_Sync_Status returns the native-balance synchronization state.
+// Get_Height remains the balance snapshot height for history correctness; use
+// this method when a caller needs to decide whether the native wallet has
+// caught up with the latest daemon block.
+func (w *Wallet_Memory) Get_Native_Sync_Status() NativeSyncStatus {
+	var scid crypto.Hash
+	balance := w.getEncryptedBalanceresult(scid)
+	nativeSyncHeight, nativeSyncTopoHeight, nativeSyncGeneration := w.nativeSyncHeights()
+	daemonHeight, daemonTopoHeight, daemonGeneration, connected := daemonSyncState()
+
+	return NativeSyncStatus{
+		WalletHeight:         uint64(balance.Height),
+		WalletTopoHeight:     balance.Topoheight,
+		NativeSyncHeight:     uint64(nativeSyncHeight),
+		NativeSyncTopoHeight: nativeSyncTopoHeight,
+		DaemonHeight:         uint64(daemonHeight),
+		DaemonTopoHeight:     daemonTopoHeight, Synchronized: connected &&
+			daemonHeight > 0 &&
+			nativeSyncGeneration == daemonGeneration &&
+
+			nativeSyncHeight == daemonHeight &&
+			nativeSyncTopoHeight == daemonTopoHeight,
+	}
+}
+
 // return height of wallet
 func (w *Wallet_Memory) Get_Height() uint64 {
 	var scid crypto.Hash
@@ -405,15 +500,17 @@ func (w *Wallet_Memory) Get_TopoHeight() int64 {
 }
 
 func (w *Wallet_Memory) Get_Daemon_Height() uint64 {
-	return uint64(daemon_height)
+	return uint64(Get_Daemon_Height())
 }
 
 // return topoheight of darmon
 func (w *Wallet_Memory) Get_Daemon_TopoHeight() int64 {
-	return daemon_topoheight
+	return getDaemonTopoHeight()
 }
 
 func (w *Wallet_Memory) IsRegistered() bool {
+	w.RLock()
+	defer w.RUnlock()
 	return w.account.Registered
 }
 
@@ -429,9 +526,39 @@ func (w *Wallet_Memory) Get_Keys() _Keys {
 // by default a wallet opens in Offline Mode
 // however, if the wallet is in online mode, it can be made offline instantly using this
 func (w *Wallet_Memory) SetOfflineMode() bool {
+	w.markNativeSync(0, 0)
+	w.sync_loop_mu.Lock()
+	defer w.sync_loop_mu.Unlock()
+
+	w.Lock()
 	current_mode := w.wallet_online_mode
+	if !current_mode {
+		w.Unlock()
+		return false
+	}
 	w.wallet_online_mode = false
-	return current_mode
+	stop := w.sync_loop_stop
+	done := w.sync_loop_done
+	w.sync_context_mu.RLock()
+	cancel := w.sync_loop_cancel
+	w.sync_context_mu.RUnlock()
+	if stop != nil {
+		close(stop)
+		if cancel != nil {
+			cancel()
+		}
+		w.sync_loop_stop = nil
+		w.sync_loop_done = nil
+	}
+	w.Unlock()
+
+	if done != nil {
+		<-done
+	}
+	// Keep the canceled context published until the next online session.
+	// Background history work may still be unwinding after the sync loop exits;
+	// returning context.Background() here would make those RPCs uncancellable.
+	return true
 }
 
 func (w *Wallet_Memory) SetNetwork(mainnet bool) bool {
@@ -445,6 +572,8 @@ func (w *Wallet_Memory) GetNetwork() bool {
 
 // return current mode
 func (w *Wallet_Memory) GetMode() bool {
+	w.RLock()
+	defer w.RUnlock()
 	return w.wallet_online_mode
 }
 
@@ -461,13 +590,30 @@ func SetDaemonAddress(endpoint string) string {
 // by default a wallet opens in Offline Mode
 // however, It can be made online by calling this
 func (w *Wallet_Memory) SetOnlineMode() bool {
-	current_mode := w.wallet_online_mode
-	w.wallet_online_mode = true
+	w.sync_loop_mu.Lock()
+	defer w.sync_loop_mu.Unlock()
 
-	if current_mode != true { // trigger subroutine if previous mode was offline
-		go w.sync_loop() // start sync subroutine
+	w.Lock()
+	current_mode := w.wallet_online_mode
+	if current_mode {
+		w.Unlock()
+		return true
 	}
-	return current_mode
+	w.wallet_online_mode = true
+	w.markNativeSync(0, 0)
+	stop := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	w.sync_loop_stop = stop
+	done := make(chan struct{})
+	w.sync_loop_done = done
+	w.sync_context_mu.Lock()
+	w.sync_loop_ctx = ctx
+	w.sync_loop_cancel = cancel
+	w.sync_context_mu.Unlock()
+	w.Unlock()
+
+	go w.sync_loop(ctx, stop, done)
+	return false
 }
 
 // by default a wallet opens in Offline Mode

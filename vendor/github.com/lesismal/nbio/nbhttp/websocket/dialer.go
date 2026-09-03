@@ -28,6 +28,7 @@ const (
 type Dialer struct {
 	Engine *nbhttp.Engine
 
+	Options  *Options
 	Upgrader *Upgrader
 
 	Jar http.CookieJar
@@ -48,6 +49,8 @@ type Dialer struct {
 }
 
 // Dial .
+//
+//go:norace
 func (d *Dialer) Dial(urlStr string, requestHeader http.Header, v ...interface{}) (*Conn, *http.Response, error) {
 	ctx := context.Background()
 	if d.DialTimeout > 0 {
@@ -57,14 +60,19 @@ func (d *Dialer) Dial(urlStr string, requestHeader http.Header, v ...interface{}
 }
 
 // DialContext .
+//
+//go:norace
 func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader http.Header, v ...interface{}) (*Conn, *http.Response, error) {
 	if d.Cancel != nil {
 		defer d.Cancel()
 	}
 
-	upgrader := d.Upgrader
-	if upgrader == nil {
-		return nil, nil, errors.New("invalid Upgrader: nil")
+	options := d.Options
+	if options == nil {
+		options = d.Upgrader
+	}
+	if options == nil {
+		return nil, nil, errors.New("invalid Options: nil")
 	}
 
 	challengeKey, err := challengeKey()
@@ -133,7 +141,7 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		}
 	}
 
-	if d.EnableCompression {
+	if options.enableCompression {
 		req.Header[secWebsocketExtHeaderField] = []string{"permessage-deflate; server_no_context_takeover; client_no_context_takeover"}
 	}
 
@@ -148,7 +156,7 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	var res *http.Response
 	var errCh chan error
 	if asyncHandler == nil {
-		errCh = make(chan error)
+		errCh = make(chan error, 1)
 	}
 
 	cliConn := &nbhttp.ClientConn{
@@ -168,11 +176,13 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 				case errCh <- e:
 				case <-ctx.Done():
 					if conn != nil {
-						conn.Close()
+						_ = conn.Close()
 					}
 				}
 			} else {
-				asyncHandler(wsConn, res, e)
+				d.Engine.Execute(func() {
+					asyncHandler(wsConn, res, e)
+				})
 			}
 		}
 
@@ -183,7 +193,13 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 
 		nbc, ok := conn.(*nbio.Conn)
 		if !ok {
-			tlsConn, tlsOk := conn.(*tls.Conn)
+			nbhttpConn, ok2 := conn.(*nbhttp.Conn)
+			if !ok2 {
+				err = ErrBadHandshake
+				notifyResult(err)
+				return
+			}
+			tlsConn, tlsOk := nbhttpConn.Conn.(*tls.Conn)
 			if !tlsOk {
 				err = ErrBadHandshake
 				notifyResult(err)
@@ -203,9 +219,6 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 			notifyResult(err)
 			return
 		}
-		state := &connState{common: upgrader}
-
-		parser.ConnState = state
 
 		if d.Jar != nil {
 			if rc := resp.Cookies(); len(rc) > 0 {
@@ -239,16 +252,14 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 			break
 		}
 
-		wsConn = newConn(upgrader, conn, resp.Header.Get(secWebsocketProtoHeaderField), remoteCompressionEnabled)
-		wsConn.isClient = true
-		wsConn.Engine = d.Engine
-		wsConn.OnClose(upgrader.onClose)
+		wsConn = NewClientConn(options, conn, resp.Header.Get(secWebsocketProtoHeaderField), remoteCompressionEnabled, false)
+		parser.ParserCloser = wsConn
+		wsConn.Engine = parser.Engine
+		wsConn.Execute = parser.Execute
+		nbc.SetSession(wsConn)
 
-		state.conn = wsConn
-		state.Engine = parser.Engine
-
-		if upgrader.openHandler != nil {
-			upgrader.openHandler(wsConn)
+		if wsConn.openHandler != nil {
+			wsConn.openHandler(wsConn)
 		}
 
 		notifyResult(err)

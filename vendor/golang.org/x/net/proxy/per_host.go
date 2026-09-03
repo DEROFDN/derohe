@@ -5,7 +5,9 @@
 package proxy
 
 import (
+	"context"
 	"net"
+	"net/netip"
 	"strings"
 )
 
@@ -41,8 +43,23 @@ func (p *PerHost) Dial(network, addr string) (c net.Conn, err error) {
 	return p.dialerForRequest(host).Dial(network, addr)
 }
 
+// DialContext connects to the address addr on the given network through either
+// defaultDialer or bypass.
+func (p *PerHost) DialContext(ctx context.Context, network, addr string) (c net.Conn, err error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	d := p.dialerForRequest(host)
+	if x, ok := d.(ContextDialer); ok {
+		return x.DialContext(ctx, network, addr)
+	}
+	return dialContext(ctx, d, network, addr)
+}
+
 func (p *PerHost) dialerForRequest(host string) Dialer {
-	if ip := net.ParseIP(host); ip != nil {
+	if nip, err := netip.ParseAddr(host); err == nil {
+		ip := net.IP(nip.AsSlice())
 		for _, net := range p.bypassNetworks {
 			if net.Contains(ip) {
 				return p.bypass
@@ -93,8 +110,8 @@ func (p *PerHost) AddFromString(s string) {
 			}
 			continue
 		}
-		if ip := net.ParseIP(host); ip != nil {
-			p.AddIP(ip)
+		if nip, err := netip.ParseAddr(host); err == nil {
+			p.AddIP(net.IP(nip.AsSlice()))
 			continue
 		}
 		if strings.HasPrefix(host, "*.") {
@@ -122,9 +139,7 @@ func (p *PerHost) AddNetwork(net *net.IPNet) {
 // AddZone specifies a DNS suffix that will use the bypass proxy. A zone of
 // "example.com" matches "example.com" and all of its subdomains.
 func (p *PerHost) AddZone(zone string) {
-	if strings.HasSuffix(zone, ".") {
-		zone = zone[:len(zone)-1]
-	}
+	zone = strings.TrimSuffix(zone, ".")
 	if !strings.HasPrefix(zone, ".") {
 		zone = "." + zone
 	}
@@ -133,8 +148,6 @@ func (p *PerHost) AddZone(zone string) {
 
 // AddHost specifies a host name that will use the bypass proxy.
 func (p *PerHost) AddHost(host string) {
-	if strings.HasSuffix(host, ".") {
-		host = host[:len(host)-1]
-	}
+	host = strings.TrimSuffix(host, ".")
 	p.bypassHosts = append(p.bypassHosts, host)
 }

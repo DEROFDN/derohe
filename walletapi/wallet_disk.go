@@ -18,7 +18,6 @@ package walletapi
 
 import "os"
 import "fmt"
-import "time"
 import "sync"
 import "io/ioutil"
 
@@ -147,8 +146,18 @@ func (w *Wallet_Disk) Save_Wallet() (err error) {
 
 // close the wallet
 func (w *Wallet_Disk) Close_Encrypted_Wallet() {
-	time.Sleep(time.Second) // give goroutines some time to quit
-	w.Save_Wallet()
+	if w == nil || w.Wallet_Memory == nil {
+		return
+	}
+
+	// Stop the wallet sync loop before the final save. This avoids racing a
+	// background Save_Wallet call with disk teardown.
+	w.Wallet_Memory.SetOfflineMode()
+	if err := w.Save_Wallet(); err != nil {
+		return
+	}
+
+	w.Wallet_Memory.Lock()
 	w.Wallet_Memory.wallet_disk = nil
-	w.Wallet_Memory.Close_Encrypted_Wallet()
+	w.Wallet_Memory.Unlock()
 }

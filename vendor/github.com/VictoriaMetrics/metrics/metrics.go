@@ -25,7 +25,11 @@ import (
 type namedMetric struct {
 	name   string
 	metric metric
-	isAux  bool
+
+	// isAux indicates whether it is an auxiliary metric.
+	// Currently only set for quantileValue, as it is part of the Summary.
+	// This field affects sorting when quantileValue and Summary are compared.
+	isAux bool
 }
 
 type metric interface {
@@ -248,6 +252,23 @@ func WriteProcessMetrics(w io.Writer) {
 	writePushMetrics(w)
 }
 
+// WriteGoMetrics writes Go runtime metrics to w.
+// This includes runtime/metrics such as memory stats, GC stats, goroutine counts, etc.
+func WriteGoMetrics(w io.Writer) {
+	writeGoMetrics(w)
+}
+
+// WriteProcMetrics writes OS-level process metrics to w by reading
+// the /proc filesystem (CPU, memory, file descriptors, PSI, etc.).
+func WriteProcMetrics(w io.Writer) {
+	writeProcessMetrics(w)
+}
+
+// WritePushMetrics writes push-mode related metrics to w.
+func WritePushMetrics(w io.Writer) {
+	writePushMetrics(w)
+}
+
 // WriteFDMetrics writes `process_max_fds` and `process_open_fds` metrics to w.
 func WriteFDMetrics(w io.Writer) {
 	writeFDMetrics(w)
@@ -338,6 +359,10 @@ func WriteMetadataIfNeeded(w io.Writer, metricName, metricType string) {
 		return
 	}
 	metricFamily := getMetricFamily(metricName)
+	writeMetadata(w, metricFamily, metricType)
+}
+
+func writeMetadata(w io.Writer, metricFamily, metricType string) {
 	fmt.Fprintf(w, "# HELP %s\n", metricFamily)
 	fmt.Fprintf(w, "# TYPE %s %s\n", metricFamily, metricType)
 }

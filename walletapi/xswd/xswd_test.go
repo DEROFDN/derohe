@@ -13,12 +13,11 @@ import (
 	"time"
 
 	"github.com/creachadair/jrpc2"
-	"github.com/creachadair/jrpc2/code"
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/walletapi"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
-	"github.com/ybbus/jsonrpc"
+	"github.com/ybbus/jsonrpc/v2"
 )
 
 // Test ApplicationData
@@ -710,7 +709,7 @@ func TestXSWDServer(t *testing.T) {
 				assert.NoErrorf(t, err, "Request 6 %q on application %d should not error: %s", request6.Method, i, err)
 				assert.NotNil(t, response6, "Response 6 on application %d should not be nil", i)
 				assert.Error(t, serverErr, "Response 6 on application %d should have error as method was invalid: %v", i, serverErr)
-				assert.Equal(t, code.MethodNotFound, serverErr.Code, "Response 6 on application %d should be %v: %v", i, code.MethodNotFound, serverErr.Code)
+				assert.Equal(t, jrpc2.MethodNotFound, serverErr.Code, "Response 6 on application %d should be %v: %v", i, jrpc2.MethodNotFound, serverErr.Code)
 			})
 
 			// // Request 7
@@ -768,7 +767,7 @@ func TestXSWDServer(t *testing.T) {
 			// Break the requests up to stay within rate limit
 			time.Sleep(sleep500)
 			// Invalid data attempts expected to fail
-			expectedErr := code.ParseError
+			expectedErr := jrpc2.ParseError
 
 			// // Request 9
 			t.Run("Request9", func(t *testing.T) {
@@ -924,7 +923,7 @@ func TestXSWDServer(t *testing.T) {
 				assert.NoErrorf(t, err, "Request 13c %q on application %d should not error: %s", request13b.Method, i, err)
 				assert.NotNil(t, response13c, "Response 13c on application %d should not be nil", i)
 				assert.Error(t, serverErr, "Response 13c on application %d should have error: %v", i, serverErr)
-				assert.Equal(t, code.InternalError, serverErr.Code, "Response 13c on application %d should be %v: %v", i, code.InternalError, serverErr.Code)
+				assert.Equal(t, jrpc2.InternalError, serverErr.Code, "Response 13c on application %d should be %v: %v", i, jrpc2.InternalError, serverErr.Code)
 
 				// Test SignData again with Deny permission
 				server.requestHandler = func(app *ApplicationData, request *jrpc2.Request) Permission { return Deny }
@@ -957,7 +956,7 @@ func TestXSWDServer(t *testing.T) {
 				assert.NoErrorf(t, err, "Request 14a %q on application %d should not error: %s", request14.Method, i, err)
 				assert.NotNil(t, response14a, "Response 14a on application %d should not be nil", i)
 				assert.Error(t, serverErr, "Response 14a on application %d should have error: %v", i, serverErr)
-				assert.Equal(t, code.InternalError, serverErr.Code, "Response 14a on application %d should be %v: %v", i, code.InternalError, serverErr.Code)
+				assert.Equal(t, jrpc2.InternalError, serverErr.Code, "Response 14a on application %d should be %v: %v", i, jrpc2.InternalError, serverErr.Code)
 
 				// Call again with Deny should fail
 				server.requestHandler = func(ad *ApplicationData, r *jrpc2.Request) Permission { return Deny }
@@ -1539,7 +1538,7 @@ func TestXSWDServerWithPort(t *testing.T) {
 			assert.NoErrorf(t, err, "Request 6 %q should not give error: %s", request6.Method, err)
 			assert.NotNil(t, response6, "Response 6 should not be nil")
 			assert.Error(t, serverErr, "Response 6 should have error: %v", serverErr)
-			assert.Equal(t, code.Cancelled, serverErr.Code, "Response 6 should be %v: %v", code.Cancelled, serverErr.Code)
+			assert.Equal(t, jrpc2.Cancelled, serverErr.Code, "Response 6 should be %v: %v", jrpc2.Cancelled, serverErr.Code)
 		})
 
 		// // Request 7
@@ -1561,7 +1560,7 @@ func TestXSWDServerWithPort(t *testing.T) {
 			assert.NoErrorf(t, err, "Request 7 batch should not give error: %s", err)
 			assert.NotNil(t, response7, "Response 7 should not be nil")
 			assert.Error(t, serverErr, "Response 7 should have error: %v", serverErr)
-			assert.Equal(t, code.ParseError, serverErr.Code, "Response 7 should be %v: %v", code.ParseError, serverErr.Code)
+			assert.Equal(t, jrpc2.ParseError, serverErr.Code, "Response 7 should be %v: %v", jrpc2.ParseError, serverErr.Code)
 		})
 
 		// Close the app connection
@@ -1697,7 +1696,7 @@ func TestXSWDServerWithPort(t *testing.T) {
 			}
 			_, serverErr, err := testXSWDCall(t, conn, request5)
 			assert.NoErrorf(t, err, "Request 5 %s should not error: %s", request5.Method, err)
-			assert.Equal(t, code.InvalidRequest, serverErr.Code, "Response 5 should be %v: %v", code.InvalidRequest, serverErr.Code)
+			assert.Equal(t, jrpc2.InvalidRequest, serverErr.Code, "Response 5 should be %v: %v", jrpc2.InvalidRequest, serverErr.Code)
 		})
 
 		// // Request 6
@@ -1731,7 +1730,7 @@ func TestXSWDServerWithPort(t *testing.T) {
 			_, serverErr, err := testXSWDCall(t, conn, request7)
 			assert.NoErrorf(t, err, "Request 7 %s should not error: %s", request7.Method, err)
 			// This errors on RPC.Call(), not request.UnmarshalParams()
-			assert.Equal(t, code.InvalidRequest, serverErr.Code, "Response 7 should be %v: %v", code.InvalidRequest, serverErr.Code)
+			assert.Equal(t, jrpc2.InvalidRequest, serverErr.Code, "Response 7 should be %v: %v", jrpc2.InvalidRequest, serverErr.Code)
 		})
 	})
 }

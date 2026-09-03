@@ -488,7 +488,7 @@ func handle_set_command(l *readline.Instance, line string) {
 
 	if help == true || len(line_parts) == 1 { // user type plain set command, give out all settings and help
 
-		fmt.Fprintf(l.Stderr(), color_extra_white+"Current settings"+color_extra_white+"\n")
+		fmt.Fprint(l.Stderr(), color_extra_white+"Current settings"+color_extra_white+"\n")
 		fmt.Fprintf(l.Stderr(), color_normal+"Seed Language: "+color_extra_white+"%s\t"+color_normal+"eg. "+color_extra_white+"set seed language\n"+color_normal, wallet.GetSeedLanguage())
 		fmt.Fprintf(l.Stderr(), color_normal+"Ringsize: "+color_extra_white+"%d\t"+color_normal+"eg. "+color_extra_white+"set ringsize 16\n"+color_normal, wallet.GetRingSize())
 		fmt.Fprintf(l.Stderr(), color_normal+"Save Every : "+color_extra_white+"%s \t"+color_normal+"eg. "+color_extra_white+"default value:0 (set using command line)\n"+color_normal, wallet.SetSaveDuration(-1))
@@ -1076,7 +1076,7 @@ func usage(w io.Writer) {
 // display seed to the user in his preferred language
 func display_seed(l *readline.Instance, wallet *walletapi.Wallet_Disk) {
 	seed := wallet.GetSeed()
-	fmt.Fprintf(l.Stderr(), color_green+"PLEASE NOTE: the following 25 words can be used to recover access to your wallet. Please write them down and store them somewhere safe and secure. Please do not store them in your email or on file storage services outside of your immediate control."+color_white+"\n")
+	fmt.Fprint(l.Stderr(), color_green+"PLEASE NOTE: the following 25 words can be used to recover access to your wallet. Please write them down and store them somewhere safe and secure. Please do not store them in your email or on file storage services outside of your immediate control."+color_white+"\n")
 	fmt.Fprintf(os.Stderr, color_red+"%s"+color_white+"\n", seed)
 
 }

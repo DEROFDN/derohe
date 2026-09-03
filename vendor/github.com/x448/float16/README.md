@@ -1,18 +1,17 @@
 # Float16 (Binary16) in Go/Golang
-[![](https://github.com/x448/float16/workflows/ci/badge.svg)](https://github.com/x448/float16/actions?query=workflow%3Aci)
-[![](https://github.com/x448/float16/workflows/cover%20100%25/badge.svg)](https://github.com/x448/float16/actions?query=workflow%3A%22cover+100%25%22)
-[![](https://github.com/x448/float16/workflows/linters/badge.svg)](https://github.com/x448/float16/actions?query=workflow%3Alinters)
+[![Build Status](https://travis-ci.org/x448/float16.svg?branch=master)](https://travis-ci.org/x448/float16)
+[![codecov](https://codecov.io/gh/x448/float16/branch/master/graph/badge.svg?v=4)](https://codecov.io/gh/x448/float16)
 [![Go Report Card](https://goreportcard.com/badge/github.com/x448/float16)](https://goreportcard.com/report/github.com/x448/float16)
 [![Release](https://img.shields.io/github/release/x448/float16.svg?style=flat-square)](https://github.com/x448/float16/releases)
 [![License](http://img.shields.io/badge/license-mit-blue.svg?style=flat-square)](https://raw.githubusercontent.com/x448/float16/master/LICENSE)
 
-[__`x448/float16`__](https://github.com/x448/float16) package provides [IEEE 754 half-precision floating-point format (binary16)](https://en.wikipedia.org/wiki/Half-precision_floating-point_format) with IEEE 754 default rounding for conversions. IEEE 754-2008 refers to this 16-bit floating-point format as binary16.
+`float16` package provides [IEEE 754 half-precision floating-point format (binary16)](https://en.wikipedia.org/wiki/Half-precision_floating-point_format) with IEEE 754 default rounding for conversions. IEEE 754-2008 refers to this 16-bit floating-point format as binary16.
 
 IEEE 754 default rounding ("Round-to-Nearest RoundTiesToEven") is considered the most accurate and statistically unbiased estimate of the true result.
 
 All possible 4+ billion floating-point conversions with this library are verified to be correct.
 
-Lowercase "float16" refers to IEEE 754 binary16. And capitalized "Float16" refers to exported Go data type.
+Lowercase "float16" refers to IEEE 754 binary16. And capitalized "Float16" refers to exported Go data type provided by this library.
 
 ## Features
 Current features include:
@@ -29,17 +28,18 @@ This library is used by [fxamacker/cbor](https://github.com/fxamacker/cbor) and 
 
 Current status:
 
-* Core API is done and breaking API changes are unlikely.
+* core API is done and breaking API changes are unlikely.
 * 100% of unit tests pass:
   * short mode (`go test -short`) tests around 65765 conversions in 0.005s.  
   * normal mode (`go test`) tests all possible 4+ billion conversions in about 95s.  
 * 100% code coverage with both short mode and normal mode.  
-* Tested on amd64, arm64, ppc64le, and s390x.
+* tested on amd64 but it should work on all little-endian platforms supported by Go.
  
 Roadmap:
 
-* Add functions for fast batch conversions leveraging SIMD when supported by hardware.
-* Speed up unit test when verifying all possible 4+ billion conversions.
+* add functions for fast batch conversions leveraging SIMD when supported by hardware.
+* speed up unit test when verifying all possible 4+ billion conversions.
+* test on additional platforms.
  
 ## Float16 to Float32 Conversion
 Conversions from float16 to float32 are lossless conversions.  All 65536 possible float16 to float32 conversions (in pure Go) are confirmed to be correct.  
@@ -121,15 +121,13 @@ PrecisionFromFloat32-2  0.29ns ± 1%  // speed using PrecisionFromfloat32() to c
 ```
 
 ## System Requirements
-* Go 1.12 (or newer).
-* amd64, arm64, ppc64le, or s390x.
-
-Other architectures and Go versions may work, but are not tested regularly.
+* Tested on Go 1.11, 1.12, and 1.13 but it should also work with older versions.
+* Tested on amd64 but it should also work on all little-endian platforms supported by Go.
 
 ## Special Thanks
 Special thanks to Kathryn Long (starkat99) for creating [half-rs](https://github.com/starkat99/half-rs), a very nice rust implementation of float16.
 
 ## License
-Copyright © 2019-present Montgomery Edwards⁴⁴⁸ and Faye Amacker.
+Copyright (c) 2019 Montgomery Edwards⁴⁴⁸ and Faye Amacker
 
-x448/float16 is licensed under the MIT License.  See [LICENSE](LICENSE) for the full license text.
+Licensed under [MIT License](LICENSE)

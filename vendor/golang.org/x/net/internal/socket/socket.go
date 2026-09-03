@@ -7,10 +7,14 @@
 package socket // import "golang.org/x/net/internal/socket"
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
+	"runtime"
 	"unsafe"
 )
+
+var errNotImplemented = errors.New("not implemented on " + runtime.GOOS + "/" + runtime.GOARCH)
 
 // An Option represents a sticky socket option.
 type Option struct {
@@ -55,7 +59,7 @@ func (o *Option) GetInt(c *Conn) (int, error) {
 	if o.Len == 1 {
 		return int(b[0]), nil
 	}
-	return int(NativeEndian.Uint32(b[:4])), nil
+	return int(binary.NativeEndian.Uint32(b[:4])), nil
 }
 
 // Set writes the option and value to the kernel.
@@ -81,23 +85,15 @@ func (o *Option) SetInt(c *Conn, v int) error {
 		b = []byte{byte(v)}
 	} else {
 		var bb [4]byte
-		NativeEndian.PutUint32(bb[:o.Len], uint32(v))
+		binary.NativeEndian.PutUint32(bb[:o.Len], uint32(v))
 		b = bb[:4]
 	}
 	return o.set(c, b)
 }
 
-func controlHeaderLen() int {
-	return roundup(sizeofCmsghdr)
-}
-
-func controlMessageLen(dataLen int) int {
-	return roundup(sizeofCmsghdr) + dataLen
-}
-
 // ControlMessageSpace returns the whole length of control message.
 func ControlMessageSpace(dataLen int) int {
-	return roundup(sizeofCmsghdr) + roundup(dataLen)
+	return controlMessageSpace(dataLen)
 }
 
 // A ControlMessage represents the head message in a stream of control

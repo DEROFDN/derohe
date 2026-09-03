@@ -58,6 +58,10 @@ type Peer struct {
 	ConnectAfter    uint64 `json:"connectafter"`    // we should connect when the following timestamp passes
 	BlacklistBefore uint64 `json:"blacklistbefore"` // peer blacklisted till epoch , priority nodes are never blacklisted, 0 if not blacklist
 	GoodCount       uint64 `json:"goodcount"`       // how many times peer has been shared with us
+	SuccessCount    uint64 `json:"successcount"`    // successful handshakes, in or out (for scoring); effectively 0 or 1 — peer map evicts on disconnect
+	LastLatency     int64  `json:"lastlatency"`     // nanoseconds, from rtt_micro
+	LastTopoHeight  int64  `json:"lasttopoheight"`  // peer's topo height at measurement
+	LastMeasured    uint64 `json:"lastmeasured"`    // epoch seconds when latency captured
 	Version         int    `json:"version"`         // version 1 is original C daemon peer, version 2 is golang p2p version
 	Whitelist       bool   `json:"whitelist"`
 	sync.Mutex
@@ -206,8 +210,40 @@ func Peer_SetSuccess(address string) {
 	p.ConnectAfter = 0
 	p.Whitelist = true
 	p.LastConnected = uint64(time.Now().UTC().Unix()) // set time when last connected
+	p.SuccessCount++
 
 	// logger.Infof("Setting peer as white listed")
+}
+
+// captures live latency/topoheight from the ping path, not from handshake
+// call after c.update(&response.Common) in ping_loop when Latency > 0
+func Peer_UpdateLatency(address string, latencyNs int64, topoHeight int64) {
+	peer_mutex.Lock()
+	defer peer_mutex.Unlock()
+	p, ok := peer_map[ParseIPNoError(address)]
+	if !ok || p == nil {
+		return
+	}
+	p.LastLatency = latencyNs
+	p.LastTopoHeight = topoHeight
+	p.LastMeasured = uint64(time.Now().UTC().Unix())
+}
+
+// computes a score for a peer: success/fail history + latency bonus
+// SuccessCount is effectively 0 or 1 (peer map evicts on disconnect), so it contributes
+// linearly at weight 1, not a large multiplier. The latency bonus drives selection.
+// latency bonus decays to zero after 24 hours
+func peerScore(p *Peer, now uint64) float64 {
+	score := float64(p.SuccessCount) - float64(p.FailCount*50)
+
+	if p.LastMeasured > 0 && p.LastLatency > 0 {
+		age := now - p.LastMeasured
+		if age < 24*3600 {
+			latencyMs := float64(p.LastLatency) / 1e6 // ns → ms
+			score += 10000.0 / (latencyMs + 1.0)      // +1 avoids div-by-zero
+		}
+	}
+	return score
 }
 
 /*
@@ -240,24 +276,31 @@ func Peer_Delete(p *Peer) {
 	delete(peer_map, ParseIPNoError(p.Address))
 }
 
+func printLatency(p *Peer) string {
+	if p.LastLatency <= 0 {
+		return "-"
+	}
+	ms := float64(p.LastLatency) / 1e6
+	return fmt.Sprintf("%.1fms", ms)
+}
+
 // prints all the connection info to screen
 func PeerList_Print() {
 	peer_mutex.Lock()
 	defer peer_mutex.Unlock()
 	fmt.Printf("Peer List\n")
-	fmt.Printf("%-22s %-6s %-4s   %-5s %-7s %9s %3s\n", "Remote Addr", "Active", "Good", "Fail", " State", "Height", "DIR")
+	fmt.Printf("%-22s %-6s %4s %5s %4s %8s %8s\n", "Remote Addr", "Active", "Good", "Fail", "Succ", "Lat(ms)", "Age")
 
 	var list []*Peer
 	greycount := 0
 	for _, v := range peer_map {
-		if v.Whitelist { // only display white listed peer
+		if v.Whitelist {
 			list = append(list, v)
 		} else {
 			greycount++
 		}
 	}
 
-	// sort the list
 	sort.Slice(list, func(i, j int) bool { return list[i].Address < list[j].Address })
 
 	for i := range list {
@@ -265,7 +308,28 @@ func PeerList_Print() {
 		if IsAddressConnected(ParseIPNoError(list[i].Address)) {
 			connected = "ACTIVE"
 		}
-		fmt.Printf("%-22s %-6s %4d %5d \n", list[i].Address, connected, list[i].GoodCount, list[i].FailCount)
+		ageStr := "-"
+		if list[i].LastMeasured > 0 {
+			age := time.Now().UTC().Unix() - int64(list[i].LastMeasured)
+			switch {
+			case age < 0:
+				ageStr = "now"
+			case age < 60:
+				ageStr = fmt.Sprintf("%ds ago", age)
+			case age < 3600:
+				ageStr = fmt.Sprintf("%dm ago", age/60)
+			case age < 86400:
+				ageStr = fmt.Sprintf("%dh ago", age/3600)
+			default:
+				ageStr = fmt.Sprintf("%dd ago", age/86400)
+			}
+		}
+		fmt.Printf("%-22s %-6s %4d %5d %4d %8s %8s\n",
+			list[i].Address, connected,
+			list[i].GoodCount, list[i].FailCount,
+			list[i].SuccessCount,
+			printLatency(list[i]),
+			ageStr)
 	}
 
 	fmt.Printf("\nWhitelist size %d\n", len(peer_map)-greycount)
@@ -289,23 +353,52 @@ func find_peer_to_connect(version int) *Peer {
 	peer_mutex.Lock()
 	defer peer_mutex.Unlock()
 
-	// first search the whitelisted ones
+	now := uint64(time.Now().UTC().Unix())
+
+	// Pass 1: weighted random among eligible whitelist peers (reservoir sampling)
+	var best *Peer
+	var totalWeight float64
 	for _, v := range peer_map {
-		if uint64(time.Now().Unix()) > v.BlacklistBefore && //  if ip is blacklisted skip it
-			uint64(time.Now().Unix()) > v.ConnectAfter &&
-			!IsAddressConnected(ParseIPNoError(v.Address)) && v.Whitelist && !IsAddressInBanList(ParseIPNoError(v.Address)) {
-			v.ConnectAfter = uint64(time.Now().UTC().Unix()) + 10 // minimum 10 secs gap
-			return v
+		if now > v.BlacklistBefore &&
+			now > v.ConnectAfter &&
+			!IsAddressConnected(ParseIPNoError(v.Address)) &&
+			v.Whitelist &&
+			!IsAddressInBanList(ParseIPNoError(v.Address)) {
+
+			w := peerScore(v, now)
+			if w < 0.1 {
+				w = 0.1 // minimum weight 0.1 preserves FailCount ordering for negatives (1 fail > 10 fails)
+			}
+			totalWeight += w
+			if globals.Global_Random.Float64()*totalWeight < w {
+				best = v
+			}
 		}
 	}
-	// if we donot have any white listed, choose from the greylist
+	if best != nil {
+		best.ConnectAfter = now + 10 // minimum 10 secs gap
+		return best
+	}
+
+	// Pass 2: uniform random among eligible greylist peers (no latency data)
+	var greyBest *Peer
+	var greyCount float64
 	for _, v := range peer_map {
-		if uint64(time.Now().Unix()) > v.BlacklistBefore && //  if ip is blacklisted skip it
-			uint64(time.Now().Unix()) > v.ConnectAfter &&
-			!IsAddressConnected(ParseIPNoError(v.Address)) && !v.Whitelist && !IsAddressInBanList(ParseIPNoError(v.Address)) {
-			v.ConnectAfter = uint64(time.Now().UTC().Unix()) + 10 // minimum 10 secs gap
-			return v
+		if now > v.BlacklistBefore &&
+			now > v.ConnectAfter &&
+			!IsAddressConnected(ParseIPNoError(v.Address)) &&
+			!v.Whitelist &&
+			!IsAddressInBanList(ParseIPNoError(v.Address)) {
+
+			greyCount++
+			if globals.Global_Random.Float64()*greyCount < 1 {
+				greyBest = v
+			}
 		}
+	}
+	if greyBest != nil {
+		greyBest.ConnectAfter = now + 10 // minimum 10 secs gap
+		return greyBest
 	}
 
 	return nil // if no peer found, return nil

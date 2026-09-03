@@ -427,17 +427,61 @@ func maintain_seed_node_connection() {
 			return
 		case <-delay.C:
 		}
-		endpoint := ""
-		if globals.IsMainnet() { // choose mainnet seed node
-			r, _ := rand.Int(rand.Reader, big.NewInt(10240))
-			endpoint = config.Mainnet_seed_nodes[r.Int64()%int64(len(config.Mainnet_seed_nodes))]
-		} else { // choose testnet peer node
-			r, _ := rand.Int(rand.Reader, big.NewInt(10240))
-			endpoint = config.Testnet_seed_nodes[r.Int64()%int64(len(config.Testnet_seed_nodes))]
+
+		var seeds []string
+		if globals.IsMainnet() {
+			seeds = config.Mainnet_seed_nodes
+		} else {
+			seeds = config.Testnet_seed_nodes
 		}
-		if endpoint != "" {
-			connect_with_endpoint(endpoint, sync_node)
-			//connect_with_endpoint(endpoint, true) // seed nodes always have sync mode
+
+		// split seeds into known (have recent latency data) and unknown
+		now := uint64(time.Now().UTC().Unix())
+		type scoredSeed struct {
+			addr string
+			lat  int64
+		}
+		var known []scoredSeed
+		var unknown []string
+
+		peer_mutex.Lock()
+		for _, s := range seeds {
+			if p, ok := peer_map[ParseIPNoError(s)]; ok &&
+				p.LastMeasured > 0 &&
+				p.LastLatency > 0 &&
+				now >= p.LastMeasured &&
+				(now-p.LastMeasured) < 24*3600 {
+
+				known = append(known, scoredSeed{s, p.LastLatency})
+			} else {
+				unknown = append(unknown, s)
+			}
+		}
+		peer_mutex.Unlock()
+
+		// known seeds: fastest first
+		sort.Slice(known, func(i, j int) bool {
+			return known[i].lat < known[j].lat
+		})
+
+		// unknown seeds: shuffle for variety
+		globals.Global_Random.Shuffle(len(unknown), func(i, j int) {
+			unknown[i], unknown[j] = unknown[j], unknown[i]
+		})
+
+		// build ordered list: known (fast first) + unknown (random)
+		var ordered []string
+		for _, s := range known {
+			ordered = append(ordered, s.addr)
+		}
+		ordered = append(ordered, unknown...)
+
+		// connect to first non-connected seed
+		for _, endpoint := range ordered {
+			if !IsAddressConnected(ParseIPNoError(endpoint)) {
+				connect_with_endpoint(endpoint, sync_node)
+				break
+			}
 		}
 	}
 }
@@ -707,8 +751,8 @@ func process_outgoing_connection(conn net.Conn, tlsconn net.Conn, remote_addr ne
 // shutdown the p2p component
 func P2P_Shutdown() {
 	close(Exit_Event) // send signal to all connections to exit
-	save_peer_list() // save peer list
-	save_ban_list()  // save ban list
+	save_peer_list()  // save peer list
+	save_ban_list()   // save ban list
 
 	// TODO we  must wait for connections to kill themselves
 	logger.Info("P2P Shutdown")

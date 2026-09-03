@@ -6,17 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
+
+	"github.com/creachadair/jrpc2"
 )
 
-// NewPos adapts a function to a jrpc2.Handler. The concrete value of fn must
-// be a function accepted by Positional. The resulting Func will handle JSON
-// encoding and decoding, call fn, and report appropriate errors.
+// NewPos adapts a function to a [jrpc2.Handler]. The concrete value of fn must
+// be a function accepted by [Positional]. The resulting handler will handle
+// JSON encoding and decoding, call fn, and report appropriate errors.
 //
 // NewPos is intended for use during program initialization, and will panic if
 // the type of fn does not have one of the accepted forms. Programs that need
 // to check for possible errors should call handler.Positional directly, and
 // use the Wrap method of the resulting FuncInfo to obtain the wrapper.
-func NewPos(fn interface{}, names ...string) Func {
+func NewPos(fn any, names ...string) jrpc2.Handler {
 	fi, err := Positional(fn, names...)
 	if err != nil {
 		panic(err)
@@ -24,48 +27,92 @@ func NewPos(fn interface{}, names ...string) Func {
 	return fi.Wrap()
 }
 
-// Positional checks whether fn can serve as a jrpc2.Handler. The concrete
+// structFieldNames reports whether atype is a struct or pointer to struct, and
+// if so returns a slice of the eligible field names in order of declaration.
+// If atype == nil or is not a (pointer to) struct, it returns false, nil.
+func structFieldNames(atype reflect.Type) (bool, []string) {
+	if atype == nil {
+		return false, nil
+	}
+	if atype.Kind() == reflect.Pointer {
+		atype = atype.Elem()
+	}
+	if atype.Kind() != reflect.Struct {
+		return false, nil
+	}
+
+	var names []string
+	for i := 0; i < atype.NumField(); i++ {
+		fi := atype.Field(i)
+		if !fi.IsExported() {
+			continue
+		}
+		if tag, ok := fi.Tag.Lookup("json"); ok {
+			if tag == "-" {
+				continue // explicitly omitted
+			}
+			name := strings.SplitN(tag, ",", 2)[0]
+			if name != "" {
+				names = append(names, name)
+				continue
+			}
+			// fall through to other cases
+		}
+		if fi.Anonymous {
+			// This is an untagged anonymous field. Tagged anonymous fields are
+			// handled by the cases above.
+			continue
+		}
+		names = append(names, fi.Name)
+	}
+	return true, names
+}
+
+// Positional checks whether fn can serve as a [jrpc2.Handler]. The concrete
 // value of fn must be a function with one of the following type signature
 // schemes:
 //
-//   func(context.Context, X1, X2, ..., Xn) (Y, error)
-//   func(context.Context, X1, X2, ..., Xn) Y
-//   func(context.Context, X1, X2, ..., Xn) error
+//	func(context.Context, X1, X2, ..., Xn) (Y, error)
+//	func(context.Context, X1, X2, ..., Xn) Y
+//	func(context.Context, X1, X2, ..., Xn) error
 //
-// For JSON-marshalable types X_i and Y. If fn does not have one of these
+// for JSON-marshalable types X_i and Y. If fn does not have one of these
 // forms, Positional reports an error. The given names must match the number of
 // non-context arguments exactly. Variadic functions are not supported.
 //
-// In contrast to Check, this function allows any number of arguments, but the
-// caller must provide names for them. Positional creates an anonymous struct
-// type whose fields correspond to the non-context arguments of fn.  The names
-// are used as the JSON field keys for the corresponding parameters.
+// In contrast to [Check], this function allows any number of arguments, but
+// the caller must provide names for them. Positional creates an anonymous
+// struct type whose fields correspond to the non-context arguments of fn.  The
+// names are used as the JSON field keys for the corresponding parameters.
 //
-// When converted into a handler.Func, the wrapped function accepts a JSON
-// object with the field keys named. For example, given:
+// When converted into a [jrpc2.Handler], the wrapped function accepts either a
+// JSON array with exactly n members, or a JSON object with the field keys
+// named. For example, given:
 //
-//   func add(ctx context.Context, x, y int) int { return x + y }
+//	func add(ctx context.Context, x, y int) int { return x + y }
 //
-//   fi, err := handler.Positional(add, "first", "second")
-//   // ...
-//   call := fi.Wrap()
+//	fi, err := handler.Positional(add, "first", "second")
+//	// ...
+//	call := fi.Wrap()
 //
-// the resulting JSON-RPC handler accepts a parameter object like:
+// the resulting handler by default accepts a JSON array with with (exactly)
+// the same number of elements as the positional parameters:
 //
-//   {"first": 17, "second": 23}
+//	[17, 23]
 //
-// where "first" is mapped to argument x and "second" to argument y.  Unknown
-// field keys generate an error. The field names are not required to match the
-// parameter names declared by the function; it is the names assigned here that
-// determine which object keys are accepted.
+// No arguments can be omitted in this format, but the caller can use a JSON
+// "null" in place of any argument. The caller may also disable array support
+// by setting AllowArray(false) on the resulting FuncInfo.
 //
-// The wrapped function will also accept a JSON array with with (exactly) the
-// same number of elements as the positional parameters:
+// The handler will also accept a parameter object like:
 //
-//   [17, 23]
+//	{"first": 17, "second": 23}
 //
-// Unlike the object format, no arguments can be omitted in this format.
-func Positional(fn interface{}, names ...string) (*FuncInfo, error) {
+// where "first" is mapped to argument x and "second" to argument y.  In this
+// form, fields may be omitted, but unknown field keys generate an error. The
+// object keys are taken from the arguments to Positional, not the parameter
+// names declared on the function.
+func Positional(fn any, names ...string) (*FuncInfo, error) {
 	if fn == nil {
 		return nil, errors.New("nil function")
 	}
@@ -140,7 +187,7 @@ func makeArgType(t reflect.Type, names []string) (reflect.Type, error) {
 // positional arguments.
 //
 // Preconditions: fv is a function and atype is its argument struct.
-func makeCaller(ft reflect.Type, fv reflect.Value, atype reflect.Type) interface{} {
+func makeCaller(ft reflect.Type, fv reflect.Value, atype reflect.Type) any {
 	atypes := []reflect.Type{ctxType, atype}
 
 	otypes := make([]reflect.Type, ft.NumOut())

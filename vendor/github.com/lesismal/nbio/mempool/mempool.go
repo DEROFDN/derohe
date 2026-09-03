@@ -5,180 +5,102 @@
 package mempool
 
 import (
-	"fmt"
-	"runtime"
 	"sync"
 )
 
-const maxAppendSize = 1024 * 1024 * 4
-
-type Allocator interface {
-	Malloc(size int) []byte
-	Realloc(buf []byte, size int) []byte
-	Free(buf []byte)
-}
-
-// DefaultMemPool .
-var DefaultMemPool = New(64)
-
 // MemPool .
 type MemPool struct {
-	minSize int
-	pool    sync.Pool
-
-	Debug       bool
-	mux         sync.Mutex
-	allocStacks map[*byte]string
-	freeStacks  map[*byte]string
+	*debugger
+	bufSize  int
+	freeSize int
+	pool     *sync.Pool
 }
 
 // New .
-func New(minSize int) Allocator {
-	if minSize <= 0 {
-		minSize = 64
+func New(bufSize, freeSize int) Allocator {
+	if bufSize <= 0 {
+		bufSize = 64
 	}
+	if freeSize <= 0 {
+		freeSize = 64 * 1024
+	}
+	if freeSize < bufSize {
+		freeSize = bufSize
+	}
+
 	mp := &MemPool{
-		minSize:     minSize,
-		allocStacks: map[*byte]string{},
-		freeStacks:  map[*byte]string{},
+		debugger: &debugger{},
+		bufSize:  bufSize,
+		freeSize: freeSize,
+		pool:     &sync.Pool{},
 		// Debug:       true,
 	}
 	mp.pool.New = func() interface{} {
-		buf := make([]byte, minSize)
+		buf := make([]byte, bufSize)
 		return &buf
 	}
 	return mp
 }
 
 // Malloc .
-func (mp *MemPool) Malloc(size int) []byte {
+func (mp *MemPool) Malloc(size int) *[]byte {
+	var ret []byte
+	if size > mp.freeSize {
+		ret = make([]byte, size)
+		mp.incrMalloc(&ret)
+		return &ret
+	}
 	pbuf := mp.pool.Get().(*[]byte)
-	need := size - cap(*pbuf)
-	if need > 0 {
-		if need <= maxAppendSize {
-			*pbuf = (*pbuf)[:cap(*pbuf)]
-			*pbuf = append(*pbuf, make([]byte, need)...)
-		} else {
-			mp.pool.Put(pbuf)
-			newBuf := make([]byte, size)
-			pbuf = &newBuf
-		}
+	n := cap(*pbuf)
+	if n < size {
+		*pbuf = append((*pbuf)[:n], make([]byte, size-n)...)
 	}
-
-	if mp.Debug {
-		mp.saveAllocStack(*pbuf)
-	}
-
-	return (*pbuf)[:size]
+	(*pbuf) = (*pbuf)[:size]
+	mp.incrMalloc(pbuf)
+	return pbuf
 }
 
 // Realloc .
-func (mp *MemPool) Realloc(buf []byte, size int) []byte {
-	if size <= cap(buf) {
-		return buf[:size]
+func (mp *MemPool) Realloc(pbuf *[]byte, size int) *[]byte {
+	if size <= cap(*pbuf) {
+		*pbuf = (*pbuf)[:size]
+		return pbuf
 	}
-	if cap(buf) < mp.minSize {
-		newBuf := mp.Malloc(size)
-		copy(newBuf[:len(buf)], buf)
-		return newBuf
+
+	if cap(*pbuf) < mp.freeSize {
+		newBufPtr := mp.pool.Get().(*[]byte)
+		n := cap(*newBufPtr)
+		if n < size {
+			*newBufPtr = append((*newBufPtr)[:n], make([]byte, size-n)...)
+		}
+		*newBufPtr = (*newBufPtr)[:size]
+		copy(*newBufPtr, *pbuf)
+		mp.Free(pbuf)
+		return newBufPtr
 	}
-	pbuf := &buf
-	need := size - cap(buf)
-	if need <= maxAppendSize {
-		*pbuf = (*pbuf)[:cap(*pbuf)]
-		*pbuf = append(*pbuf, make([]byte, need)...)
-	} else {
+	*pbuf = append((*pbuf)[:cap(*pbuf)], make([]byte, size-cap(*pbuf))...)[:size]
+	return pbuf
+}
+
+// Append .
+func (mp *MemPool) Append(pbuf *[]byte, more ...byte) *[]byte {
+	*pbuf = append(*pbuf, more...)
+	return pbuf
+}
+
+// AppendString .
+func (mp *MemPool) AppendString(pbuf *[]byte, more string) *[]byte {
+	*pbuf = append(*pbuf, more...)
+	return pbuf
+}
+
+// Free .
+func (mp *MemPool) Free(pbuf *[]byte) {
+	if pbuf != nil && cap(*pbuf) > 0 {
+		mp.incrFree(pbuf)
+		if cap(*pbuf) > mp.freeSize {
+			return
+		}
 		mp.pool.Put(pbuf)
-		newBuf := make([]byte, size)
-		pbuf = &newBuf
 	}
-	copy((*pbuf)[:len(buf)], buf)
-
-	if mp.Debug {
-		mp.saveAllocStack(*pbuf)
-	}
-	return (*pbuf)[:size]
-}
-
-// Free .
-func (mp *MemPool) Free(buf []byte) {
-	if cap(buf) < mp.minSize {
-		return
-	}
-	if mp.Debug {
-		mp.saveFreeStack(buf)
-	}
-	mp.pool.Put(&buf)
-}
-
-func (mp *MemPool) saveFreeStack(buf []byte) {
-	p := &(buf[:1][0])
-	mp.mux.Lock()
-	defer mp.mux.Unlock()
-	s, ok := mp.freeStacks[p]
-	if ok {
-		allocStack := mp.allocStacks[p]
-		err := fmt.Errorf("\nbuffer exists: %p\nprevious allocation:\n%v\nprevious free:\n%v\ncurrent free:\n%v", p, allocStack, s, getStack())
-		panic(err)
-	}
-	mp.freeStacks[p] = getStack()
-	delete(mp.allocStacks, p)
-}
-
-func (mp *MemPool) saveAllocStack(buf []byte) {
-	p := &(buf[:1][0])
-	mp.mux.Lock()
-	defer mp.mux.Unlock()
-	delete(mp.freeStacks, p)
-	mp.allocStacks[p] = getStack()
-}
-
-// NativeAllocator definition.
-type NativeAllocator struct{}
-
-// Malloc .
-func (a *NativeAllocator) Malloc(size int) []byte {
-	return make([]byte, size)
-}
-
-// Realloc .
-func (a *NativeAllocator) Realloc(buf []byte, size int) []byte {
-	if size <= cap(buf) {
-		return buf[:size]
-	}
-	newBuf := make([]byte, size)
-	copy(newBuf, buf)
-	return newBuf
-}
-
-// Free .
-func (a *NativeAllocator) Free(buf []byte) {
-}
-
-// Malloc exports default package method.
-func Malloc(size int) []byte {
-	return DefaultMemPool.Malloc(size)
-}
-
-// Realloc exports default package method.
-func Realloc(buf []byte, size int) []byte {
-	return DefaultMemPool.Realloc(buf, size)
-}
-
-// Free exports default package method.
-func Free(buf []byte) {
-	DefaultMemPool.Free(buf)
-}
-
-func getStack() string {
-	i := 2
-	str := ""
-	for ; i < 10; i++ {
-		pc, file, line, ok := runtime.Caller(i)
-		if !ok {
-			break
-		}
-		str += fmt.Sprintf("\tstack: %d %v [file: %s] [func: %s] [line: %d]\n", i-1, ok, file, runtime.FuncForPC(pc).Name(), line)
-	}
-	return str
 }

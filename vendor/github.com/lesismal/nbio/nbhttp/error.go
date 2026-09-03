@@ -9,9 +9,6 @@ import (
 )
 
 var (
-	// ErrClosed .
-	ErrClosed = errors.New("closed")
-
 	// ErrInvalidCRLF .
 	ErrInvalidCRLF = errors.New("invalid cr/lf at the end of line")
 
@@ -91,4 +88,9 @@ var (
 
 	// ErrClientClosed .
 	ErrClientClosed = errors.New("http client closed")
+)
+
+var (
+	// ErrServiceOverload .
+	ErrServiceOverload = errors.New("service overload")
 )

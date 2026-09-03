@@ -44,7 +44,8 @@ import "sync"
 
 var memPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 16*1024)
+		buf := make([]byte, 16*1024)
+		return &buf
 	},
 }
 
@@ -291,7 +292,7 @@ func onWebsocket(w http.ResponseWriter, r *http.Request) {
 		//panic(err)
 		return
 	}
-	wsConn := conn.(*websocket.Conn)
+	wsConn := conn
 
 	session := user_session{address: *addr, address_sum: graviton.Sum(addr_raw)}
 	wsConn.SetSession(&session)
@@ -350,11 +351,11 @@ func Getwork_server() {
 		NPoller:                 runtime.NumCPU(),
 	})
 
-	svr.OnReadBufferAlloc(func(c *nbio.Conn) []byte {
-		return memPool.Get().([]byte)
+	svr.OnReadBufferAlloc(func(c *nbio.Conn) *[]byte {
+		return memPool.Get().(*[]byte)
 	})
-	svr.OnReadBufferFree(func(c *nbio.Conn, b []byte) {
-		memPool.Put(b)
+	svr.OnReadBufferFree(func(c *nbio.Conn, pbuf *[]byte) {
+		memPool.Put(pbuf)
 	})
 
 	//globals.Cron.AddFunc("@every 2s", SendJob) // if daemon restart automaticaly send job

@@ -6,7 +6,7 @@
 
 // Register allocation:
 // AX	h
-// SI	pointer to advance through b
+// CX	pointer to advance through b
 // DX	n
 // BX	loop end
 // R8	v1, k1
@@ -16,39 +16,39 @@
 // R12	tmp
 // R13	prime1v
 // R14	prime2v
-// DI	prime4v
+// R15	prime4v
 
-// round reads from and advances the buffer pointer in SI.
+// round reads from and advances the buffer pointer in CX.
 // It assumes that R13 has prime1v and R14 has prime2v.
 #define round(r) \
-	MOVQ  (SI), R12 \
-	ADDQ  $8, SI    \
+	MOVQ  (CX), R12 \
+	ADDQ  $8, CX    \
 	IMULQ R14, R12  \
 	ADDQ  R12, r    \
 	ROLQ  $31, r    \
 	IMULQ R13, r
 
 // mergeRound applies a merge round on the two registers acc and val.
-// It assumes that R13 has prime1v, R14 has prime2v, and DI has prime4v.
+// It assumes that R13 has prime1v, R14 has prime2v, and R15 has prime4v.
 #define mergeRound(acc, val) \
 	IMULQ R14, val \
 	ROLQ  $31, val \
 	IMULQ R13, val \
 	XORQ  val, acc \
 	IMULQ R13, acc \
-	ADDQ  DI, acc
+	ADDQ  R15, acc
 
 // func Sum64(b []byte) uint64
 TEXT ·Sum64(SB), NOSPLIT, $0-32
 	// Load fixed primes.
 	MOVQ ·prime1v(SB), R13
 	MOVQ ·prime2v(SB), R14
-	MOVQ ·prime4v(SB), DI
+	MOVQ ·prime4v(SB), R15
 
 	// Load slice.
-	MOVQ b_base+0(FP), SI
+	MOVQ b_base+0(FP), CX
 	MOVQ b_len+8(FP), DX
-	LEAQ (SI)(DX*1), BX
+	LEAQ (CX)(DX*1), BX
 
 	// The first loop limit will be len(b)-32.
 	SUBQ $32, BX
@@ -65,14 +65,14 @@ TEXT ·Sum64(SB), NOSPLIT, $0-32
 	XORQ R11, R11
 	SUBQ R13, R11
 
-	// Loop until SI > BX.
+	// Loop until CX > BX.
 blockLoop:
 	round(R8)
 	round(R9)
 	round(R10)
 	round(R11)
 
-	CMPQ SI, BX
+	CMPQ CX, BX
 	JLE  blockLoop
 
 	MOVQ R8, AX
@@ -100,16 +100,16 @@ noBlocks:
 afterBlocks:
 	ADDQ DX, AX
 
-	// Right now BX has len(b)-32, and we want to loop until SI > len(b)-8.
+	// Right now BX has len(b)-32, and we want to loop until CX > len(b)-8.
 	ADDQ $24, BX
 
-	CMPQ SI, BX
+	CMPQ CX, BX
 	JG   fourByte
 
 wordLoop:
 	// Calculate k1.
-	MOVQ  (SI), R8
-	ADDQ  $8, SI
+	MOVQ  (CX), R8
+	ADDQ  $8, CX
 	IMULQ R14, R8
 	ROLQ  $31, R8
 	IMULQ R13, R8
@@ -117,18 +117,18 @@ wordLoop:
 	XORQ  R8, AX
 	ROLQ  $27, AX
 	IMULQ R13, AX
-	ADDQ  DI, AX
+	ADDQ  R15, AX
 
-	CMPQ SI, BX
+	CMPQ CX, BX
 	JLE  wordLoop
 
 fourByte:
 	ADDQ $4, BX
-	CMPQ SI, BX
+	CMPQ CX, BX
 	JG   singles
 
-	MOVL  (SI), R8
-	ADDQ  $4, SI
+	MOVL  (CX), R8
+	ADDQ  $4, CX
 	IMULQ R13, R8
 	XORQ  R8, AX
 
@@ -138,19 +138,19 @@ fourByte:
 
 singles:
 	ADDQ $4, BX
-	CMPQ SI, BX
+	CMPQ CX, BX
 	JGE  finalize
 
 singlesLoop:
-	MOVBQZX (SI), R12
-	ADDQ    $1, SI
+	MOVBQZX (CX), R12
+	ADDQ    $1, CX
 	IMULQ   ·prime5v(SB), R12
 	XORQ    R12, AX
 
 	ROLQ  $11, AX
 	IMULQ R13, AX
 
-	CMPQ SI, BX
+	CMPQ CX, BX
 	JL   singlesLoop
 
 finalize:
@@ -170,22 +170,23 @@ finalize:
 	RET
 
 // writeBlocks uses the same registers as above except that it uses AX to store
-// the d pointer.
+// the x pointer.
 
-// func writeBlocks(d *Digest, b []byte) int
-TEXT ·writeBlocks(SB), NOSPLIT, $0-40
+// func writeBlocks(x *xxh, b []byte) []byte
+TEXT ·writeBlocks(SB), NOSPLIT, $0-56
 	// Load fixed primes needed for round.
 	MOVQ ·prime1v(SB), R13
 	MOVQ ·prime2v(SB), R14
 
 	// Load slice.
-	MOVQ b_base+8(FP), SI
+	MOVQ b_base+8(FP), CX
+	MOVQ CX, ret_base+32(FP) // initialize return base pointer; see NOTE below
 	MOVQ b_len+16(FP), DX
-	LEAQ (SI)(DX*1), BX
+	LEAQ (CX)(DX*1), BX
 	SUBQ $32, BX
 
-	// Load vN from d.
-	MOVQ d+0(FP), AX
+	// Load vN from x.
+	MOVQ x+0(FP), AX
 	MOVQ 0(AX), R8   // v1
 	MOVQ 8(AX), R9   // v2
 	MOVQ 16(AX), R10 // v3
@@ -199,17 +200,34 @@ blockLoop:
 	round(R10)
 	round(R11)
 
-	CMPQ SI, BX
+	CMPQ CX, BX
 	JLE  blockLoop
 
-	// Copy vN back to d.
+	// Copy vN back to x.
 	MOVQ R8, 0(AX)
 	MOVQ R9, 8(AX)
 	MOVQ R10, 16(AX)
 	MOVQ R11, 24(AX)
 
-	// The number of bytes written is SI minus the old base pointer.
-	SUBQ b_base+8(FP), SI
-	MOVQ SI, ret+32(FP)
+	// Construct return slice.
+	// NOTE: It's important that we don't construct a slice that has a base
+	// pointer off the end of the original slice, as in Go 1.7+ this will
+	// cause runtime crashes. (See discussion in, for example,
+	// https://github.com/golang/go/issues/16772.)
+	// Therefore, we calculate the length/cap first, and if they're zero, we
+	// keep the old base. This is what the compiler does as well if you
+	// write code like
+	//   b = b[len(b):]
+
+	// New length is 32 - (CX - BX) -> BX+32 - CX.
+	ADDQ $32, BX
+	SUBQ CX, BX
+	JZ   afterSetBase
+
+	MOVQ CX, ret_base+32(FP)
+
+afterSetBase:
+	MOVQ BX, ret_len+40(FP)
+	MOVQ BX, ret_cap+48(FP) // set cap == len
 
 	RET

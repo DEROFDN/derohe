@@ -26,9 +26,7 @@ import (
 )
 
 const BlockSize = 16
-
-var IV = make([]byte, BlockSize)
-
+var IV=make([]byte,BlockSize)
 type SM4Key []byte
 
 // Cipher is an instance of SM4 encryption.
@@ -250,9 +248,13 @@ func (c *Sm4Cipher) Encrypt(dst, src []byte) {
 	cryptBlock(c.subkeys, c.block1, c.block2, dst, src, false)
 }
 
+
+
 func (c *Sm4Cipher) Decrypt(dst, src []byte) {
 	cryptBlock(c.subkeys, c.block1, c.block2, dst, src, true)
 }
+
+
 
 func xor(in, iv []byte) (out []byte) {
 	if len(in) != len(iv) {
@@ -274,9 +276,6 @@ func pkcs7Padding(src []byte) []byte {
 
 func pkcs7UnPadding(src []byte) ([]byte, error) {
 	length := len(src)
-	if length == 0 {
-		return nil, errors.New("Invalid pkcs7 padding (len(padtext) == 0)")
-	}
 	unpadding := int(src[length-1])
 	if unpadding > BlockSize || unpadding == 0 {
 		return nil, errors.New("Invalid pkcs7 padding (unpadding > BlockSize || unpadding == 0)")
@@ -291,12 +290,12 @@ func pkcs7UnPadding(src []byte) ([]byte, error) {
 
 	return src[:(length - unpadding)], nil
 }
-func SetIV(iv []byte) error {
-	if len(iv) != BlockSize {
-		return errors.New("SM4: invalid iv size")
-	}
-	IV = iv
-	return nil
+func SetIV(iv []byte)error{
+      if len(iv)!=BlockSize{
+          return errors.New("SM4: invalid iv size")
+	  }
+	  IV=iv
+	  return nil
 }
 
 func Sm4Cbc(key []byte, in []byte, mode bool) (out []byte, err error) {
@@ -309,12 +308,12 @@ func Sm4Cbc(key []byte, in []byte, mode bool) (out []byte, err error) {
 	} else {
 		inData = in
 	}
-	iv := make([]byte, BlockSize)
-	copy(iv, IV)
+    iv:=make([]byte,BlockSize)
+	copy(iv,IV)
 	out = make([]byte, len(inData))
 	c, err := NewCipher(key)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	if mode {
 		for i := 0; i < len(inData)/16; i++ {
@@ -351,7 +350,7 @@ func Sm4Ecb(key []byte, in []byte, mode bool) (out []byte, err error) {
 	out = make([]byte, len(inData))
 	c, err := NewCipher(key)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	if mode {
 		for i := 0; i < len(inData)/16; i++ {
@@ -390,7 +389,7 @@ func Sm4CFB(key []byte, in []byte, mode bool) (out []byte, err error) {
 	out = make([]byte, len(inData))
 	c, err := NewCipher(key)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	K := make([]byte, BlockSize)
@@ -449,7 +448,7 @@ func Sm4OFB(key []byte, in []byte, mode bool) (out []byte, err error) {
 	out = make([]byte, len(inData))
 	c, err := NewCipher(key)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	K := make([]byte, BlockSize)

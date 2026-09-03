@@ -23,7 +23,7 @@ import "github.com/deroproject/derohe/globals" // needed for logs
 
 import "github.com/deroproject/derohe/rpc"
 import "github.com/deroproject/derohe/walletapi"
-import "github.com/ybbus/jsonrpc"
+import "github.com/ybbus/jsonrpc/v2"
 
 var logger logr.Logger = logr.Discard() // default discard all logs
 

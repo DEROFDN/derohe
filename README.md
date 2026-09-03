@@ -1,3 +1,13 @@
+> ### Fork notice
+>
+> This is **DHEBP/derohe**, an experimental fork of [DEROFDN/derohe](https://github.com/DEROFDN/derohe), maintained independently by [DHEBP](https://github.com/DHEBP). It is not an official DERO Foundation release.
+>
+> It carries wallet-side work not yet merged upstream — opt-in curated decoy ring selection, opt-in anonymous sender attribution, and honest reporting of sender attribution as unverified for rings larger than 2. Changes are confined to `walletapi/`, `rpc/`, `cmd/` and tooling.
+>
+> **Consensus code is identical to upstream `community-dev`.** A node built from this repo accepts and rejects exactly the same blocks and transactions as any other DERO node. This is enforced in CI by [`consensus-guard`](.github/workflows/consensus-guard.yml), which fails the build if anything under `blockchain/`, `dvm/`, `cryptography/`, `transaction/`, `block/`, `astrobwt/`, `pow/`, `premine/`, `proof/`, `config/`, `globals/` or `p2p/` diverges from upstream.
+>
+> If you want the upstream node, use [DEROFDN/derohe](https://github.com/DEROFDN/derohe) branch `community-dev`.
+
 # Welcome to DERO
 [Twitter](https://twitter.com/DeroProject) [Discord](https://discord.gg/H95TJDp) [Matrix](https://matrix.to/#/#general:matrix.dero.live) [GitHub](https://github.com/DEROFDN/derohe) [Explorer](https://explorer.derofoundation.org) [Wiki](https://wiki.dero.io)
 

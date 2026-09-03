@@ -11,7 +11,6 @@ import (
 	"unicode"
 
 	"github.com/creachadair/jrpc2"
-	"github.com/creachadair/jrpc2/code"
 	"github.com/creachadair/jrpc2/handler"
 	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/rpc"
@@ -115,9 +114,9 @@ func (perm Permission) String() string {
 	return str
 }
 
-const PermissionDenied code.Code = -32043
-const PermissionAlwaysDenied code.Code = -32044
-const RateLimitExceeded code.Code = -32070
+const PermissionDenied jrpc2.Code = -32043
+const PermissionAlwaysDenied jrpc2.Code = -32044
+const RateLimitExceeded jrpc2.Code = -32070
 
 type messageRequest struct {
 	app     *ApplicationData
@@ -653,14 +652,14 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 				err := request.UnmarshalParams(&params)
 				if err != nil {
 					x.logger.V(1).Error(err, "Error while unmarshaling params")
-					return ResponseWithError(request, jrpc2.Errorf(code.InvalidParams, "Error while unmarshaling params: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InvalidParams, "Error while unmarshaling params: %q", err.Error()))
 				}
 
 				x.logger.V(2).Info("requesting daemon with", "method", request.Method(), "param", request.ParamString())
-				result, err := walletapi.GetRPCClient().RPC.Call(context.Background(), request.Method(), params)
+				result, err := walletapi.GetRPCClient().CallResponseWithContext(context.Background(), request.Method(), params)
 				if err != nil {
 					x.logger.V(1).Error(err, "Error on daemon call")
-					return ResponseWithError(request, jrpc2.Errorf(code.InvalidRequest, "Error on daemon call: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InvalidRequest, "Error on daemon call: %q", err.Error()))
 				}
 
 				// we set original ID
@@ -671,13 +670,13 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 				err = result.UnmarshalResult(&response)
 				if err != nil {
 					x.logger.V(1).Error(err, "Error on unmarshal daemon result")
-					return ResponseWithError(request, jrpc2.Errorf(code.InternalError, "Error on unmarshal daemon call: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InternalError, "Error on unmarshal daemon call: %q", err.Error()))
 				}
 
 				json, err := result.MarshalJSON()
 				if err != nil {
 					x.logger.V(1).Error(err, "Error on marshal daemon response")
-					return ResponseWithError(request, jrpc2.Errorf(code.InternalError, "Error on marshal daemon call: %q", err.Error()))
+					return ResponseWithError(request, jrpc2.Errorf(jrpc2.InternalError, "Error on marshal daemon call: %q", err.Error()))
 				}
 
 				x.logger.V(2).Info("received response", "response", string(json))
@@ -685,12 +684,12 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 				return ResponseWithResult(request, response)
 			} else {
 				x.logger.V(1).Info("Daemon is offline", "endpoint", x.wallet.Daemon_Endpoint)
-				return ResponseWithError(request, jrpc2.Errorf(code.Cancelled, "daemon %s is offline", x.wallet.Daemon_Endpoint))
+				return ResponseWithError(request, jrpc2.Errorf(jrpc2.Cancelled, "daemon %s is offline", x.wallet.Daemon_Endpoint))
 			}
 		}
 
 		x.logger.Info("RPC Method not found", "method", methodName)
-		return ResponseWithError(request, jrpc2.Errorf(code.MethodNotFound, "method %q not found", methodName))
+		return ResponseWithError(request, jrpc2.Errorf(jrpc2.MethodNotFound, "method %q not found", methodName))
 	}
 
 	// only one request at a time
@@ -710,9 +709,9 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 		wallet_context := *x.context
 		wallet_context.Extra["app_data"] = app
 		ctx := context.WithValue(context.Background(), "wallet_context", &wallet_context)
-		response, err := handler.Handle(ctx, request)
+		response, err := handler(ctx, request)
 		if err != nil {
-			return ResponseWithError(request, jrpc2.Errorf(code.InternalError, "Error while handling request method %q: %v", methodName, err))
+			return ResponseWithError(request, jrpc2.Errorf(jrpc2.InternalError, "Error while handling request method %q: %v", methodName, err))
 		}
 
 		return ResponseWithResult(request, response)
@@ -790,26 +789,25 @@ func (x *XSWD) readMessageFromSession(conn *Connection, app *ApplicationData) {
 		}
 
 		// unmarshal the request
-		requests, err := jrpc2.ParseRequests(buff)
+		requests, err := parseRequestsCompat(buff)
 		if err != nil {
 			x.logger.Error(err, "Error while parsing request")
-			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(code.ParseError, "Error while parsing request"))); err != nil {
+			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(jrpc2.ParseError, "Error while parsing request"))); err != nil {
 				return
 			}
 			continue
 		}
 
-		request := requests[0]
 		// We only support one request at a time for permission request
 		if len(requests) != 1 {
 			x.logger.V(2).Error(nil, "Invalid number of requests")
-			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(code.ParseError, "Batch requests are not supported"))); err != nil {
+			if err := conn.Send(ResponseWithError(nil, jrpc2.Errorf(jrpc2.ParseError, "Batch requests are not supported"))); err != nil {
 				return
 			}
 			continue
 		}
 
-		x.requests <- messageRequest{app: app, request: request, conn: conn}
+		x.requests <- messageRequest{app: app, request: requests[0], conn: conn}
 	}
 }
 
@@ -860,4 +858,59 @@ func isASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// errInvalidVersion mirrors the error the previously vendored jrpc2 returned
+// for a missing or invalid JSON-RPC version marker.
+var errInvalidVersion error = &jrpc2.Error{Code: jrpc2.InvalidRequest, Message: "incorrect version marker"}
+
+// parseRequestsCompat parses XSWD messages with the acceptance behaviour of the
+// jrpc2 version derohe originally vendored: every message yields a request, and
+// only a missing or invalid version marker is an error.
+//
+// jrpc2 v1 records per-message validation errors and ParsedRequest.ToRequest
+// drops any message carrying one, which would silently stop serving shapes XSWD
+// has always accepted (scalar params, extra fields, non-string ids). The version
+// check reads the raw JSON rather than inspecting library error values, so it is
+// not coupled to upstream error codes or messages.
+func parseRequestsCompat(msg []byte) ([]*jrpc2.Request, error) {
+	parsed, err := jrpc2.ParseRequests(msg)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkVersionMarkers(msg); err != nil {
+		return nil, err
+	}
+	out := make([]*jrpc2.Request, len(parsed))
+	for i, p := range parsed {
+		p.Error = nil
+		if p.ID == "" {
+			// An absent, null or rejected id all reduce to an empty ID here, and
+			// the old library represented all three as a nil request id. ToRequest
+			// maps "null" to nil but an empty string to an empty non-nil id, which
+			// would flip Request.IsNotification.
+			p.ID = "null"
+		}
+		out[i] = p.ToRequest()
+	}
+	return out, nil
+}
+
+// checkVersionMarkers reports errInvalidVersion if any message in msg is missing
+// a "jsonrpc":"2.0" marker. msg is either a single object or a batch array.
+func checkVersionMarkers(msg []byte) error {
+	batch := []json.RawMessage{msg}
+	var arr []json.RawMessage
+	if json.Unmarshal(msg, &arr) == nil {
+		batch = arr
+	}
+	for _, m := range batch {
+		var obj struct {
+			V string `json:"jsonrpc"`
+		}
+		if err := json.Unmarshal(m, &obj); err != nil || obj.V != jrpc2.Version {
+			return errInvalidVersion
+		}
+	}
+	return nil
 }

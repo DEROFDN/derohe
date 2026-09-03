@@ -232,6 +232,11 @@ func ping_loop() {
 					return
 				}
 				c.update(&response.Common) // update common information
+				latency := atomic.LoadInt64(&c.Latency)
+				topoH := atomic.LoadInt64(&c.TopoHeight)
+				if latency > 0 {
+					Peer_UpdateLatency(Address(c), latency, topoH)
+				}
 			}()
 		}
 		return true
@@ -666,10 +671,26 @@ func trigger_sync() {
 		clist = append(clist, value)
 	}
 
-	// sort the list random
-	// do random shuffling, can we get away with len/2 random shuffling
-	globals.Global_Random.Shuffle(len(clist), func(i, j int) {
-		clist[i], clist[j] = clist[j], clist[i]
+	// sort by height descending (furthest ahead first), then latency ascending (fastest among equal)
+	sort.SliceStable(clist, func(i, j int) bool {
+		hi := atomic.LoadInt64(&clist[i].Height)
+		hj := atomic.LoadInt64(&clist[j].Height)
+		if hi != hj {
+			return hi > hj
+		}
+		li := atomic.LoadInt64(&clist[i].Latency)
+		lj := atomic.LoadInt64(&clist[j].Latency)
+		// unknown latency (0) sorts last among equal height - not fastest
+		if li == 0 && lj == 0 {
+			return false
+		}
+		if li == 0 {
+			return false
+		}
+		if lj == 0 {
+			return true
+		}
+		return li < lj
 	})
 
 	for _, connection := range clist {

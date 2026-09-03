@@ -21,8 +21,64 @@ type GenerateProofFunc func(scid crypto.Hash, scid_index int, s *crypto.Statemen
 
 var GenerateProoffuncptr GenerateProofFunc = crypto.GenerateProof
 
+// AttributionMode controls which ring slot index is written into the encrypted
+// receiver payload (the leading byte at the witness_index write below). It changes
+// only the sender-attribution metadata the receiver decrypts; it never affects which
+// keys are sender/receiver, the amount, the recipient, or consensus validity.
+type AttributionMode uint8
+
+const (
+	// AttributionHonest writes witness_index[1] (the receiver's own slot) — the default
+	// and today's behavior. The receiver already knows it is the receiver, so this leaks
+	// nothing about the sender.
+	//
+	// GUARDRAIL: honest mode MUST write witness_index[1] and MUST NOT be changed to
+	// witness_index[0] (the real sender slot). Writing the sender slot would make the
+	// receiver-decryptable byte reveal the true sender on every transfer.
+	AttributionHonest AttributionMode = iota
+	// AttributionAnonymous writes the slot index of a decoy ring member (drawn from the
+	// anonymity set, never the real sender or receiver). The receiver is reduced to the
+	// ring's 1-of-N anonymity instead of being handed the sender's slot directly.
+	AttributionAnonymous
+	// Naming a SPECIFIC address as the apparent sender is deliberately not an
+	// AttributionMode value: the attribution-rotation engine drives this enum and must
+	// never be able to reach a targeted attribution by accident. That is a containment
+	// decision about THIS enum, not a judgment that the capability is off the table — if
+	// it ships, it ships as a separate opt-in field, with the receiver-export scrub as
+	// its privacy floor (at ring > 2 the exported entry is blanked, so a sender-chosen
+	// attribution can never be republished as a verified accusation).
+)
+
+// RingPreference is an opt-in decoy-curation hint for ring assembly. A nil
+// *RingPreference reproduces today's behavior (pure DERO.GetRandomAddress selection).
+// The curation logic that consumes it is wired in wallet_transfer.go.
+type RingPreference struct {
+	// PreferredDecoys are base-address strings to place in the ring first (after dedup);
+	// random members top up to ringsize. Each is validated registered on the base balance
+	// tree before use. Addresses the user controls must NOT be supplied here — curating
+	// your own addresses collapses your anonymity set.
+	PreferredDecoys []string
+	// Strict: if true, a bad preferred decoy (unparseable / self / duplicate / unregistered)
+	// is a hard error. If false (default), it is skipped and random selection fills the slot.
+	Strict bool
+}
+
+// TransferOptions carries opt-in, additive transfer privacy knobs. The zero value
+// reproduces today's behavior exactly (honest attribution, random ring selection).
+type TransferOptions struct {
+	Attribution AttributionMode // zero value = AttributionHonest
+	Ring        *RingPreference // nil = today's random ring selection
+}
+
 // generate proof  etc
+//
+// BuildTransaction is preserved verbatim as a shim over buildTransaction so existing
+// callers (tests, benchmarks) keep compiling and get honest, non-curated behavior.
 func (w *Wallet_Memory) BuildTransaction(transfers []rpc.Transfer, emap [][][]byte, rings [][]*bn256.G1, block_hash crypto.Hash, height uint64, scdata rpc.Arguments, roothash []byte, max_bits int, fees uint64) *transaction.Transaction {
+	return w.buildTransaction(transfers, emap, rings, block_hash, height, scdata, roothash, max_bits, fees, TransferOptions{})
+}
+
+func (w *Wallet_Memory) buildTransaction(transfers []rpc.Transfer, emap [][][]byte, rings [][]*bn256.G1, block_hash crypto.Hash, height uint64, scdata rpc.Arguments, roothash []byte, max_bits int, fees uint64, opts TransferOptions) *transaction.Transaction {
 
 	sender := w.account.Keys.Public.G1()
 	sender_secret := w.account.Keys.Secret.BigInt()
@@ -184,7 +240,18 @@ rebuild_tx:
 
 				shared_key := crypto.GenerateSharedSecret(ephemeral_scalar, publickeylist[i])
 
-				payload := append([]byte{byte(uint(witness_index[1]))}, data...)
+				// honest attribution writes witness_index[1] (the receiver's own slot).
+				// GUARDRAIL: never witness_index[0] (the real sender) — that would reveal
+				// the true sender to the receiver on every transfer.
+				attrIndex := witness_index[1]
+				if opts.Attribution == AttributionAnonymous && len(witness_index) > 2 {
+					// witness_index[2:] are the anonymity-set (decoy) slots: real, registered
+					// ring members that are neither the sender [0] nor the receiver [1].
+					// Pointing attribution at one reduces the receiver to 1-of-N ring anonymity.
+					decoyPos := 2 + crand.Intn(len(witness_index)-2)
+					attrIndex = witness_index[decoyPos]
+				}
+				payload := append([]byte{byte(uint(attrIndex))}, data...)
 				//fmt.Printf("buulding shared_key %x  index of receiver %d\n",shared_key,i)
 				//fmt.Printf("building plaintext payload %x\n",asset.RPCPayload)
 

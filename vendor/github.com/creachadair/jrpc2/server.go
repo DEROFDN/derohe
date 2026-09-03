@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"io"
 	"strconv"
 	"strings"
@@ -13,36 +14,68 @@ import (
 	"time"
 
 	"github.com/creachadair/jrpc2/channel"
-	"github.com/creachadair/jrpc2/code"
-	"github.com/creachadair/jrpc2/metrics"
+	"github.com/creachadair/mds/queue"
 	"golang.org/x/sync/semaphore"
 )
 
-// A Server is a JSON-RPC 2.0 server. The server receives requests and sends
-// responses on a channel.Channel provided by the caller, and dispatches
-// requests to user-defined Handlers.
+const (
+	rpcServerInfo = "rpc.serverInfo"
+)
+
+var (
+	serverMetrics = new(expvar.Map)
+
+	serversActiveGauge     = new(expvar.Int)
+	rpcRequestsCount       = new(expvar.Int)
+	rpcErrorsCount         = new(expvar.Int)
+	bytesReadCount         = new(expvar.Int)
+	bytesWrittenCount      = new(expvar.Int)
+	rpcCallsPushed         = new(expvar.Int)
+	rpcNotificationsPushed = new(expvar.Int)
+)
+
+func init() {
+	serverMetrics.Set("servers_active", serversActiveGauge)
+	serverMetrics.Set("rpc_requests", rpcRequestsCount)
+	serverMetrics.Set("rpc_errors", rpcErrorsCount)
+	serverMetrics.Set("bytes_read", bytesReadCount)
+	serverMetrics.Set("bytes_written", bytesWrittenCount)
+	serverMetrics.Set("calls_pushed", rpcCallsPushed)
+	serverMetrics.Set("notifications_pushed", rpcNotificationsPushed)
+}
+
+// ServerMetrics returns a map of exported server metrics for use with the
+// expvar package. This map is shared among all server instances created by
+// NewServer. The caller is free to add or remove metrics in the map, but note
+// that such changes will affect all servers.
+//
+// The caller is responsible for publishing the metrics to the exporter via
+// [expvar.Publish] or similar.
+func ServerMetrics() *expvar.Map { return serverMetrics }
+
+// Server implements a JSON-RPC 2.0 server. The server receives requests and
+// sends responses on a [channel.Channel] provided by the caller, and
+// dispatches requests to user-defined Handlers.
 type Server struct {
 	wg  sync.WaitGroup      // ready when workers are done at shutdown time
 	mux Assigner            // associates method names with handlers
 	sem *semaphore.Weighted // bounds concurrent execution (default 1)
 
 	// Configurable settings
-	allowP  bool                         // allow server notifications to the client
-	log     func(string, ...interface{}) // write debug logs here
-	rpcLog  RPCLogger                    // log RPC requests and responses here
-	newctx  func() context.Context       // create a new base request context
-	dectx   decoder                      // decode context from request
-	metrics *metrics.M                   // metrics collected during execution
-	start   time.Time                    // when Start was called
-	builtin bool                         // whether built-in rpc.* methods are enabled
+	allowP  bool                   // allow server notifications to the client
+	log     func(string, ...any)   // write debug logs here
+	rpcLog  RPCLogger              // log RPC requests and responses here
+	newctx  func() context.Context // create a new base request context
+	start   time.Time              // when Start was called
+	builtin bool                   // whether built-in rpc.* methods are enabled
 
 	mu *sync.Mutex // protects the fields below
 
-	nbar sync.WaitGroup  // notification barrier (see the dispatch method)
-	err  error           // error from a previous operation
-	work chan struct{}   // for signaling message availability
-	inq  *queue          // inbound requests awaiting processing
-	ch   channel.Channel // the channel to the client
+	nbar sync.WaitGroup         // notification barrier (see the dispatch method)
+	err  error                  // error from a previous operation
+	work chan struct{}          // for signaling message availability
+	inq  queue.Queue[jmessages] // inbound requests awaiting processing
+	ch   channel.Channel        // the channel to the client
 
 	// For each request ID currently in-flight, this map carries a cancel
 	// function attached to the context that was sent to the handler.
@@ -57,10 +90,9 @@ type Server struct {
 // NewServer returns a new unstarted server that will dispatch incoming
 // JSON-RPC requests according to mux. To start serving, call Start.
 //
-// N.B. It is only safe to modify mux after the server has been started if mux
-// itself is safe for concurrent use by multiple goroutines.
-//
-// This function will panic if mux == nil.
+// This function will panic if mux == nil.  It is not safe to modify mux after
+// the server has been started unless mux itself is safe for concurrent use by
+// multiple goroutines.
 func NewServer(mux Assigner, opts *ServerOptions) *Server {
 	if mux == nil {
 		panic("nil assigner")
@@ -72,12 +104,9 @@ func NewServer(mux Assigner, opts *ServerOptions) *Server {
 		log:     opts.logFunc(),
 		rpcLog:  opts.rpcLog(),
 		newctx:  opts.newContext(),
-		dectx:   opts.decodeContext(),
 		mu:      new(sync.Mutex),
-		metrics: opts.metrics(),
 		start:   opts.startTime(),
 		builtin: opts.allowBuiltin(),
-		inq:     newQueue(),
 		used:    make(map[string]context.CancelFunc),
 		call:    make(map[string]*Response),
 		callID:  1,
@@ -85,9 +114,9 @@ func NewServer(mux Assigner, opts *ServerOptions) *Server {
 	return s
 }
 
-// Start enables processing of requests from c and returns. Start does not
-// block while the server runs. This function will panic if the server is
-// already running. It returns s to allow chaining with construction.
+// Start initiates processing of requests from c and returns. Start does not
+// block while the server runs. Start will panic if the server is already
+// running. It returns s to allow chaining with construction.
 func (s *Server) Start(c channel.Channel) *Server {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,7 +129,7 @@ func (s *Server) Start(c channel.Channel) *Server {
 	if s.start.IsZero() {
 		s.start = time.Now().In(time.UTC)
 	}
-	s.metrics.Count("rpc.serversActive", 1)
+	serversActiveGauge.Add(1)
 
 	// Reset all the I/O structures and start up the workers.
 	s.err = nil
@@ -112,13 +141,12 @@ func (s *Server) Start(c channel.Channel) *Server {
 	// processing the request queue. In addition, each request in flight adds a
 	// goroutine to s.wg. At server shutdown, s.wg completes when the
 	// maintenance goroutines and all pending requests are finished.
-	s.wg.Add(2)
 
 	// Accept requests from the client and enqueue them for processing.
-	go func() { defer s.wg.Done(); s.read(c) }()
+	s.wg.Go(func() { s.read(c) })
 
 	// Remove requests from the queue and dispatch them to handlers.
-	go func() { defer s.wg.Done(); s.serve() }()
+	s.wg.Go(s.serve)
 
 	return s
 }
@@ -128,17 +156,16 @@ func (s *Server) Start(c channel.Channel) *Server {
 //
 // The flow of an inbound request is:
 //
-//   serve             -- main serving loop
-//   * nextRequest     -- process the next request batch
-//     * dispatch
-//       * assign      -- assign handlers to requests
-//       | ...
-//       |
-//       * invoke      -- invoke handlers
-//       | \ handler   -- handle an individual request
-//       |   ...
-//       * deliver     -- send responses to the client
-//
+//	serve             -- main serving loop
+//	* nextRequest     -- process the next request batch
+//	  * dispatch
+//	    * assign      -- assign handlers to requests
+//	    | ...
+//	    |
+//	    * invoke      -- invoke handlers
+//	    | \ handler   -- handle an individual request
+//	    |   ...
+//	    * deliver     -- send responses to the client
 func (s *Server) serve() {
 	for {
 		next, err := s.nextRequest()
@@ -146,11 +173,7 @@ func (s *Server) serve() {
 			s.log("Error reading from client: %v", err)
 			return
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			next()
-		}()
+		s.wg.Go(func() { next() })
 	}
 }
 
@@ -170,21 +193,21 @@ func (s *Server) signal() {
 func (s *Server) nextRequest() (func() error, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for s.ch != nil && s.inq.isEmpty() {
+	for s.ch != nil && s.inq.IsEmpty() {
 		s.mu.Unlock()
 		<-s.work
 		s.mu.Lock()
 	}
-	if s.ch == nil && s.inq.isEmpty() {
+	if s.ch == nil && s.inq.IsEmpty() {
 		return nil, s.err
 	}
 	ch := s.ch // capture
 
-	next := s.inq.pop()
-	s.log("Dequeued request batch of length %d (qlen=%d)", len(next), s.inq.size())
+	next, _ := s.inq.Pop()
+	s.log("Dequeued request batch of length %d (qlen=%d)", len(next), s.inq.Len())
 
 	// Construct a dispatcher to run the handlers outside the lock.
-	return s.dispatch(next, ch), nil
+	return s.dispatchLocked(next, ch), nil
 }
 
 // waitForBarrier blocks until all notification handlers that have been issued
@@ -201,18 +224,19 @@ func (s *Server) waitForBarrier(n int) {
 	s.nbar.Add(n)
 }
 
-// dispatch constructs a function that invokes each of the specified tasks.
-// The caller must hold s.mu when calling dispatch, but the returned function
-// should be executed outside the lock to wait for the handlers to return.
+// dispatchLocked constructs a function that invokes each of the specified
+// tasks.  The caller must hold s.mu when calling dispatchLocked, but the
+// returned function should be executed outside the lock to wait for the
+// handlers to return.
 //
-// dispatch blocks until any notification received prior to this batch has
-// completed, to ensure that notifications are processed in a partial order
+// dispatchLocked blocks until any notification received prior to this batch
+// has completed, to ensure that notifications are processed in a partial order
 // that respects order of receipt. Notifications within a batch are handled
 // concurrently.
-func (s *Server) dispatch(next jmessages, ch sender) func() error {
+func (s *Server) dispatchLocked(next jmessages, ch sender) func() error {
 	// Resolve all the task handlers or record errors.
 	start := time.Now()
-	tasks := s.checkAndAssign(next)
+	tasks := s.checkAndAssignLocked(next)
 
 	// Ensure all notifications already issued have completed; see #24.
 	todo, notes := tasks.numToDo()
@@ -234,14 +258,12 @@ func (s *Server) dispatch(next jmessages, ch sender) func() error {
 				break
 			}
 			t := t
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				t.val, t.err = s.invoke(t.ctx, t.m, t.hreq)
 				if t.hreq.IsNotification() {
 					s.nbar.Done()
 				}
-			}()
+			})
 		}
 
 		// Wait for all the handlers to return, then deliver any responses.
@@ -265,47 +287,33 @@ func (s *Server) deliver(rsps jmessages, ch sender, elapsed time.Duration) error
 	// cancelling its valid predecessor in that ID.
 	for _, rsp := range rsps {
 		if rsp.err == nil {
-			s.cancel(string(rsp.ID))
+			s.cancelLocked(string(rsp.ID))
 		}
 	}
 
 	nw, err := encode(ch, rsps)
-	s.metrics.CountAndSetMax("rpc.bytesWritten", int64(nw))
+	bytesWrittenCount.Add(int64(nw))
 	return err
 }
 
-// checkAndAssign resolves all the task handlers for the given batch, or
+// checkAndAssignLocked resolves all the task handlers for the given batch, or
 // records errors for them as appropriate. The caller must hold s.mu.
-func (s *Server) checkAndAssign(next jmessages) tasks {
+func (s *Server) checkAndAssignLocked(next jmessages) tasks {
 	var ts tasks
 	var ids []string
 	dup := make(map[string]*task) // :: id ⇒ first task in batch with id
 
-	// Phase 1: Filter out responses from push calls and check for duplicate
-	// request ID.s
+	// Phase 1: Check for errors and duplicate request IDs.
 	for _, req := range next {
 		fid := fixID(req.ID)
-		id := string(fid)
-		if !req.isRequestOrNotification() && s.call[id] != nil {
-			// This is a result or error for a pending push-call.
-			//
-			// N.B. It is important to check for this before checking for
-			// duplicate request IDs, since the ID spaces could overlap.
-			rsp := s.call[id]
-			delete(s.call, id)
-			rsp.ch <- req
-			continue // don't send a reply for this
-		} else if req.err != nil {
-			// keep the existing error
-		} else if !s.versionOK(req.V) {
-			req.err = ErrInvalidVersion
-		}
-
 		t := &task{
 			hreq:  &Request{id: fid, method: req.M, params: req.P},
 			batch: req.batch,
-			err:   req.err,
 		}
+		if req.err != nil {
+			t.err = req.err
+		}
+		id := string(fid)
 		if old := dup[id]; old != nil {
 			// A previous task already used this ID, fail both.
 			old.err = errDuplicateID.WithData(id)
@@ -328,8 +336,9 @@ func (s *Server) checkAndAssign(next jmessages) tasks {
 			// deferred validation error
 		} else if t.hreq.method == "" {
 			t.err = errEmptyMethod
-		} else if s.setContext(t, id) {
-			t.m = s.assign(t.ctx, t.hreq.method)
+		} else {
+			s.setContext(t, id)
+			t.m = s.assignLocked(t.ctx, t.hreq.method)
 			if t.m == nil {
 				t.err = errNoSuchMethod.WithData(t.hreq.method)
 			}
@@ -338,7 +347,7 @@ func (s *Server) checkAndAssign(next jmessages) tasks {
 		if t.err != nil {
 			s.log("Request check error for %q (params %q): %v",
 				t.hreq.method, string(t.hreq.params), t.err)
-			s.metrics.Count("rpc.errors", 1)
+			rpcErrorsCount.Add(1)
 		}
 	}
 	return ts
@@ -346,15 +355,8 @@ func (s *Server) checkAndAssign(next jmessages) tasks {
 
 // setContext constructs and attaches a request context to t, and reports
 // whether this succeeded.
-func (s *Server) setContext(t *task, id string) bool {
-	base, params, err := s.dectx(s.newctx(), t.hreq.method, t.hreq.params)
-	t.hreq.params = params
-	if err != nil {
-		t.err = Errorf(code.InternalError, "invalid request context: %v", err)
-		return false
-	}
-
-	t.ctx = context.WithValue(base, inboundRequestKey{}, t.hreq)
+func (s *Server) setContext(t *task, id string) {
+	t.ctx = context.WithValue(s.newctx(), inboundRequestKey{}, t.hreq)
 
 	// Store the cancellation for a request that needs a reply, so that we can
 	// respond to cancellation requests.
@@ -363,7 +365,6 @@ func (s *Server) setContext(t *task, id string) bool {
 		s.used[id] = cancel
 		t.ctx = ctx
 	}
-	return true
 }
 
 // invoke invokes the handler m for the specified request type, and marshals
@@ -376,7 +377,7 @@ func (s *Server) invoke(base context.Context, h Handler, req *Request) (json.Raw
 	defer s.sem.Release(1)
 
 	s.rpcLog.LogRequest(ctx, req)
-	v, err := h.Handle(ctx, req)
+	v, err := h(ctx, req)
 	if err != nil {
 		if req.IsNotification() {
 			s.log("Discarding error from notification to %q: %v", req.Method(), err)
@@ -391,19 +392,15 @@ func (s *Server) invoke(base context.Context, h Handler, req *Request) (json.Raw
 func (s *Server) ServerInfo() *ServerInfo {
 	info := &ServerInfo{
 		Methods:   []string{"*"},
+		Metrics:   make(map[string]any),
 		StartTime: s.start,
-		Counter:   make(map[string]int64),
-		MaxValue:  make(map[string]int64),
-		Label:     make(map[string]interface{}),
 	}
+	serverMetrics.Do(func(kv expvar.KeyValue) {
+		info.Metrics[kv.Key] = json.RawMessage(kv.Value.String())
+	})
 	if n, ok := s.mux.(Namer); ok {
 		info.Methods = n.Names()
 	}
-	s.metrics.Snapshot(metrics.Snapshot{
-		Counter:  info.Counter,
-		MaxValue: info.MaxValue,
-		Label:    info.Label,
-	})
 	return info
 }
 
@@ -415,10 +412,10 @@ var ErrPushUnsupported = errors.New("server push is not enabled")
 //
 // This is a non-standard extension of JSON-RPC, and may not be supported by
 // all clients.  Unless s was constructed with the AllowPush option set true,
-// this method will always report an error (ErrPushUnsupported) without sending
-// anything.  If Notify is called after the client connection is closed, it
-// returns ErrConnClosed.
-func (s *Server) Notify(ctx context.Context, method string, params interface{}) error {
+// this method will always report an error ([ErrPushUnsupported]) without
+// sending anything.  If Notify is called after the client connection is
+// closed, it returns [ErrConnClosed].
+func (s *Server) Notify(ctx context.Context, method string, params any) error {
 	if !s.allowP {
 		return ErrPushUnsupported
 	}
@@ -429,7 +426,7 @@ func (s *Server) Notify(ctx context.Context, method string, params interface{}) 
 // Callback posts a single server-side call to the client. It blocks until a
 // reply is received, ctx ends, or the client connection terminates.  A
 // successful callback reports a nil error and a non-nil response. Errors
-// returned by the client have concrete type *jrpc2.Error.
+// returned by the client have concrete type [*Error].
 //
 // This is a non-standard extension of JSON-RPC, and may not be supported by
 // all clients. If you are not sure whether the client supports push calls, you
@@ -437,10 +434,10 @@ func (s *Server) Notify(ctx context.Context, method string, params interface{}) 
 // client response that will never arrive.
 //
 // Unless s was constructed with the AllowPush option set true, this method
-// will always report an error (ErrPushUnsupported) without sending
+// will always report an error ([ErrPushUnsupported]) without sending
 // anything. If Callback is called after the client connection is closed, it
-// returns ErrConnClosed.
-func (s *Server) Callback(ctx context.Context, method string, params interface{}) (*Response, error) {
+// returns [ErrConnClosed].
+func (s *Server) Callback(ctx context.Context, method string, params any) (*Response, error) {
 	if !s.allowP {
 		return nil, ErrPushUnsupported
 	}
@@ -470,11 +467,11 @@ func (s *Server) waitCallback(pctx context.Context, id string, p *Response) {
 
 	p.ch <- &jmessage{
 		ID: json.RawMessage(id),
-		E:  &Error{Code: code.FromError(err), Message: err.Error()},
+		E:  &Error{Code: ErrorCode(err), Message: err.Error()},
 	}
 }
 
-func (s *Server) pushReq(ctx context.Context, wantID bool, method string, params interface{}) (rsp *Response, _ error) {
+func (s *Server) pushReq(ctx context.Context, wantID bool, method string, params any) (rsp *Response, _ error) {
 	var bits []byte
 	if params != nil {
 		v, err := json.Marshal(params)
@@ -505,6 +502,9 @@ func (s *Server) pushReq(ctx context.Context, wantID bool, method string, params
 		}
 		s.call[id] = rsp
 		go s.waitCallback(cbctx, id, rsp)
+		rpcCallsPushed.Add(1)
+	} else {
+		rpcNotificationsPushed.Add(1)
 	}
 
 	s.log("Posting server %s %q %s", kind, method, string(bits))
@@ -513,22 +513,17 @@ func (s *Server) pushReq(ctx context.Context, wantID bool, method string, params
 		M:  method,
 		P:  bits,
 	}})
-	s.metrics.CountAndSetMax("rpc.bytesWritten", int64(nw))
-	s.metrics.Count("rpc."+kind+"sPushed", 1)
+	bytesWrittenCount.Add(int64(nw))
 	return rsp, err
 }
 
-// Metrics returns the server metrics collector for s.  If s does not define a
-// collector, this method returns nil, which is ready for use but discards all
-// metrics.
-func (s *Server) Metrics() *metrics.M { return s.metrics }
-
-// Stop shuts down the server. It is safe to call this method multiple times or
-// from concurrent goroutines; it will only take effect once.
+// Stop shuts down the server. All in-progress call handlers are cancelled. It
+// is safe to call this method multiple times or from concurrent goroutines; it
+// will only take effect once.
 func (s *Server) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.stop(errServerStopped)
+	s.stopLocked(errServerStopped)
 }
 
 // ServerStatus describes the status of a stopped server.
@@ -555,7 +550,7 @@ func (s ServerStatus) Success() bool { return s.Err == nil }
 func (s *Server) WaitStatus() ServerStatus {
 	s.wg.Wait()
 	// Postcondition check.
-	if !s.inq.isEmpty() {
+	if !s.inq.IsEmpty() {
 		panic("s.inq is not empty at shutdown")
 	}
 	stat := ServerStatus{Err: s.err}
@@ -573,10 +568,10 @@ func (s *Server) WaitStatus() ServerStatus {
 // It is equivalent to s.WaitStatus().Err.
 func (s *Server) Wait() error { return s.WaitStatus().Err }
 
-// stop shuts down the connection and records err as its final state.  The
-// caller must hold s.mu. If multiple callers invoke stop, only the first will
-// successfully record its error status.
-func (s *Server) stop(err error) {
+// stopLocked shuts down the connection and records err as its final state.
+// The caller must hold s.mu. If multiple callers invoke stop, only the first
+// will successfully record its error status.
+func (s *Server) stopLocked(err error) {
 	if s.ch == nil {
 		return // nothing is running
 	}
@@ -588,19 +583,20 @@ func (s *Server) stop(err error) {
 	//
 	// TODO(@creachadair): We need better tests for this behaviour.
 	var keep jmessages
-	s.inq.each(func(cur jmessages) {
+	s.inq.Each(func(cur jmessages) bool {
 		for _, req := range cur {
 			if req.isNotification() {
 				keep = append(keep, req)
 				s.log("Retaining notification %p", req)
 			} else {
-				s.cancel(string(req.ID))
+				s.cancelLocked(string(req.ID))
 			}
 		}
+		return true
 	})
-	s.inq.reset()
+	s.inq.Clear()
 	for _, elt := range keep {
-		s.inq.push(jmessages{elt})
+		s.inq.Add(jmessages{elt})
 	}
 	close(s.work)
 
@@ -621,7 +617,7 @@ func (s *Server) stop(err error) {
 
 	s.err = err
 	s.ch = nil
-	s.metrics.Count("rpc.serversActive", -1)
+	serversActiveGauge.Add(-1)
 }
 
 // read is the main receiver loop, decoding requests from the client and adding
@@ -635,30 +631,66 @@ func (s *Server) read(ch receiver) {
 		var in jmessages
 		var derr error
 		bits, err := ch.Recv()
-		s.metrics.CountAndSetMax("rpc.bytesRead", int64(len(bits)))
+		bytesReadCount.Add(int64(len(bits)))
 		if err == nil || (err == io.EOF && len(bits) != 0) {
 			err = nil
 			derr = in.parseJSON(bits)
-			s.metrics.Count("rpc.requests", int64(len(in)))
+			rpcRequestsCount.Add(int64(len(in)))
 		}
 		s.mu.Lock()
 		if err != nil { // receive failure; shut down
-			s.stop(err)
+			s.stopLocked(err)
 			s.mu.Unlock()
 			return
 		} else if derr != nil { // parse failure; report and continue
-			s.pushError(derr)
+			s.pushErrorLocked(derr)
 		} else if len(in) == 0 {
-			s.pushError(errEmptyBatch)
+			s.pushErrorLocked(errEmptyBatch)
 		} else {
-			s.log("Received request batch of size %d (qlen=%d)", len(in), s.inq.size())
-			s.inq.push(in)
-			if s.inq.size() == 1 { // the queue was empty
-				s.signal()
+			// Filter out response messages. It's possible that the entire batch
+			// was responses, so re-check the length after doing this.
+			keep := s.filterBatchLocked(in)
+			if len(keep) != 0 {
+				s.log("Received request batch of size %d (qlen=%d)", len(keep), s.inq.Len())
+				s.inq.Add(keep)
+				if s.inq.Len() == 1 { // the queue was empty
+					s.signal()
+				}
 			}
 		}
 		s.mu.Unlock()
 	}
+}
+
+// filterBatchLocked removes and handles any response messages from next,
+// dispatching replies to pending callbacks as required. The remainder is
+// returned.  The caller must hold s.mu, and must re-check that the result is
+// not empty.
+func (s *Server) filterBatchLocked(next jmessages) jmessages {
+	keep := make(jmessages, 0, len(next))
+	for _, req := range next {
+		if req.isRequestOrNotification() {
+			keep = append(keep, req)
+			continue
+		}
+
+		// If this is a response implicating the ID of a pending push-call,
+		// deliver the result to that call. Do this early to avoid deadlocking on
+		// the sequencing barrier (see #78).
+		//
+		// Note, however, if it does NOT correspond to a known push-call, keep it
+		// in the batch so it can be serviced as an error.
+		id := string(fixID(req.ID))
+		if s.call[id] != nil {
+			rsp := s.call[id]
+			delete(s.call, id)
+			rsp.ch <- req
+			s.log("Received response for callback %q", id)
+		} else {
+			keep = append(keep, req)
+		}
+	}
+	return keep
 }
 
 // ServerInfo is the concrete type of responses from the rpc.serverInfo method.
@@ -666,22 +698,22 @@ type ServerInfo struct {
 	// The list of method names exported by this server.
 	Methods []string `json:"methods,omitempty"`
 
-	// Metric values defined by the evaluation of methods.
-	Counter  map[string]int64       `json:"counters,omitempty"`
-	MaxValue map[string]int64       `json:"maxValue,omitempty"`
-	Label    map[string]interface{} `json:"labels,omitempty"`
+	// Metrics defined by the server and handler methods.
+	Metrics map[string]any `json:"metrics,omitempty"`
 
 	// When the server started.
-	StartTime time.Time `json:"startTime,omitempty"`
+	StartTime time.Time `json:"startTime,omitzero"`
 }
 
-// assign returns a Handler to handle the specified name, or nil.
-// The caller must hold s.mu.
-func (s *Server) assign(ctx context.Context, name string) Handler {
+// assignLocked returns a Handler to handle the specified name, or nil.  The
+// caller must hold s.mu.
+func (s *Server) assignLocked(ctx context.Context, name string) Handler {
 	if s.builtin && strings.HasPrefix(name, "rpc.") {
 		switch name {
 		case rpcServerInfo:
-			return methodFunc(s.handleRPCServerInfo)
+			return func(context.Context, *Request) (any, error) {
+				return s.ServerInfo(), nil
+			}
 		default:
 			return nil // reserved
 		}
@@ -689,33 +721,33 @@ func (s *Server) assign(ctx context.Context, name string) Handler {
 	return s.mux.Assign(ctx, name)
 }
 
-// pushError reports an error for the given request ID directly back to the
-// client, bypassing the normal request handling mechanism.  The caller must
-// hold s.mu when calling this method.
-func (s *Server) pushError(err error) {
+// pushErrorLocked reports an error for the given request ID directly back to
+// the client, bypassing the normal request handling mechanism.  The caller
+// must hold s.mu when calling this method.
+func (s *Server) pushErrorLocked(err error) {
 	s.log("Invalid request: %v", err)
 	var jerr *Error
 	if e, ok := err.(*Error); ok {
 		jerr = e
 	} else {
-		jerr = &Error{Code: code.FromError(err), Message: err.Error()}
+		jerr = &Error{Code: ErrorCode(err), Message: err.Error()}
 	}
 
 	nw, err := encode(s.ch, jmessages{{
 		ID: json.RawMessage("null"),
 		E:  jerr,
 	}})
-	s.metrics.Count("rpc.errors", 1)
-	s.metrics.CountAndSetMax("rpc.bytesWritten", int64(nw))
+	rpcErrorsCount.Add(1)
+	bytesWrittenCount.Add(int64(nw))
 	if err != nil {
 		s.log("Writing error response: %v", err)
 	}
 }
 
-// cancel reports whether id is an active call.  If so, it also calls the
+// cancelLocked reports whether id is an active call.  If so, it also calls the
 // cancellation function associated with id and removes it from the
 // reservations. The caller must hold s.mu.
-func (s *Server) cancel(id string) bool {
+func (s *Server) cancelLocked(id string) bool {
 	cancel, ok := s.used[id]
 	if ok {
 		cancel()
@@ -723,8 +755,6 @@ func (s *Server) cancel(id string) bool {
 	}
 	return ok
 }
-
-func (s *Server) versionOK(v string) bool { return v == Version }
 
 // A task represents a pending method invocation received by the server.
 type task struct {
@@ -752,7 +782,7 @@ func (ts tasks) responses(rpcLog RPCLogger) jmessages {
 			//
 			// However, parse and validation errors must still be reported, with
 			// an ID of null if the request ID was not resolvable.
-			if c := code.FromError(task.err); c != code.ParseError && c != code.InvalidRequest {
+			if c := ErrorCode(task.err); c != ParseError && c != InvalidRequest {
 				continue
 			}
 		}
@@ -762,16 +792,16 @@ func (ts tasks) responses(rpcLog RPCLogger) jmessages {
 		}
 		if task.m == nil {
 			// No method was ever assigned for this task, so it was never run.
-			rsp.err = errors.New("task not executed")
+			rsp.err = errTaskNotExecuted
 		}
 		if task.err == nil {
 			rsp.R = task.val
 		} else if e, ok := task.err.(*Error); ok {
 			rsp.E = e
-		} else if c := code.FromError(task.err); c != code.NoError {
+		} else if c := ErrorCode(task.err); c != NoError {
 			rsp.E = &Error{Code: c, Message: task.err.Error()}
 		} else {
-			rsp.E = &Error{Code: code.InternalError, Message: task.err.Error()}
+			rsp.E = &Error{Code: InternalError, Message: task.err.Error()}
 		}
 		rpcLog.LogResponse(task.ctx, &Response{
 			id:     string(rsp.ID),
@@ -795,4 +825,14 @@ func (ts tasks) numToDo() (todo, notes int) {
 		}
 	}
 	return
+}
+
+// CancelRequest instructs s to cancel the pending or in-flight request with
+// the specified ID. If no request exists with that ID, this is a no-op.
+func (s *Server) CancelRequest(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancelLocked(id) {
+		s.log("Cancelled request %s by client order", id)
+	}
 }

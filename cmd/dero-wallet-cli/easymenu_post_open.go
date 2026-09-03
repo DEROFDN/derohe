@@ -457,7 +457,7 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 		wallet = nil // overwrite previous instance
 		prompt_mutex.Unlock()
 
-		fmt.Fprintf(l.Stderr(), color_yellow+"Wallet closed"+color_white)
+		fmt.Fprint(l.Stderr(), color_yellow+"Wallet closed"+color_white)
 
 	case "9": // enable prompt mode
 		menu_mode = false
@@ -469,8 +469,8 @@ func handle_easymenu_post_open_command(l *readline.Instance, line string) (proce
 		wallet = nil
 		globals.Exit_In_Progress = true
 		prompt_mutex.Unlock()
-		fmt.Fprintf(l.Stderr(), color_yellow+"Wallet closed"+color_white)
-		fmt.Fprintf(l.Stderr(), color_yellow+"Exiting"+color_white)
+		fmt.Fprint(l.Stderr(), color_yellow+"Wallet closed"+color_white)
+		fmt.Fprint(l.Stderr(), color_yellow+"Exiting"+color_white)
 
 	case "13":
 		var zeroscid crypto.Hash

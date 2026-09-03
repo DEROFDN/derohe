@@ -121,6 +121,7 @@ func (connection *Connection) dispatch_test_handshake() {
 		p.LastConnected = uint64(time.Now().UTC().Unix())
 
 		Peer_Add(&p)
+		Peer_SetSuccess(connection.Addr.String())
 	}
 
 	// parse delivered peer list as grey list
@@ -168,9 +169,6 @@ func (c *Connection) Handshake(request Handshake_Struct, response *Handshake_Str
 				Peer_Add(&Peer{Address: request.PeerList[i].Addr, LastConnected: uint64(time.Now().UTC().Unix())})
 			}
 		}
-	}
-	if !c.Incoming {
-		Peer_SetSuccess(c.Addr.String())
 	}
 
 	return nil
