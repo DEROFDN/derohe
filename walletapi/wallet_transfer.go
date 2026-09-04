@@ -39,7 +39,7 @@ import (
 
 //import "github.com/deroproject/derohe/crypto/ringct"
 
-//import "github.com/deroproject/derohe/globals"
+import "github.com/deroproject/derohe/globals"
 
 //import "github.com/deroproject/derohe/ddn"
 
@@ -68,6 +68,8 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 	//if len(transfers) == 0 {
 	//	return nil,  fmt.Error("transfers is nil, cannot send.")
 	//}
+
+	ringsize_explicit := ringsize != 0 // caller asked for this ring size by name, see the SC-deposit guard below
 
 	if ringsize == 0 {
 		ringsize = uint64(w.account.Ringsize) // use wallet ringsize, if ringsize not provided
@@ -104,6 +106,55 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 				logger.V(3).Info("Doing 0 transfer to", "random_address", k)
 				break
 			}
+		}
+	}
+
+	// SC deposit safety. A burn attached to an SC call can only be given back if the
+	// sender can be identified, and blockchain.Extract_signer recovers a sender ONLY
+	// from a payload that is zero-SCID AND ringsize 2. At any other ring size a call
+	// that does not complete destroys the deposit and there is no refund target, by
+	// construction -- the chain cannot fix this after the fact, so refuse to BUILD the
+	// shape. This is a wallet-side guard on purpose: refusing it at verification would
+	// reject whole blocks produced by un-upgraded miners.
+	//
+	// Only a DEFAULTED ring size is refused. An explicit ringsize argument is NOT read
+	// as consent to lose the deposit -- that number is already overloaded in this
+	// ecosystem (TELA reads ring 2 vs ring >2 as updateable vs immutable) and callers
+	// pass it positionally, so it cannot carry a second meaning. It is honoured for a
+	// narrower reason: refusing it would forbid anonymous paid SC calls outright, and
+	// those are legitimate and mostly succeed -- the loss only materialises when the
+	// call does not complete, which is undecidable here. So an explicit ring >2 with a
+	// deposit is WARNED about, not refused, and only the defaulted path -- where no
+	// human chose anything and the wallet default of 16 is silently unrefundable -- is
+	// refused outright.
+	//
+	// The wallet threads ONE ring size through every payload it builds, so "no payload
+	// is zero-SCID at ring 2" reduces here to "ringsize != 2"; this is the same
+	// condition Extract_signer tests, not a per-payload approximation of it.
+	if ringsize != 2 && len(scdata) >= 1 {
+		for i := range transfers {
+			if transfers[i].Burn == 0 {
+				continue
+			}
+			if !ringsize_explicit {
+				// NOTE: deliberately NOT gated on the activation height. At ring >2 the
+				// deposit is destroyed on a failed call in BOTH eras, so the refusal is
+				// never wrong; only the remedy is era-dependent, which the message says.
+				return nil, fmt.Errorf("SC deposit of %d cannot be refunded if the call fails at ringsize %d: only a ringsize-2 payload exposes a signer, so above ringsize 2 the deposit is destroyed whenever the call does not complete, in every era. pass ringsize 2 to become refundable -- at the cost of being identifiable as the sender -- which gives the deposit back today when the contract itself rejects the call, and from height %d onward also when the call never reaches a contract at all (wrong or uninstalled scid, malformed or missing action). note that ringsize 2 also lowers the wallet's AUTO-COMPUTED fee by 60 atomic units versus the default ringsize 16 (transaction_build.go steps the fee at len(ring)/16), and that fee IS the storage-gas budget, so a call that STOREs near the limit may now fail for insufficient storage gas -- pass an explicit fee/gasstorage if the call writes more than a few hundred bytes. or pass ringsize %d explicitly to keep the deposit at risk", transfers[i].Burn, ringsize, globals.Config.BLACKHOLE_HEIGHT, ringsize)
+			}
+			// globals.Logger, NOT this package's `logger`: walletapi/wallet.go declares
+			// logger as logr.Discard() and nothing in the tree ever assigns it, so a
+			// warning sent there is discarded in every binary at every verbosity.
+			//
+			// NO burn value and NO scid in this line, deliberately. globals.InitializeLog
+			// tees every record into a zapcore.NewJSONEncoder over `logfile`, which
+			// dero-wallet-cli creates as a PLAINTEXT file next to the wallet, while the
+			// wallet DB itself is encrypted at rest -- so logging the pair would move an
+			// amount<->contract linkage out of the encrypted store and into an
+			// unencrypted one, for precisely the caller who asked for anonymity, with no
+			// operator switch to turn it off (--flog-level only moves the V threshold).
+			// Info, not Error: nothing has failed, the caller asked for this.
+			globals.Logger.Info("SC deposit at ringsize >2 is UNREFUNDABLE if the call fails; no signer can be recovered", "ringsize", ringsize)
 		}
 	}
 

@@ -107,6 +107,13 @@ func InitNetwork() {
 	if testnet, ok := Arguments["--testnet"].(bool); ok && testnet {
 		Config = config.Testnet
 	}
+
+	// NOTE: the simulator override for BLACKHOLE_HEIGHT deliberately does NOT live
+	// here. IsSimulator() reads Arguments["--simulator"], which only the
+	// cmd/simulator CLI binary sets; every in-process chain in this tree (and every
+	// embedder, e.g. HOLOGRAM) starts a simulator with params["--simulator"] only.
+	// The override therefore lives in blockchain.Blockchain_Start next to the
+	// existing chain.simulator assignment, which is the predicate all of them share.
 }
 
 // these 2 global variables control all log levels

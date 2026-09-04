@@ -92,6 +92,7 @@ type CHAIN_CONFIG struct {
 	HF2_HEIGHT       int64 // second HF applie here
 	MAJOR_HF2_HEIGHT int64 // MAJOR HF2 applies here, changes pow
 	MAJOR_HF3_HEIGHT int64 // MAJOR HF3 applied here, changes/adds consensus rules
+	BLACKHOLE_HEIGHT int64 // SC deposit refund rule applies here. gates a STATE transition only: no tx or block is ever REJECTED by this rule directly. that is not the same as harmless where it is retro-active -- a diverged balance tree changes Load_Merkle_Hash, and a later tx whose Statement.Roothash was built against the canonical tree then fails the roothash check in verify_Transaction_NonCoinbase_internal, which fails the block that carries it. on a chain that already has history that is a permanent sync wedge, not merely a diverged tree. on mainnet this is not a calendar assertion: the value is tied RELATIVELY to MAJOR_HF3_HEIGHT in init(), so it cannot independently go stale -- move the fork height and this moves with it, and it can never activate before the block-version bump that ships it. the residual (HF3 itself shipping after its own height has passed) is the base patch's rollout constraint, inherited not added. see init() below for the testnet position, where MAJOR_HF3_HEIGHT is 0 and the tie WOULD be retro-active. a separate knob so it can be moved without touching the block-version schedule; on mainnet it is TIED to MAJOR_HF3_HEIGHT in init() below
 
 	Dev_Address        string // to which address the integrator rewatd will go, if user doesn't specify integrator address'
 	Genesis_Tx         string
@@ -108,6 +109,7 @@ var Mainnet = CHAIN_CONFIG{Name: "mainnet",
 	HF2_HEIGHT:              29000,
 	MAJOR_HF2_HEIGHT:        481600,
 	MAJOR_HF3_HEIGHT:        7504640,
+	// BLACKHOLE_HEIGHT is NOT set here on purpose, see init() below
 
 	Genesis_Tx: "" +
 		"01" + // version
@@ -130,6 +132,7 @@ var Testnet = CHAIN_CONFIG{Name: "testnet", // testnet will always have last 3 b
 	HF2_HEIGHT:       0, // on testnet apply at genesis
 	MAJOR_HF2_HEIGHT: 4, // on testnet apply at 4
 	MAJOR_HF3_HEIGHT: 0, // on testnet apply at genesis
+	// BLACKHOLE_HEIGHT is NOT set here on purpose, see init() below
 
 	Genesis_Tx: "" +
 		"01" + // version
@@ -138,6 +141,48 @@ var Testnet = CHAIN_CONFIG{Name: "testnet", // testnet will always have last 3 b
 		"00" + // PREMINE_FLAG
 		"c0d7e98fdf23" + // PREMINE_VALUE
 		"1f9bcc1208dee302769931ad378a4c0c4b2c21b0cfb3e752607e12d2b6fa642500", // miners public key
+}
+
+func init() {
+	// the refund rule activates on exactly the block which bumps the block version,
+	// on every network. a composite literal cannot reference a sibling field, so the
+	// tie is made here rather than by duplicating the number and hoping the two
+	// literals are edited together; the field exists so that this rule can be moved
+	// independently later without touching the block-version schedule.
+	//
+	// NOTE, and it must be in the release note: the version bump does NOT make an
+	// un-upgraded node reject these blocks. blockchain/hardfork_core.go already
+	// carries the version-3 entry, and Check_Block_Version only compares the block's
+	// version to the one the node itself computes at that height, so a node running
+	// the un-patched code computes 3 too, accepts the block, and applies the old burn
+	// semantics. there is no state-root commitment in the block header (block.Proof
+	// is declared but never written or checked), so the divergence surfaces only
+	// later and indirectly, when a tx built against the diverged tree fails the
+	// Roothash check in transaction_verify. every node MUST be upgraded before the
+	// activation height; this is the same exposure any height-gated state rule
+	// carries, HF3's own changes included.
+	//
+	// TESTNET is deliberately NOT tied to MAJOR_HF3_HEIGHT. MAJOR_HF3_HEIGHT
+	// is 0 there, so the refund rule is retro-active to testnet genesis and a patched
+	// node replaying testnet history diverges at the first historical ring-2 SC tx
+	// which fails in one of the newly-routed ways (uninstalled scid, unknown action,
+	// SC_INSTALL without code, SCDATA carrying no action). by the roothash mechanism
+	// described on the field above, that is a permanent divergence for a replaying
+	// node, not a cosmetic one. this is the SAME class the baseline already carries
+	// on testnet -- f7a56db's sc_change_cache de-duplication in blockchain.go is
+	// gated on MAJOR_HF3_HEIGHT, which is 0 on testnet, so it too is retro-active
+	// to testnet genesis (on mainnet it is properly gated) -- so this is an
+	// increment to an existing exposure rather than a new one, and neither
+	// trigger's historical incidence has been counted on a live testnet.
+	// so testnet gets a height ABOVE any plausible current testnet head instead of 0:
+	// a rule that can wedge a resync must never be retro-active on a chain that has
+	// history. the number below is a placeholder to be tightened at release against
+	// the live testnet head; leaving it un-tightened costs nothing, because the rule
+	// is exercised on the simulator, which is unaffected either way --
+	// blockchain.Blockchain_Start overrides BLACKHOLE_HEIGHT to 0 for --simulator and
+	// a simulator chain starts at genesis with no history to diverge from.
+	Mainnet.BLACKHOLE_HEIGHT = Mainnet.MAJOR_HF3_HEIGHT
+	Testnet.BLACKHOLE_HEIGHT = 100000000
 }
 
 // mainnet has a remote daemon node, which can be used be default, if user provides a  --remote flag
