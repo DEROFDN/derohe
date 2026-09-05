@@ -108,6 +108,9 @@ func init() {
 		"min":       {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 5000, StorageCost: 0, PtrU: dvm_min}},
 		"strlen":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrU: dvm_strlen}},
 		"substr":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrS: dvm_substr}},
+		// Array & Enumeration (fork, L3/L4)
+		"arrlen":  {{Range: semver.MustParseRange(">=10.0.0"), ComputeCost: 1000, StorageCost: 0, PtrU: dvm_arrlen}},
+		"mapkeys": {{Range: semver.MustParseRange(">=10.0.0"), ComputeCost: 5000, StorageCost: 0, PtrS: dvm_mapkeys}},
 	}
 }
 

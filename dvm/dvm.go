@@ -41,6 +41,8 @@ const (
 	Invalid Vtype = 0x3 // default is  invalid
 	Uint64  Vtype = 0x4 // uint64 data type
 	String  Vtype = 0x5 // string
+	Bool    Vtype = 0x6 // boolean (L6): stored as uint64 0/1 internally
+	Int     Vtype = 0x7 // signed 64-bit integer (L9): stored in ValueInt64
 )
 
 var replacer = strings.NewReplacer("< =", "<=", "> =", ">=", "= =", "==", "! =", "!=", "& &", "&&", "| |", "||", "< <", "<<", "> >", ">>", "< >", "!=")
@@ -56,6 +58,15 @@ type Variable struct {
 	Type        Vtype  `cbor:"T,omitempty" json:"T,omitempty"` // we have only 2 data types
 	ValueUint64 uint64 `cbor:"V,omitempty" json:"VI,omitempty"`
 	ValueString string `cbor:"V,omitempty" json:"VS,omitempty"`
+	// ValueInt64 holds signed integers (L9). Locals-only like Array —
+	// contracts cannot STORE an Int (STORE takes scalars via uint64 path),
+	// so this never touches serialized SC state.
+	ValueInt64 int64 `cbor:"I,omitempty" json:"I,omitempty"`
+	// Array holds RAM-array elements (L3). Locals-only: contracts cannot
+	// STORE an array (STORE takes scalars), so this never touches the
+	// serialized SC state — consensus-neutral. Pointer keeps Variable
+	// comparable (it is used as a map key in RamStore/SC state).
+	Array *[]Variable `cbor:"A,omitempty" json:"A,omitempty"`
 }
 
 type Function struct {
@@ -163,6 +174,10 @@ func check_valid_type(name string) Vtype {
 		return Uint64
 	case "string":
 		return String
+	case "bool":
+		return Bool
+	case "int":
+		return Int
 	}
 	return Invalid
 }
@@ -295,6 +310,11 @@ func runSmartContract_internal(SC *SmartContract, EntryPoint string, state *Shar
 	dvm.SC = SC
 	dvm.f = function_call
 	dvm.Locals = map[string]Variable{}
+	// L6: built-in boolean constants TRUE/FALSE
+	dvm.Constants = map[string]Variable{
+		"TRUE":  {Name: "TRUE", Type: Bool, ValueUint64: 1},
+		"FALSE": {Name: "FALSE", Type: Bool, ValueUint64: 0},
+	}
 
 	dvm.State = state // set state to execute current function
 
@@ -315,6 +335,14 @@ func runSmartContract_internal(SC *SmartContract, EntryPoint string, state *Shar
 			}
 		case String:
 			variable.ValueString = value.(string)
+		case Bool:
+			if variable.ValueUint64, err = strconv.ParseUint(value.(string), 0, 64); err != nil {
+				return
+			}
+		case Int:
+			if variable.ValueInt64, err = strconv.ParseInt(value.(string), 0, 64); err != nil {
+				return
+			}
 
 		default:
 			panic("unknown parameter type cannot have parameters")
@@ -473,6 +501,20 @@ type DVM_Interpreter struct {
 
 	store *TX_Storage // mechanism to access a data store, can discard changes
 
+	// Loops is the structured-control-flow frame stack (FOR/WHILE/block-IF).
+	// L1 feature, gated on DVM version >= 10.0.0 (control_flow.go).
+	Loops []LoopFrame
+
+	// CallStack holds GOSUB return addresses (L2 subroutines). Each entry
+	// is the line AFTER the GOSUB line; RETURN pops it when non-empty and
+	// jumps there (subroutine return), else behaves as a function return.
+	// Gated on DVM version >= 10.0.0 (control_flow.go).
+	CallStack []uint64
+
+	// Constants holds CONST declarations (L7): name -> value. Immutable —
+	// LET on a constant is rejected. Locals-only, consensus-neutral.
+	Constants map[string]Variable
+
 }
 
 func (i *DVM_Interpreter) incrementIP(newip uint64) (line []string, err error) {
@@ -548,6 +590,24 @@ func (i *DVM_Interpreter) interpret_SmartContract() (err error) {
 			newIP, err = i.interpret_IF(line[1:])
 		case strings.EqualFold(line[0], "RETURN"):
 			newIP, err = i.interpret_RETURN(line[1:])
+
+		// L1/L2 structured control flow (gated on DVM >= 10.0.0)
+		case strings.EqualFold(line[0], "GOSUB"):
+			newIP, err = i.interpret_GOSUB(line[1:])
+		case strings.EqualFold(line[0], "CONST"):
+			newIP, err = i.interpret_CONST(line[1:])
+		case strings.EqualFold(line[0], "FOR"):
+			newIP, err = i.interpret_FOR(line[1:])
+		case strings.EqualFold(line[0], "NEXT"):
+			newIP, err = i.interpret_NEXT(line[1:])
+		case strings.EqualFold(line[0], "WHILE"):
+			newIP, err = i.interpret_WHILE(line[1:])
+		case strings.EqualFold(line[0], "WEND"):
+			newIP, err = i.interpret_WEND(line[1:])
+		case strings.EqualFold(line[0], "ELSE"):
+			newIP, err = i.interpret_ELSE(line[1:])
+		case strings.EqualFold(line[0], "ENDIF"):
+			newIP, err = i.interpret_ENDIF(line[1:])
 
 		//ability to print something for debugging purpose
 		case strings.EqualFold(line[0], "PRINT"):
@@ -635,9 +695,61 @@ func (dvm *DVM_Interpreter) interpret_DIM(line []string) (newIP uint64, err erro
 	if data_type == Invalid {
 		return 0, fmt.Errorf("function name \"%s\", No such Data type \"%s\"", dvm.f.Name, line[len(line)-1])
 	}
+	// L6: Bool type is gated on DVM >= 10.0.0
+	if data_type == Bool {
+		if err := dvm.gateControlFlow("Bool"); err != nil {
+			return 0, err
+		}
+	}
+	// L9: Int type is gated on DVM >= 10.0.0
+	if data_type == Int {
+		if err := dvm.gateControlFlow("Int"); err != nil {
+			return 0, err
+		}
+	}
+	// Bool as a function return type is also gated — check at parse of the
+	// Function signature (this is the DIM-time check; function signatures
+	// are validated by check_valid_type at parse, so a Bool return in an
+	// old-version contract is caught at the first Bool DIM/LET use).
 
 	for i := 0; i < len(line)-2; i++ {
 		if line[i] != "," { // ignore separators
+
+			// L3: array form — DIM a ( n ) AS type  (or DIM a(5))
+			if i+2 < len(line) && line[i+1] == "(" {
+				if err = dvm.gateControlFlow("DIM arrays"); err != nil {
+					return
+				}
+				// find the matching ")"
+				j := i + 2
+				for j < len(line) && line[j] != ")" {
+					j++
+				}
+				if j >= len(line) {
+					return 0, fmt.Errorf("Invalid DIM array syntax: missing ')'")
+				}
+				size, e := strconv.ParseUint(line[i+2], 0, 64)
+				if e != nil {
+					return 0, fmt.Errorf("Invalid DIM array size %q", line[i+2])
+				}
+				if size > 1024 {
+					return 0, fmt.Errorf("DIM array size %d exceeds limit 1024", size)
+				}
+				if !check_valid_name(line[i]) {
+					return 0, fmt.Errorf("function name \"%s\", variable name \"%s\" contains invalid characters", dvm.f.Name, line[i])
+				}
+				if _, ok := dvm.Locals[line[i]]; ok {
+					return 0, fmt.Errorf("function name \"%s\", variable name \"%s\" already defined", dvm.f.Name, line[i])
+				}
+				arr := make([]Variable, size+1) // indices 0..size
+				for k := range arr {
+					arr[k] = Variable{Name: line[i], Type: data_type}
+				}
+				arrp := arr
+				dvm.Locals[line[i]] = Variable{Name: line[i], Type: data_type, Array: &arrp}
+				i = j // skip the size tokens
+				continue
+			}
 
 			if !check_valid_name(line[i]) {
 				return 0, fmt.Errorf("function name \"%s\", variable name \"%s\" contains invalid characters", dvm.f.Name, line[i])
@@ -655,6 +767,10 @@ func (dvm *DVM_Interpreter) interpret_DIM(line []string) (newIP uint64, err erro
 				dvm.Locals[line[i]] = Variable{Name: line[i], Type: Uint64, ValueUint64: uint64(0)}
 			case String:
 				dvm.Locals[line[i]] = Variable{Name: line[i], Type: String, ValueString: ""}
+			case Bool:
+				dvm.Locals[line[i]] = Variable{Name: line[i], Type: Bool, ValueUint64: uint64(0)}
+			case Int:
+				dvm.Locals[line[i]] = Variable{Name: line[i], Type: Int, ValueInt64: int64(0)}
 
 			default:
 				panic("Unhandled data_type")
@@ -670,6 +786,77 @@ func (dvm *DVM_Interpreter) interpret_DIM(line []string) (newIP uint64, err erro
 // process LET statement
 func (dvm *DVM_Interpreter) interpret_LET(line []string) (newIP uint64, err error) {
 
+	// L3: array-element assignment — LET a [ idx ] = expr
+	if len(line) >= 4 && line[1] == "[" {
+		// find the closing "]"
+		j := 2
+		for j < len(line) && line[j] != "]" {
+			j++
+		}
+		if j+1 >= len(line) || !strings.EqualFold(line[j+1], "=") {
+			return 0, fmt.Errorf("Invalid LET array syntax: LET a[idx] = expr")
+		}
+		if err = dvm.gateControlFlow("array assignment"); err != nil {
+			return
+		}
+		varName := line[0]
+		v, ok := dvm.Locals[varName]
+		if !ok || v.Array == nil {
+			return 0, fmt.Errorf("function name \"%s\", variable \"%s\" is not an array", dvm.f.Name, varName)
+		}
+		arr := *v.Array
+		// the index may be a literal or an expression (e.g. a loop variable)
+		idxExpr, perr := parser.ParseExpr(strings.Join(line[2:j], " "))
+		if perr != nil {
+			return 0, perr
+		}
+		idxVal := dvm.eval(idxExpr)
+		idx, ok := idxVal.(uint64)
+		if !ok {
+			return 0, fmt.Errorf("array index must be Uint64, got %T", idxVal)
+		}
+		if idx >= uint64(len(arr)) {
+			return 0, fmt.Errorf("array index %d out of bounds (len %d)", idx, len(arr))
+		}
+		expr, perr := parser.ParseExpr(strings.Join(line[j+2:], " "))
+		if perr != nil {
+			return 0, perr
+		}
+		expr_result := dvm.eval(expr)
+		switch arr[idx].Type {
+		case Uint64:
+			val, ok := expr_result.(uint64)
+			if !ok {
+				return 0, fmt.Errorf("array element is Uint64, expression is %T", expr_result)
+			}
+			arr[idx].ValueUint64 = val
+		case String:
+			val, ok := expr_result.(string)
+			if !ok {
+				return 0, fmt.Errorf("array element is String, expression is %T", expr_result)
+			}
+			arr[idx].ValueString = val
+		case Bool:
+			val, ok := expr_result.(uint64)
+			if !ok {
+				return 0, fmt.Errorf("array element is Bool, expression is %T", expr_result)
+			}
+			arr[idx].ValueUint64 = val
+		case Int:
+			if iv, ok := expr_result.(int64); ok {
+				arr[idx].ValueInt64 = iv
+			} else if uv, ok := expr_result.(uint64); ok {
+				arr[idx].ValueInt64 = int64(uv)
+			} else {
+				return 0, fmt.Errorf("array element is Int, expression is %T", expr_result)
+			}
+		default:
+			panic("Unhandled data_type")
+		}
+		dvm.Locals[varName] = v
+		return
+	}
+
 	if len(line) <= 2 || !strings.EqualFold(line[1], "=") {
 		err = fmt.Errorf("Invalid LET syntax")
 		return
@@ -677,6 +864,10 @@ func (dvm *DVM_Interpreter) interpret_LET(line []string) (newIP uint64, err erro
 
 	if _, ok := dvm.Locals[line[0]]; !ok {
 		err = fmt.Errorf("function name \"%s\", variable name \"%s\"  is used without definition", dvm.f.Name, line[0])
+		return
+	}
+	if _, isConst := dvm.resolveConst(line[0]); isConst {
+		err = fmt.Errorf("function name \"%s\", constant \"%s\" is immutable (CONST)", dvm.f.Name, line[0])
 		return
 	}
 	result := dvm.Locals[line[0]]
@@ -695,6 +886,19 @@ func (dvm *DVM_Interpreter) interpret_LET(line []string) (newIP uint64, err erro
 		result.ValueUint64 = expr_result.(uint64)
 	case String:
 		result.ValueString = expr_result.(string)
+	case Bool:
+		// a Bool variable accepts any uint64 expression (0/1)
+		result.ValueUint64 = expr_result.(uint64)
+	case Int:
+		// an Int variable accepts any int64 expression; uint64 values
+		// reinterpret two's-complement
+		if iv, ok := expr_result.(int64); ok {
+			result.ValueInt64 = iv
+		} else if uv, ok := expr_result.(uint64); ok {
+			result.ValueInt64 = int64(uv)
+		} else {
+			panic(fmt.Sprintf("Int variable cannot hold %T", expr_result))
+		}
 
 	default:
 		panic("Unhandled data_type")
@@ -730,6 +934,41 @@ func (dvm *DVM_Interpreter) interpret_GOTO(line []string) (newIP uint64, err err
 // IF expr THEN GOTO x
 // IF expr THEN GOTO x ELSE GOTO y
 func (dvm *DVM_Interpreter) interpret_IF(line []string) (newIP uint64, err error) {
+
+	// block form: IF expr THEN  (no GOTO) — body until ELSE/ENDIF
+	// L1 feature, gated on DVM >= 10.0.0.
+	if len(line) >= 2 && strings.EqualFold(line[len(line)-1], "THEN") && !lineHasToken(line[:len(line)-1], "GOTO") {
+		if err = dvm.gateControlFlow("IF"); err != nil {
+			return
+		}
+		val, e := dvm.evalUint64(strings.Join(line[:len(line)-1], " "))
+		if e != nil {
+			return 0, fmt.Errorf("IF expr: %v", e)
+		}
+		if val != 0 {
+			// condition true — push frame, fall through into the then-block
+			dvm.Loops = append(dvm.Loops, LoopFrame{Kind: "IF", StartIP: dvm.IP})
+			return 0, nil
+		}
+		// condition false — find matching ELSE or ENDIF and skip past it
+		endif, e := dvm.findMatchingLine(dvm.IP, "IF", "ENDIF")
+		if e != nil {
+			return 0, e
+		}
+		// if there's an ELSE for this IF, skip to after it; else skip past ENDIF
+		idx, _ := dvm.f.LinesNumberIndex[dvm.IP]
+		for j := int(idx) + 1; j < len(dvm.f.LineNumbers); j++ {
+			ln := dvm.f.LineNumbers[j]
+			lnLine := dvm.f.Lines[ln]
+			if len(lnLine) > 0 && strings.EqualFold(lnLine[0], "ELSE") && ln < endif {
+				return dvm.nextLineAfter(ln), nil
+			}
+			if ln == endif {
+				break
+			}
+		}
+		return dvm.nextLineAfter(endif), nil
+	}
 
 	thenip := uint64(0)
 	elseip := uint64(0)
@@ -796,6 +1035,16 @@ func (dvm *DVM_Interpreter) interpret_IF(line []string) (newIP uint64, err error
 // process RETURN line
 func (dvm *DVM_Interpreter) interpret_RETURN(line []string) (newIP uint64, err error) {
 
+	// L2: subroutine return — if we're inside a GOSUB (CallStack non-empty),
+	// pop the return address and jump there. The RETURN value is ignored
+	// (subroutines communicate via shared Locals). Gated like GOSUB.
+	if len(dvm.CallStack) > 0 {
+		n := len(dvm.CallStack)
+		ret := dvm.CallStack[n-1]
+		dvm.CallStack = dvm.CallStack[:n-1]
+		return ret, nil
+	}
+
 	if dvm.ReturnValue.Type == Invalid {
 		if len(line) != 0 {
 			err = fmt.Errorf("function name \"%s\" cannot return anything", dvm.f.Name)
@@ -826,6 +1075,14 @@ func (dvm *DVM_Interpreter) interpret_RETURN(line []string) (newIP uint64, err e
 		dvm.ReturnValue.ValueUint64 = expr_result.(uint64)
 	case String:
 		dvm.ReturnValue.ValueString = expr_result.(string)
+	case Bool:
+		dvm.ReturnValue.ValueUint64 = expr_result.(uint64)
+	case Int:
+		if iv, ok := expr_result.(int64); ok {
+			dvm.ReturnValue.ValueInt64 = iv
+		} else {
+			dvm.ReturnValue.ValueInt64 = int64(expr_result.(uint64))
+		}
 
 	default:
 		panic("unexpected data type")
@@ -865,6 +1122,16 @@ func (dvm *DVM_Interpreter) eval(exp ast.Expr) interface{} {
 		switch exp.Op {
 		case token.XOR:
 			return ^(dvm.eval(exp.X).(uint64))
+		case token.SUB: // L9: unary minus — negative literals (-5)
+			x := dvm.eval(exp.X)
+			switch v := x.(type) {
+			case uint64:
+				return int64(-int64(v))
+			case int64:
+				return -v
+			default:
+				panic(fmt.Sprintf("unary minus on unsupported type %T", x))
+			}
 		case token.NOT:
 			x := dvm.eval(exp.X)
 			switch x := x.(type) {
@@ -881,7 +1148,53 @@ func (dvm *DVM_Interpreter) eval(exp ast.Expr) interface{} {
 
 	case *ast.BinaryExpr:
 		return dvm.evalBinaryExpr(exp)
+	case *ast.IndexExpr: // L3: array element read — a [ idx ]
+		name, ok := exp.X.(*ast.Ident)
+		if !ok {
+			panic(fmt.Sprintf("array index on non-identifier %+v", exp.X))
+		}
+		idxVal := dvm.eval(exp.Index)
+		idx, ok := idxVal.(uint64)
+		if !ok {
+			panic(fmt.Sprintf("array index must be Uint64, got %T", idxVal))
+		}
+		v, ok := dvm.Locals[name.Name]
+		if !ok || v.Array == nil {
+			panic(fmt.Sprintf("variable \"%s\" is not an array", name.Name))
+		}
+		arr := *v.Array
+		if idx >= uint64(len(arr)) {
+			panic(fmt.Sprintf("array index %d out of bounds (len %d)", idx, len(arr)))
+		}
+		el := arr[idx]
+		switch el.Type {
+		case Uint64:
+			return el.ValueUint64
+		case String:
+			return el.ValueString
+		case Bool:
+			return el.ValueUint64
+		case Int:
+			return el.ValueInt64
+		default:
+			panic("unexpected data type")
+		}
 	case *ast.Ident: // it's a variable,
+		// L7: resolve constants first (immutable named values)
+		if cv, ok := dvm.resolveConst(exp.Name); ok {
+			switch cv.Type {
+			case Uint64:
+				return cv.ValueUint64
+			case String:
+				return cv.ValueString
+			case Bool:
+				return cv.ValueUint64
+			case Int:
+				return cv.ValueInt64
+			default:
+				panic("unexpected data type")
+			}
+		}
 		if _, ok := dvm.Locals[exp.Name]; !ok {
 			panic(fmt.Sprintf("function name \"%s\", variable name \"%s\"  is used without definition", dvm.f.Name, exp.Name))
 
@@ -893,6 +1206,10 @@ func (dvm *DVM_Interpreter) eval(exp ast.Expr) interface{} {
 			return dvm.Locals[exp.Name].ValueUint64
 		case String:
 			return dvm.Locals[exp.Name].ValueString
+		case Bool:
+			return dvm.Locals[exp.Name].ValueUint64
+		case Int:
+			return dvm.Locals[exp.Name].ValueInt64
 		default:
 			panic("unexpected data type")
 		}
@@ -924,6 +1241,10 @@ func (dvm *DVM_Interpreter) eval(exp ast.Expr) interface{} {
 				arguments[p.Name] = fmt.Sprintf("%d", dvm.eval(exp.Args[i]).(uint64))
 			case String:
 				arguments[p.Name] = dvm.eval(exp.Args[i]).(string)
+			case Bool:
+				arguments[p.Name] = fmt.Sprintf("%d", dvm.eval(exp.Args[i]).(uint64))
+			case Int:
+				arguments[p.Name] = fmt.Sprintf("%d", dvm.eval(exp.Args[i]).(int64))
 			}
 		}
 
@@ -1003,6 +1324,19 @@ func (dvm *DVM_Interpreter) evalBinaryExpr(exp *ast.BinaryExpr) interface{} {
 		return left.(string) + fmt.Sprintf("%d", right)
 	}
 
+	// L9: allow int64-vs-uint64 mixed operations — reinterpret the uint64
+	// side as int64 (two's complement) so signed arithmetic and comparisons
+	// work against plain literals (e.g. IntVar == 70).
+	if _, lok := left.(int64); lok {
+		if _, rok := right.(uint64); rok {
+			right = int64(right.(uint64))
+		}
+	} else if _, rok := right.(int64); rok {
+		if _, lok := left.(uint64); lok {
+			left = int64(left.(uint64))
+		}
+	}
+
 	if fmt.Sprintf("%T", left) != fmt.Sprintf("%T", right) {
 		panic(fmt.Sprintf("Expressions cannot be different type(String/Uint64) left (val %+v %+v)   right (%+v %+v)", left, exp.X, right, exp.Y))
 	}
@@ -1048,6 +1382,95 @@ func (dvm *DVM_Interpreter) evalBinaryExpr(exp *ast.BinaryExpr) interface{} {
 		default:
 			panic(fmt.Sprintf("String data type only support addition operation ('%s') not supported", exp.Op))
 		}
+	}
+
+	// L9: signed arithmetic — if either operand is int64, do the whole
+	// operation in int64 (negative literals, signed deltas).
+	if l64, lok := left.(int64); lok {
+		r64, rok := right.(int64)
+		if !rok {
+			// int64 op uint64: reinterpret the uint64 as int64
+			r64 = int64(right.(uint64))
+		}
+		switch exp.Op {
+		case token.ADD:
+			// overflow check: (a+b) overflows iff the sign of the result
+			// differs from both operands
+			if (r64 > 0 && l64 > int64(math.MaxInt64)-r64) || (r64 < 0 && l64 < int64(math.MinInt64)-r64) {
+				panic("int64 overflow on ADD")
+			}
+			return l64 + r64
+		case token.SUB:
+			if (r64 < 0 && l64 > int64(math.MaxInt64)+r64) || (r64 > 0 && l64 < int64(math.MinInt64)+r64) {
+				panic("int64 overflow on SUB")
+			}
+			return l64 - r64
+		case token.MUL:
+			if l64 != 0 && r64 != 0 {
+				if l64 == int64(math.MinInt64) && r64 == -1 {
+					panic("int64 overflow on MUL")
+				}
+				p := l64 * r64
+				if p/r64 != l64 {
+					panic("int64 overflow on MUL")
+				}
+				return p
+			}
+			return l64 * r64
+		case token.QUO:
+			if r64 == 0 {
+				panic("division by zero")
+			}
+			if l64 == int64(math.MinInt64) && r64 == -1 {
+				panic("int64 division overflow (MinInt64 / -1)")
+			}
+			return l64 / r64
+		case token.REM:
+			if r64 == 0 {
+				panic("division by zero")
+			}
+			if l64 == int64(math.MinInt64) && r64 == -1 {
+				return int64(0) // Go: MinInt64 % -1 == 0 (matches the math)
+			}
+			return l64 % r64
+		case token.EQL:
+			if l64 == r64 {
+				return uint64(1)
+			}
+			return uint64(0)
+		case token.NEQ:
+			if l64 != r64 {
+				return uint64(1)
+			}
+			return uint64(0)
+		case token.LEQ:
+			if l64 <= r64 {
+				return uint64(1)
+			}
+			return uint64(0)
+		case token.GEQ:
+			if l64 >= r64 {
+				return uint64(1)
+			}
+			return uint64(0)
+		case token.LSS:
+			if l64 < r64 {
+				return uint64(1)
+			}
+			return uint64(0)
+		case token.GTR:
+			if l64 > r64 {
+				return uint64(1)
+			}
+			return uint64(0)
+		default:
+			panic(fmt.Sprintf("signed op %s not supported", exp.Op))
+		}
+	}
+	if _, ok := right.(int64); ok {
+		// uint64 op int64: convert left to int64 and recurse via the same
+		// path (left is uint64; convert and run the int64 block)
+		return dvm.evalBinaryExpr(&ast.BinaryExpr{X: &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", int64(left.(uint64)))}, Op: exp.Op, Y: exp.Y})
 	}
 
 	left_uint64 := left.(uint64)
