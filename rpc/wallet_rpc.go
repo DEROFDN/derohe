@@ -233,6 +233,10 @@ type (
 	}
 	Transfer_Result struct {
 		TXID string `json:"txid,omitempty"`
+		// PrivacyWarning surfaces the K0 ringsize-2 warning (if any) raised
+		// while building this tx. Programmatic callers should display it and
+		// consider whether to proceed with a tx that exposes the signer.
+		PrivacyWarning string `json:"privacy_warning,omitempty"`
 	}
 )
 

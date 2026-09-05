@@ -20,6 +20,7 @@ package dvm
 
 import "fmt"
 import "bytes"
+import "strings"
 import "runtime/debug"
 import "encoding/binary"
 import "github.com/deroproject/derohe/cryptography/crypto"
@@ -35,8 +36,46 @@ import "github.com/deroproject/graviton"
 // 1 OPEN
 // 2 PRIVATE
 type SC_META_DATA struct {
-	Type     byte        // 0  Open, 1 Private
+	Type     byte        // 0  Open, 1 Private (low bit); bit 7 (0x80) = NoSigner (K0 Fix B2)
 	DataHash crypto.Hash // hash of SC data tree is here, so as the meta tree verifies all  SC DATA
+}
+
+// K0 Fix B2 (spec k0-fix-design.md): the NoSigner bit lives in the high bit
+// of the existing Type byte — the 33-byte wire format is UNCHANGED, so
+// existing on-chain metadata stays valid and existing contracts default to
+// uses_signer=true (behavior preserved). A contract marked NoSigner never
+// calls SIGNER(), so a ringsize-2 SC_TX to it is rejected at consensus.
+const (
+	SC_META_TYPE_PRIVATE = 0x01 // low bit: private (InitializePrivate)
+	SC_META_NOSIGNER     = 0x80 // high bit: contract never calls SIGNER() (B2)
+)
+
+// IsPrivate reports whether the contract is a private (InitializePrivate) SC,
+// masking out the B2 NoSigner bit so the two flags coexist in one byte.
+func (meta SC_META_DATA) IsPrivate() bool { return meta.Type&SC_META_TYPE_PRIVATE != 0 }
+
+// NoSigner reports whether the contract never calls SIGNER() (K0 Fix B2).
+func (meta SC_META_DATA) NoSigner() bool { return meta.Type&SC_META_NOSIGNER != 0 }
+
+// SetNoSigner marks the contract as not calling SIGNER() (K0 Fix B2).
+func (meta *SC_META_DATA) SetNoSigner() { meta.Type |= SC_META_NOSIGNER }
+
+// ContractUsesSigner scans a parsed contract's function bodies for any
+// SIGNER() call. DVM function dispatch is case-insensitive (the func_table
+// lookup lowercases, dvm_functions.go Handle_Internal_Function), so the
+// scan matches the token case-insensitively across every line of every
+// function. If SIGNER() appears anywhere, the contract needs ringsize 2.
+func ContractUsesSigner(sc SmartContract) bool {
+	for _, fn := range sc.Functions {
+		for _, line := range fn.Lines {
+			for _, tok := range line {
+				if strings.EqualFold(tok, "SIGNER") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // serialize the structure
