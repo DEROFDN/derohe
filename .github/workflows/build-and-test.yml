@@ -1,0 +1,40 @@
+name: build-and-test
+
+on:
+  push:
+    branches: [community-dev, main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.25"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      # NOTE: the tree needs -mod=mod because the released vendor/ tree is
+      # incomplete (no vendor/modules.txt) and go.mod pins the jrpc2/readline
+      # versions that actually provide the APIs the code uses.
+      - name: Build
+        run: |
+          go build ./...
+
+      - name: Run DVM intrinsic tests
+        run: |
+          go test ./dvm/ -run 'TestVerifySig|TestHashToPoint|TestPedersenCommit|TestAssetBalance|TestEcAdd' -v
+
+      - name: Run K0 tests
+        run: |
+          go test ./blockchain/ -run 'TestK0' -v
+          go test ./walletapi/ -run 'TestK0' -v
+
+      - name: Run conformance suite
+        run: |
+          go test ./tests/vectors/ -run 'TestConformance|TestG2P0|TestK0' -v
