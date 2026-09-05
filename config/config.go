@@ -60,6 +60,14 @@ const MAX_RINGSIZE = 128 // <= 128,  ringsize will be accepted
 
 const PREMINE uint64 = 1228125400000 // this is total supply of old chain ( considering both chain will be running together for some time)
 
+// MAX_SUPPLY is DERO's hard supply cap (atomic units). 21M DERO, the
+// Bitcoin-parallel narrative cap. The actual emission curve (CalcSupply)
+// converges to ~20.89M DERO, so this is a ceiling ~0.5% above the terminal
+// supply — enforced at coinbase verification as an invariant that catches
+// any regression in the reward curve (overflow, bad >>
+// shift, accidental BaseReward inflation).
+const MAX_SUPPLY uint64 = 21_000_000 * 100_000 // 2,100,000,000,000 atomic
+
 type SettingsStruct struct {
 	MAINNET_BOOTSTRAP_DIFFICULTY uint64 `env:"MAINNET_BOOTSTRAP_DIFFICULTY" envDefault:"10000000"` // mainnet bootstrap is 10 MH/s
 	MAINNET_MINIMUM_DIFFICULTY   uint64 `env:"MAINNET_MINIMUM_DIFFICULTY" envDefault:"100000"`     // mainnet minimum is 100 KH/s

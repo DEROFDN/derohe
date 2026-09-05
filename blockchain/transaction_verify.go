@@ -65,6 +65,15 @@ func (chain *Blockchain) Verify_Transaction_Coinbase(cbl *block.Complete_Block, 
 		return fmt.Errorf("tx is not coinbase")
 	}
 
+	// supply hard-cap invariant: assert the cumulative emitted supply at
+	// this height never exceeds the 21M-DERO cap. CalcSupply is a pure
+	// function of height recomputed identically by every node; the emission
+	// curve converges to ~20.89M DERO, so this only trips if the reward
+	// curve regresses (a bug in CalcBlockReward / BaseReward / PREMINE).
+	if supply := CalcSupply(cbl.Bl.Height); supply > config.MAX_SUPPLY {
+		return fmt.Errorf("coinbase supply %d exceeds hard cap %d atomic at height %d — emission curve regression", supply, config.MAX_SUPPLY, cbl.Bl.Height)
+	}
+
 	return nil // success comes last
 }
 
