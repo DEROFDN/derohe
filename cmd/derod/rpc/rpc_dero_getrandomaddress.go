@@ -19,6 +19,7 @@ package rpc
 import "fmt"
 import "bytes"
 import "context"
+import "encoding/hex"
 import "runtime/debug"
 import "github.com/deroproject/derohe/config"
 import "github.com/deroproject/derohe/globals"
@@ -142,5 +143,144 @@ func GetRandomAddress(ctx context.Context, p rpc.GetRandomAddress_Params) (resul
 	result.Address = cursor_list
 	result.Status = "OK"
 
+	return result, nil
+}
+
+// GetRandomAddressBatch returns a batch of REAL registered accounts with
+// their encrypted balances, sampled from the balance tree. The K1/K2 fix:
+//   - K1: the 5-block active-account filter is REMOVED — decoys are drawn
+//     from the full registered set including recently-active accounts, so
+//     "recently touched" is no longer a predictor of sender/receiver.
+//     A weak floor (exclude only the CURRENT block's touched set) remains
+//     optional and cannot act as a discriminator.
+//   - K2: the encrypted balance is returned WITH the candidate, so the
+//     wallet never issues per-candidate GetEncryptedBalance calls (which
+//     leaked the ring to the daemon in the clear).
+//
+// The wallet picks the final ring client-side with its own CSPRNG, so the
+// daemon's posterior over the true ring after serving a batch of size B
+// for a ring of size R is 1/C(B,R) — its information advantage is
+// destroyed.
+//
+// No consensus change — wallet<->daemon protocol only.
+func GetRandomAddressBatch(ctx context.Context, p rpc.GetRandomAddressBatch_Params) (result rpc.GetRandomAddressBatch_Result, err error) {
+	defer func() { // safety so if anything wrong happens, we return error
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic occured. stack trace %s", debug.Stack())
+		}
+	}()
+
+	// cap the batch size; 512 is more than enough (rings cap at 128)
+	count := p.Count
+	if count <= 0 || count > 512 {
+		count = 512
+	}
+
+	topoheight := chain.Load_TOPO_HEIGHT()
+	result.TopoHeight = uint64(topoheight)
+
+	toporecord, err := chain.Store.Topo_store.Read(topoheight)
+	if err != nil {
+		panic(err)
+	}
+
+	ss, err := chain.Store.Balance_store.LoadSnapshot(toporecord.State_Version)
+	if err != nil {
+		panic(err)
+	}
+
+	// if the wallet pinned a state version, use it; else the current tip
+	var balance_tree interface {
+		Random() ([]byte, []byte, error)
+		Get(key []byte) ([]byte, error)
+	}
+	if p.StateVersion != 0 {
+		ss_pinned, err := chain.Store.Balance_store.LoadSnapshot(p.StateVersion)
+		if err != nil {
+			return result, fmt.Errorf("GetRandomAddressBatch: cannot load pinned state version %d: %w", p.StateVersion, err)
+		}
+		ss = ss_pinned
+		result.StateVersion = p.StateVersion
+	} else {
+		result.StateVersion = toporecord.State_Version
+	}
+
+	treename := config.BALANCE_TREE
+	if !p.SCID.IsZero() {
+		treename = string(p.SCID[:])
+	}
+
+	bt, err := ss.GetTree(treename)
+	if err != nil {
+		panic(err)
+	}
+	balance_tree = bt
+
+	// weak floor: if requested, exclude accounts touched in the CURRENT
+	// block only (topoheight-1), NOT the last 5. Too small a window to
+	// build a posterior against.
+	var bt_prev interface {
+		Get(key []byte) ([]byte, error)
+	}
+	if p.ExcludeRecentBlock && topoheight > 1 {
+		toporecord_prev, err := chain.Store.Topo_store.Read(topoheight - 1)
+		if err == nil {
+			ss_prev, err := chain.Store.Balance_store.LoadSnapshot(toporecord_prev.State_Version)
+			if err == nil {
+				if t, err := ss_prev.GetTree(treename); err == nil {
+					bt_prev = t
+				}
+			}
+		}
+	}
+
+	seen := map[string]bool{}
+	result.Candidates = make([]rpc.GetRandomAddressBatch_Candidate, 0, count)
+
+	// sample generously (3x) because some draws collide or fail to decode
+	for i := 0; i < count*3 && len(result.Candidates) < count; i++ {
+		k, v, err := balance_tree.Random()
+		if err != nil {
+			continue
+		}
+
+		// weak floor: skip only current-block-touched accounts
+		if bt_prev != nil {
+			v_prev, err := bt_prev.Get(k)
+			if err != nil {
+				continue
+			}
+			if bytes.Compare(v, v_prev) != 0 {
+				continue
+			}
+		}
+
+		var acckey crypto.Point
+		if err := acckey.DecodeCompressed(k[:]); err != nil {
+			continue
+		}
+		if len(v) == 0 { // no balance record — not a real account (ghost)
+			continue
+		}
+
+		addr := rpc.NewAddressFromKeys(&acckey)
+		addr.Mainnet = true
+		if globals.Config.Name != config.Mainnet.Name { // anything other than mainnet is testnet at this point in time
+			addr.Mainnet = false
+		}
+		addrstr := addr.String()
+		if seen[addrstr] {
+			continue
+		}
+		seen[addrstr] = true
+
+		result.Candidates = append(result.Candidates, rpc.GetRandomAddressBatch_Candidate{
+			Address:          addrstr,
+			Registered:       true,
+			EncryptedBalance: hex.EncodeToString(v),
+		})
+	}
+
+	result.Status = "OK"
 	return result, nil
 }

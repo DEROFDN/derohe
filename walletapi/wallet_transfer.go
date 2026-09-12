@@ -17,8 +17,10 @@
 package walletapi
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 
 	"github.com/deroproject/derohe/config"
 	"github.com/deroproject/derohe/cryptography/bn256"
@@ -340,40 +342,96 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 		deduplicator[w.GetAddress().String()] = true
 
 		for ringsize != 2 {
-			probable_members := w.Random_ring_members(transfers[t].SCID)
-			if len(probable_members) <= 40 { // we do not have enough ring members for sure, extract ring members from base
-				var zeroscid crypto.Hash
-				probable_members = w.Random_ring_members(zeroscid)
+			// K1/K2 fix: fetch the batch ONCE (with embedded encrypted
+			// balances) — no per-candidate GetEncryptedBalance queries that
+			// leaked the ring to the daemon in the clear. Select the ring
+			// client-side with our own CSPRNG so the daemon's posterior over
+			// the ring is 1/C(B,R).
+			var candidates []rpc.GetRandomAddressBatch_Candidate
+			candidates, err = w.Random_ring_members_batch(transfers[t].SCID, 512)
+			if err != nil || len(candidates) < int(ringsize) {
+				// fall back to the legacy path (best effort) rather than
+				// blocking the tx entirely on a daemon without the new RPC
+				probable_members := w.Random_ring_members(transfers[t].SCID)
+				if len(probable_members) <= 40 { // we do not have enough ring members for sure, extract ring members from base
+					var zeroscid crypto.Hash
+					probable_members = w.Random_ring_members(zeroscid)
+				}
+				for _, k := range probable_members {
+					if _, collision := deduplicator[k]; collision {
+						continue
+					}
+					deduplicator[k] = true
+					if len(ring_balances) < int(ringsize) && k != receiver_without_payment_id.String() && k != w.GetAddress().String() {
+						var addr_member *rpc.Address
+						var ebal *crypto.ElGamal
+
+						bits_needed[len(ring_balances)], _, _, ebal, err = w.GetEncryptedBalanceAtTopoHeight(transfers[t].SCID, -1, k)
+						if err != nil {
+							fmt.Printf(" unregistered %s\n", k)
+							return
+						}
+						if addr_member, err = rpc.NewAddress(k); err != nil {
+							return
+						}
+
+						ring_balances = append(ring_balances, ebal.Serialize())
+						ring = append(ring, addr_member.PublicKey.G1())
+
+						if len(ring_balances) == int(ringsize) {
+							goto ring_members_collected
+						}
+					}
+				}
 			}
-			for _, k := range probable_members {
-				if _, collision := deduplicator[k]; collision {
+
+			// client-side CSPRNG selection over the verified batch
+			for len(ring_balances) < int(ringsize) && len(candidates) > 0 {
+				// Fisher-Yates style draw without replacement using the
+				// wallet's own CSPRNG (crypto/rand) — the daemon cannot
+				// predict which candidates become the ring.
+				idx, rerr := rand.Int(rand.Reader, big.NewInt(int64(len(candidates))))
+				if rerr != nil {
+					break
+				}
+				i := int(idx.Int64())
+				c := candidates[i]
+				candidates[i] = candidates[len(candidates)-1]
+				candidates = candidates[:len(candidates)-1]
+
+				if _, collision := deduplicator[c.Address]; collision {
 					continue
 				}
-				deduplicator[k] = true
-				if len(ring_balances) < int(ringsize) && k != receiver_without_payment_id.String() && k != w.GetAddress().String() {
-					var addr_member *rpc.Address
-					//fmt.Printf("t:%d len %d %s     receiver %s   sender %s\n",t,len(ring_balances),  k, receiver_without_payment_id.String(), w.GetAddress().String())
-					var ebal *crypto.ElGamal
+				deduplicator[c.Address] = true
 
-					bits_needed[len(ring_balances)], _, _, ebal, err = w.GetEncryptedBalanceAtTopoHeight(transfers[t].SCID, -1, k)
-					if err != nil {
-						fmt.Printf(" unregistered %s\n", k)
-						return
-					}
-					if addr_member, err = rpc.NewAddress(k); err != nil {
-						return
-					}
-
-					ring_balances = append(ring_balances, ebal.Serialize())
-					ring = append(ring, addr_member.PublicKey.G1())
-
-					if len(ring_balances) == int(ringsize) {
-						goto ring_members_collected
-					}
-
+				var addr_member *rpc.Address
+				if addr_member, err = rpc.NewAddress(c.Address); err != nil {
+					continue
 				}
+
+				// decode the embedded encrypted balance + nonce height
+				// (the tree value is NonceBalance: uvarint NonceHeight +
+				// 66B ElGamal — same format GetEncryptedBalance returns)
+				ebal_bytes, herr := hex.DecodeString(c.EncryptedBalance)
+				if herr != nil || len(ebal_bytes) < 67 {
+					continue
+				}
+				var nb crypto.NonceBalance
+				func() {
+					defer func() { recover() }() // Unmarshal panics on malformed input
+					nb.Unmarshal(ebal_bytes)
+				}()
+				if nb.Balance == nil {
+					continue
+				}
+
+				ring_balances = append(ring_balances, nb.Balance.Serialize())
+				ring = append(ring, addr_member.PublicKey.G1())
 			}
 
+			// if we still don't have enough, we tried everything — break to
+			// avoid an infinite loop
+			break
 		}
 	ring_members_collected:
 
