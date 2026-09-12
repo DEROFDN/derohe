@@ -450,19 +450,9 @@ func handle_set_command(l *readline.Instance, line string) {
 	help := false
 	switch command {
 	case "help":
-	case "ringsize":
-		if len(line_parts) != 3 {
-			logger.Info("Wrong number of arguments, see help eg", "")
-			help = true
-			break
-		}
-		s, err := strconv.ParseUint(line_parts[2], 10, 64)
-		if err != nil {
-			logger.Error(err, "Error parsing ringsize")
-			return
-		}
-		wallet.SetRingSize(int(s))
-		logger.Info("New Ring size", "ringsize", wallet.GetRingSize())
+	// ring size is configured in the Transaction Build Options menu (option 7), the
+	// single consistent place to define how a transfer's ring is built. The old
+	// `set ringsize` command was removed to avoid a second, colliding config path.
 
 	case "priority":
 		if len(line_parts) != 3 {
@@ -482,6 +472,10 @@ func handle_set_command(l *readline.Instance, line string) {
 		language := choose_seed_language(l)
 		logger.Info("Setting seed language", "language", wallet.SetSeedLanguage(language))
 
+	// extra sender privacy is configured in the Transaction Build Options menu (option 7),
+	// the single consistent place to define a transfer's ring build. The old
+	// `set anonymous` command was removed to avoid a second, colliding config path.
+
 	default:
 		help = true
 	}
@@ -490,12 +484,14 @@ func handle_set_command(l *readline.Instance, line string) {
 
 		fmt.Fprintf(l.Stderr(), color_extra_white+"Current settings"+color_extra_white+"\n")
 		fmt.Fprintf(l.Stderr(), color_normal+"Seed Language: "+color_extra_white+"%s\t"+color_normal+"eg. "+color_extra_white+"set seed language\n"+color_normal, wallet.GetSeedLanguage())
-		fmt.Fprintf(l.Stderr(), color_normal+"Ringsize: "+color_extra_white+"%d\t"+color_normal+"eg. "+color_extra_white+"set ringsize 16\n"+color_normal, wallet.GetRingSize())
+		fmt.Fprintf(l.Stderr(), color_normal+"Ring size: "+color_extra_white+"%d\t"+color_normal+"set in the "+color_extra_white+"Transaction Build Options"+color_normal+" menu (option 7)\n"+color_normal, wallet.GetRingSize())
 		fmt.Fprintf(l.Stderr(), color_normal+"Save Every : "+color_extra_white+"%s \t"+color_normal+"eg. "+color_extra_white+"default value:0 (set using command line)\n"+color_normal, wallet.SetSaveDuration(-1))
 		fmt.Fprintf(l.Stderr(), color_normal+"Track Recent Blocks : "+color_extra_white+"%d \t"+color_normal+"eg. "+color_extra_white+"default value:0 means track all blocks (set using command line)\n"+color_normal, wallet.SetTrackRecentBlocks(-1))
 
 		fmt.Fprintf(l.Stderr(), color_normal+"Priority: "+color_extra_white+"%0.2f\t"+color_normal+"eg. "+color_extra_white+"set priority 4.0\t"+color_normal+"Transaction priority on DERO network \n", wallet.GetFeeMultiplier())
 		fmt.Fprintf(l.Stderr(), "\t\tMinimum priority is 1.00. High priority = high fees\n")
+
+		fmt.Fprintf(l.Stderr(), color_normal+"Sender attribution: "+color_extra_white+"%s\t"+color_normal+"set in the "+color_extra_white+"Transaction Build Options"+color_normal+" menu (option 7). ANONYMOUS needs ring size >= 4.\n", attributionModeLabel(attribution_mode))
 
 	}
 }
@@ -1034,6 +1030,7 @@ var completer = readline.NewPrefixCompleter(
 		readline.PcItem("mixin"),
 		readline.PcItem("seed"),
 		readline.PcItem("priority"),
+		readline.PcItem("anonymous"),
 	),
 	readline.PcItem("show_transfers"),
 	readline.PcItem("spendkey"),
