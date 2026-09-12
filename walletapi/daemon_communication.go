@@ -470,7 +470,9 @@ func (w *Wallet_Memory) GetEncryptedBalanceAtTopoHeight(scid crypto.Hash, topohe
 	}
 
 	if topoheight == -1 && accountaddr == w.GetAddress().String() {
-		//fmt.Printf("topoheight %d accountaddr '%s' waddress '%s'\n ",topoheight,accountaddr,w.GetAddress().String())
+		// Override Height/Topoheight with daemon tip so sync indicator is accurate.
+		result.Height = result.DHeight
+		result.Topoheight = result.DTopoheight
 
 		w.setEncryptedBalanceresult(scid, result)
 		w.account.TopoHeight = result.Topoheight
