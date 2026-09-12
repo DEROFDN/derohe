@@ -985,6 +985,11 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
+										// GATE 0: this wallet authored the tx; entry.Sender is our OWN address,
+										// authenticated by construction. outgoingSenderVerifiedGate0 is the single
+										// tested source of truth for this verdict (always verified, any ring size).
+										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+										entry.SenderVerified = outgoingSenderVerifiedGate0()
 
 										entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
 										entry.Data = append(entry.Data, tx.Payloads[t].RPCPayload[:]...)
@@ -1010,6 +1015,11 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 										addr := rpc.NewAddressFromKeys((*crypto.Point)(w.account.Keys.Public.G1()))
 										addr.Mainnet = w.GetNetwork()
 										entry.Sender = addr.String()
+										// GATE 0: this wallet authored the tx; entry.Sender is our OWN address,
+										// authenticated by construction. outgoingSenderVerifiedGate0 is the single
+										// tested source of truth for this verdict (always verified, any ring size).
+										entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+										entry.SenderVerified = outgoingSenderVerifiedGate0()
 
 										entry.Payload = append(entry.Payload, payload[1:]...)
 										entry.Data = append(entry.Data, payload...)
@@ -1062,23 +1072,31 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 								//fmt.Printf("decoding encrypted payload %x\n",tx.Payloads[t].RPCPayload)
 								crypto.EncryptDecryptUserData(crypto.Keccak256(shared_key[:], w.GetAddress().PublicKey.EncodeCompressed()), tx.Payloads[t].RPCPayload)
 								//fmt.Printf("decoded plaintext payload %x\n",tx.Payloads[t].RPCPayload)
-								sender_idx := uint(tx.Payloads[t].RPCPayload[0])
-								// if ring size is 2, the other party is the sender so mark it so
-								if uint(tx.Payloads[t].Statement.RingSize) == 2 {
-									sender_idx = 0
-									if j == 0 {
-										sender_idx = 1
-									}
-								}
-
-								if sender_idx < uint(tx.Payloads[t].Statement.RingSize) { // off-by-one fix: valid indices are 0..RingSize-1
+								// GATE 0: resolveSenderGate0 is the single tested source of truth for the bounds
+								// guard (strict "<") and the fail-closed honesty flag (see gate0_sender_honesty.go).
+								sender_idx, resolved, verified := resolveSenderGate0(tx.Payloads[t].RPCPayload[0], uint(tx.Payloads[t].Statement.RingSize), j == 0)
+								if resolved {
 									addr := rpc.NewAddressFromKeys((*crypto.Point)(tx.Payloads[t].Statement.Publickeylist[sender_idx]))
 									addr.Mainnet = w.GetNetwork()
 									entry.Sender = addr.String()
 								}
+								entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+								entry.SenderVerified = verified
+
+								// sanitized copy of the decrypted payload for the exported entry fields.
+								// for an unverified attribution (ring > 2, where payload[0] is sender-chosen
+								// and unauthenticated) the leading attribution slot byte must NOT be exported:
+								// it re-derives the claimed sender via the public Publickeylist even after
+								// entry.Sender is blanked. So we blank entry.Sender AND zero payload[0] in the
+								// copy that feeds entry.Data. The verified case (ring 2, structural) is untouched.
+								exported_payload := tx.Payloads[t].RPCPayload
+								if !entry.SenderVerified {
+									entry.Sender = ""
+									exported_payload = append([]byte{0x00}, tx.Payloads[t].RPCPayload[1:]...)
+								}
 
 								entry.Payload = append(entry.Payload, tx.Payloads[t].RPCPayload[1:]...)
-								entry.Data = append(entry.Data, tx.Payloads[t].RPCPayload[:]...)
+								entry.Data = append(entry.Data, exported_payload...)
 
 								args, _ := entry.ProcessPayload()
 								_ = args
@@ -1101,23 +1119,31 @@ func (w *Wallet_Memory) synchistory_block(scid crypto.Hash, topo int64) (err err
 
 								crypto.EncryptDecryptUserData(crypto.Keccak256(shared_key[:], w.GetAddress().PublicKey.EncodeCompressed()), payload)
 
-								sender_idx := uint(payload[0])
-								// if ring size is 2, the other party is the sender so mark it so
-								if uint(tx.Payloads[t].Statement.RingSize) == 2 {
-									sender_idx = 0
-									if j == 0 {
-										sender_idx = 1
-									}
-								}
-
-								if sender_idx < uint(tx.Payloads[t].Statement.RingSize) { // off-by-one fix: valid indices are 0..RingSize-1
+								// GATE 0: resolveSenderGate0 is the single tested source of truth for the bounds
+								// guard (strict "<") and the fail-closed honesty flag (see gate0_sender_honesty.go).
+								sender_idx, resolved, verified := resolveSenderGate0(payload[0], uint(tx.Payloads[t].Statement.RingSize), j == 0)
+								if resolved {
 									addr := rpc.NewAddressFromKeys((*crypto.Point)(tx.Payloads[t].Statement.Publickeylist[sender_idx]))
 									addr.Mainnet = w.GetNetwork()
 									entry.Sender = addr.String()
 								}
+								entry.RingSize = uint64(tx.Payloads[t].Statement.RingSize)
+								entry.SenderVerified = verified
+
+								// sanitized copy of the decrypted payload for the exported entry fields.
+								// for an unverified attribution (ring > 2, where payload[0] is sender-chosen
+								// and unauthenticated) the leading attribution slot byte must NOT be exported:
+								// it re-derives the claimed sender via the public Publickeylist even after
+								// entry.Sender is blanked. So we blank entry.Sender AND zero payload[0] in the
+								// copy that feeds entry.Data. The verified case (ring 2, structural) is untouched.
+								exported_payload := payload
+								if !entry.SenderVerified {
+									entry.Sender = ""
+									exported_payload = append([]byte{0x00}, payload[1:]...)
+								}
 
 								entry.Payload = append(entry.Payload, payload[1:]...)
-								entry.Data = append(entry.Data, payload...)
+								entry.Data = append(entry.Data, exported_payload...)
 
 								args, _ := entry.ProcessPayload()
 								_ = args

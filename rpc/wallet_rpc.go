@@ -82,7 +82,33 @@ type Entry struct {
 	Payload_RPC  Arguments `json:"payload_rpc,omitempty"`
 
 	// these fields are only valid based on payload type  and if payload could be successfully parsed and will by default be equal to zero values
-	Sender          string `json:"sender"`
+	Sender string `json:"sender"`
+	// SenderVerified is true when entry.Sender can be trusted: either attribution is
+	// protocol-pinned (ring size 2, where the counterparty is necessarily the sender)
+	// or this wallet authored the transaction (an outgoing/self send, certain at any
+	// ring size). For an incoming ring size > 2 transfer the sender chose the
+	// unauthenticated attribution byte and entry.Sender MUST NOT be trusted.
+	//
+	// Renderer truth table (RingSize, SenderVerified, Sender):
+	//   ring 2 / true  / addr      -> trusted counterparty; show it
+	//   self   / true  / own addr  -> our own send; show it
+	//   ring>2 / false / ""        -> withheld (scrubbed); show "unknown (unverifiable, ring N)"
+	//   ring 0 / false / addr      -> pre-upgrade entry; served as-is (non-retroactive), show it
+	//   any    / false / "" + PayloadError != "" -> decode failed (distinct from a scrub)
+	//
+	// NON-RETROACTIVE: the scrub runs at DECODE time only. Entries persisted before the
+	// wallet upgraded keep their guessed Sender and unscrubbed Data[0], and are served
+	// as-is (Get_Transfers included) — the guarantee holds only for blocks decoded
+	// post-upgrade. The upgrade is one-way for the privacy property: pre-upgrade entries
+	// deserialize SenderVerified=false, RingSize=0 (zero values), which is
+	// indistinguishable from a scrub without re-decoding — so a migration MUST re-derive
+	// RingSize from chain data, never trust the persisted 0 (a read-path scrub keyed on
+	// these fields would wrongly blank the wallet's own verified sends).
+	SenderVerified bool `json:"sender_verified"`
+	// RingSize is the ring size of the payload this entry was decoded from. 0 means
+	// unknown — typically an entry persisted before the attribution upgrade — NOT a real
+	// ring; see the non-retroactive caveat on SenderVerified.
+	RingSize        uint64 `json:"ringsize"`
 	DestinationPort uint64 `json:"dstport"`
 	SourcePort      uint64 `json:"srcport"`
 }
@@ -108,7 +134,23 @@ func (e Entry) String() string {
 	if !e.Coinbase {
 		fmt.Fprintf(&b, "PayloadType :  %d\n", e.PayloadType)
 		if e.PayloadType == 0 {
-			fmt.Fprintf(&b, "Sender: %s\n", e.Sender)
+			// the Sender line follows the truth table on SenderVerified above: a scrubbed
+			// attribution must read as a deliberate refusal, distinct from a decode failure.
+			if e.SenderVerified {
+				fmt.Fprintf(&b, "Sender: %s\n", e.Sender)
+			} else if e.PayloadError != "" {
+				fmt.Fprintf(&b, "Sender: unknown (payload decode failed)\n")
+			} else if e.RingSize == 0 {
+				// Pre-upgrade / unknown-ring entry: no real ring was decoded (RingSize==0),
+				// so the non-retroactive rule applies — serve the persisted sender as-is
+				// rather than relabel legitimate history as unverifiable. This matches
+				// GetTransfers, which serves these entries unchanged.
+				fmt.Fprintf(&b, "Sender: %s\n", e.Sender)
+			} else {
+				// Genuine post-upgrade ring>2 decode with an unverified (sender-chosen)
+				// index: the sender was scrubbed at decode; render the deliberate refusal.
+				fmt.Fprintf(&b, "Sender: unknown (unverifiable, ring size %d)\n", e.RingSize)
+			}
 			if e.PayloadError == "" {
 				args, _ := e.ProcessPayload()
 				fmt.Fprintf(&b, "DestPort:  %016x\n", e.DestinationPort)
