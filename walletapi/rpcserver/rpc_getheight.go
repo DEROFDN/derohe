@@ -21,13 +21,15 @@ import (
 	"fmt"
 	"runtime/debug"
 
+	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/rpc"
 )
 
 func GetHeight(ctx context.Context) (result rpc.GetHeight_Result, err error) {
 	defer func() { // safety so if anything wrong happens, we return error
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic occured. stack trace %s", debug.Stack())
+			globals.Logger.V(1).Error(nil, "panic in RPC handler", "r", r, "stack", debug.Stack())
+			err = fmt.Errorf("internal error")
 		}
 	}()
 
