@@ -62,6 +62,7 @@ var Connected bool = false
 var daemon_height int64
 var daemon_topoheight int64
 var last_event_topoheight_tracked int64
+var rpcCallTimeout = 10 * time.Second // per-call timeout preventing hangs on dead connections
 
 // return daemon height
 func Get_Daemon_Height() int64 {
@@ -219,7 +220,9 @@ func (w *Wallet_Memory) sync_loop() {
 }
 
 func (cli *Client) Call(method string, params interface{}, result interface{}) error {
-	return cli.RPC.CallResult(context.Background(), method, params, result)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcCallTimeout)
+	defer cancel()
+	return cli.RPC.CallResult(ctx, method, params, result)
 }
 
 // returns whether wallet was online some time ago
