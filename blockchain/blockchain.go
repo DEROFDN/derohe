@@ -1488,8 +1488,17 @@ func (chain *Blockchain) Rewind_Chain(rewind_count int) (result bool) {
 		rewinded++
 	}
 
+	// where the chain lands is known before a single record is cleaned, so say
+	// so up front, otherwise every Clean() below leaves concurrent Count()
+	// callers walking the growing clean run.
+	settled_count, count_settled := chain.Store.Topo_store.SettleForClean(top_block_topo_index, rewinded)
+
 	for i := int64(0); i < rewinded; i++ {
 		chain.Store.Topo_store.Clean(top_block_topo_index - i)
+	}
+
+	if count_settled { // re-assert: a write from elsewhere may have invalidated it mid-loop
+		chain.Store.Topo_store.SetCount(settled_count)
 	}
 
 	chain.MiniBlocks.PurgeHeight(0xffffffffffffff) // purge all miniblocks upto this height
