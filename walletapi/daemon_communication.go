@@ -288,7 +288,7 @@ func (w *Wallet_Memory) Sync_Wallet_Memory_With_Daemon_internal(scid crypto.Hash
 				w.Lock()
 				w.account.Balance[scid] = b
 				w.Unlock()
-				w.SyncHistory(scid) // also update statement
+				go w.SyncHistory(scid) // also update statement (run in background to avoid blocking sync loop)
 			}
 
 			w.save_if_disk() // save wallet
