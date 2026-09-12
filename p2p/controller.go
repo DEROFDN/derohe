@@ -167,6 +167,7 @@ func P2P_Init(params map[string]interface{}) error {
 	globals.Cron.AddFunc("@every 10s", ping_loop)               // ping every one
 	globals.Cron.AddFunc("@every 10s", chunks_clean_up)         // clean chunks
 
+	probeClockOnce()        // loud startup NTP check before the background loop
 	go time_check_routine() // check whether server time is in sync using ntp
 
 	metrics.Set.NewGauge("p2p_peer_count", func() float64 { // set a new gauge
@@ -707,8 +708,8 @@ func process_outgoing_connection(conn net.Conn, tlsconn net.Conn, remote_addr ne
 // shutdown the p2p component
 func P2P_Shutdown() {
 	close(Exit_Event) // send signal to all connections to exit
-	save_peer_list() // save peer list
-	save_ban_list()  // save ban list
+	save_peer_list()  // save peer list
+	save_ban_list()   // save ban list
 
 	// TODO we  must wait for connections to kill themselves
 	logger.Info("P2P Shutdown")
