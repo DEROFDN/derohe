@@ -174,7 +174,7 @@ func (s *Simulator) common(w_sc_tree, w_sc_data_tree *Tree_Wrapper, scid crypto.
 		copy(signer[:], signer_addr.Compressed())
 	}
 
-	gascompute, gasstorage, err = Execute_sc_function(w_sc_tree, w_sc_data_tree, scid, bl_height, bl_topoheight, uint64(time.Now().Unix()), blid, scid, sc, entrypoint, 1, 0, signer, incoming_values, SCDATA, fees, simulator)
+	gascompute, gasstorage, err = Execute_sc_function(w_sc_tree, w_sc_data_tree, scid, bl_height, bl_topoheight, uint64(time.Now().Unix()), blid, scid, sc, entrypoint, 1, 0, signer, incoming_values, SCDATA, fees, simulator, s.cache, s.ss)
 	fmt.Printf("sc execution error %s\n", err)
 
 	// we must commit all the changes
