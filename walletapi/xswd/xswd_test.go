@@ -18,7 +18,7 @@ import (
 	"github.com/deroproject/derohe/walletapi"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
-	"github.com/ybbus/jsonrpc"
+	"github.com/ybbus/jsonrpc/v2"
 )
 
 // Test ApplicationData
