@@ -30,7 +30,8 @@ func GetBlock(ctx context.Context, p rpc.GetBlock_Params) (result rpc.GetBlock_R
 
 	defer func() { // safety so if anything wrong happens, we return error
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic occured. stack trace %s", debug.Stack())
+			logger.V(1).Error(nil, "panic in RPC handler", "r", r, "stack", debug.Stack())
+			err = fmt.Errorf("internal error")
 		}
 	}()
 

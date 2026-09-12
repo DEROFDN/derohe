@@ -26,7 +26,8 @@ import "github.com/deroproject/derohe/rpc"
 func GetLastBlockHeader(ctx context.Context) (result rpc.GetLastBlockHeader_Result, err error) {
 	defer func() { // safety so if anything wrong happens, we return error
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic occured. stack trace %s", debug.Stack())
+			logger.V(1).Error(nil, "panic in RPC handler", "r", r, "stack", debug.Stack())
+			err = fmt.Errorf("internal error")
 		}
 	}()
 	top_hash := chain.Get_Top_ID()
