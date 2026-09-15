@@ -418,6 +418,16 @@ type Shared_State struct {
 	GasStoreLimit   int64
 	GasStoreCheck   bool // storage gas, bail out as soon as limit is breached
 
+	CryptoBudgetUsed  int64 // weighted count of expensive EC/signature intrinsics
+	CryptoBudgetLimit int64
+	CryptoBudgetCheck bool // if true, bail out as soon as crypto budget is breached
+
+	// ChainVersion is the DVM feature version activated by the current chain
+	// hard fork (see ChainVersionFromHardFork). Combined with the contract's
+	// own declared version it gates opcode availability; a zero value means no
+	// chain gate is in force (off-chain/tooling execution).
+	ChainVersion semver.Version
+
 	Chain_inputs *Blockchain_Input // all blockchain info is available here
 
 	Assets          map[crypto.Hash]uint64       // all assets supplied with this tx, including DERO main asset

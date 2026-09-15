@@ -190,6 +190,7 @@ func Execute_sc_function(w_sc_tree *Tree_Wrapper, data_tree *Tree_Wrapper, scid 
 			TXID:          txid,
 			Signer:        string(signer[:]),
 		},
+		ChainVersion: ChainVersionFromHardFork(hard_fork_version_current),
 	}
 
 	tx_store.DiskLoader = diskloader // hook up loading from chain
@@ -239,6 +240,10 @@ func Execute_sc_function(w_sc_tree *Tree_Wrapper, data_tree *Tree_Wrapper, scid 
 	if state.GasComputeLimit > 0 {
 		state.GasComputeCheck = true
 	}
+
+	// the expensive EC/signature intrinsics are capped separately from compute
+	// gas, see crypto_budget.go for the measurements behind the weights
+	state.EnableCryptoBudget()
 
 	// gas consumed in parameters to avoid tx bloats
 	if gasstorage_incoming > 0 {
