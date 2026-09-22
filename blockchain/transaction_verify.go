@@ -198,6 +198,24 @@ func (chain *Blockchain) Verify_Transaction_NonCoinbase_CheckNonce_Tips(hf_versi
 	return nil
 }
 
+// k0RingSizeFloorReject implements the K0 Fix B1 decision rule (spec §9 K0,
+// k0-fix-design.md): from config.K0_MIN_RING4_HEIGHT onward, NORMAL/BURN
+// txs with ringsize < 4 are rejected. Ringsize 2 exposes the signer by
+// design (Extract_signer / transaction_execute.go), so the privacy floor
+// is 4 — sender + receiver + 2 decoys. SC_TX / coinbase / registration /
+// premine are exempt (they have their own auth model; SC owner auth moves
+// to verify_sig — K0 Fix C).
+func k0RingSizeFloorReject(height uint64, txtype transaction.TransactionType, ringsize uint64) bool {
+	floor := uint64(globals.Config.K0_MIN_RING4_HEIGHT)
+	if height < floor {
+		return false // pre-fork txs unaffected
+	}
+	if txtype != transaction.NORMAL && txtype != transaction.BURN_TX {
+		return false // SC_TX / coinbase / registration / premine exempt
+	}
+	return ringsize < 4
+}
+
 func (chain *Blockchain) Verify_Transaction_NonCoinbase(tx *transaction.Transaction) (err error) {
 	return chain.verify_Transaction_NonCoinbase_internal(false, tx)
 }
@@ -299,6 +317,16 @@ func (chain *Blockchain) verify_Transaction_NonCoinbase_internal(skip_proof bool
 
 		if tx.Payloads[t].Statement.RingSize < 2 { // ring size minimum 2
 			return fmt.Errorf("RingSize for %d statement cannot be less than 2 actual %d", t, tx.Payloads[t].Statement.RingSize)
+		}
+
+		// K0 Fix B1 (spec §9 K0, k0-fix-design.md): from K0_MIN_RING4_HEIGHT
+		// onward, NORMAL/BURN txs with ringsize < 4 are rejected. Ringsize 2
+		// exposes the signer by design (parity selects the sender position);
+		// the privacy floor is 4. SC_TX / coinbase / registration / premine
+		// exempt until the verify_sig migration (K0 Fix C).
+		if k0RingSizeFloorReject(tx.Height, tx.TransactionType, tx.Payloads[t].Statement.RingSize) {
+			return fmt.Errorf("K0: ringsize %d < 4 rejected for NORMAL/BURN txs from height %d (privacy floor; use ringsize >= 4)",
+				tx.Payloads[t].Statement.RingSize, globals.Config.K0_MIN_RING4_HEIGHT)
 		}
 
 		if tx.Payloads[t].Statement.RingSize > 128 { // ring size current limited to 128

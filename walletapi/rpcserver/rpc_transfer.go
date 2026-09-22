@@ -93,5 +93,7 @@ func Transfer(ctx context.Context, p rpc.Transfer_Params) (result rpc.Transfer_R
 
 	// we must return a txid if everything went alright
 	result.TXID = tx.GetHash().String()
+	// surface the K0 ringsize-2 privacy warning (if any) to programmatic callers
+	result.PrivacyWarning = w.wallet.LastRingSizeWarning
 	return result, nil
 }

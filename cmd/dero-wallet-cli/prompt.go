@@ -337,6 +337,16 @@ func handle_prompt_command(l *readline.Instance, line string) {
 				break
 			}
 
+			// K0 guard: surface the ringsize-2 privacy warning, if raised,
+			// and require explicit confirmation before dispatch.
+			if wallet.LastRingSizeWarning != "" {
+				fmt.Fprintf(l.Stderr(), color_red+"PRIVACY WARNING: %s\n"+color_normal, wallet.LastRingSizeWarning)
+				if !ConfirmYesNoDefaultNo(l, "This transaction exposes the sender on-chain. Broadcast anyway (y/N)") {
+					logger.Info("Transaction cancelled due to privacy warning")
+					break
+				}
+			}
+
 			if err = wallet.SendTransaction(tx); err != nil {
 				logger.Error(err, "Error while dispatching Transaction")
 				return
