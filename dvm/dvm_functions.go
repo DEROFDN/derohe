@@ -25,8 +25,10 @@ import (
 	"strings"
 
 	"github.com/blang/semver/v4"
+	"github.com/deroproject/derohe/cryptography/bn256"
 	"github.com/deroproject/derohe/cryptography/crypto"
 	"github.com/deroproject/derohe/rpc"
+	"github.com/deroproject/derohe/transaction"
 	"golang.org/x/crypto/sha3"
 )
 
@@ -108,6 +110,8 @@ func init() {
 		"min":       {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 5000, StorageCost: 0, PtrU: dvm_min}},
 		"strlen":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrU: dvm_strlen}},
 		"substr":    {{Range: semver.MustParseRange(">=0.0.0"), ComputeCost: 20000, StorageCost: 0, PtrS: dvm_substr}},
+		// ZK Proof Verification (fork)
+		"verify_proof": {{Range: semver.MustParseRange(">=10.0.0"), ComputeCost: 2000000, StorageCost: 0, PtrU: dvm_verify_proof}},
 	}
 }
 
@@ -641,5 +645,114 @@ func dvm_max(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uin
 
 func dvm_panic(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
 	panic("panic function called")
+	return true, uint64(0)
+}
+
+// dvm_verify_proof verifies a DERO aggregate Bulletproof inside the VM.
+// verify_proof(tx_hex String, scid_index Uint64, ctx_hex String) -> Uint64 (0/1)
+//
+// The contract supplies a fully-serialized transaction (which carries the
+// statement's C/D/pointers/roothash + the proof) plus a context blob of
+// the expanded statement material DERO's serialization deliberately omits:
+// for each of the N ring members, [ring key (33B) | CLn (33B) | CRn (33B)]
+// concatenated (99*N bytes, hex). These are public values (the ring and the
+// per-member encrypted-balance vectors at the tx's height) — a contract
+// stores them at setup or receives them from the prover. The VM splices
+// them into the statement and runs the same audited Proof.Verify the nodes
+// run on every tx. This is the P1-1 native hook — NOT VM-interpreted group
+// arithmetic.
+//
+// The context is the binding: the contract verifies the proof against ITS
+// OWN ring + balance vectors, so a caller cannot swap in a statement that
+// verifies against an arbitrary ring.
+func dvm_verify_proof(dvm *DVM_Interpreter, expr *ast.CallExpr) (handled bool, result uint64) {
+	// a consensus primitive must never panic out of the VM: any internal
+	// failure (malformed input reaching a panicking decode path) -> 0
+	defer func() {
+		if r := recover(); r != nil {
+			result = uint64(0)
+		}
+	}()
+
+	checkargscount(3, len(expr.Args))
+
+	tx_hex, ok := dvm.eval(expr.Args[0]).(string)
+	if !ok {
+		panic("verify_proof: tx_hex must be a string (hex)")
+	}
+	idx, ok := dvm.eval(expr.Args[1]).(uint64)
+	if !ok {
+		panic("verify_proof: scid_index must be uint64")
+	}
+	ctx_hex, ok := dvm.eval(expr.Args[2]).(string)
+	if !ok {
+		panic("verify_proof: ctx_hex must be a string (hex)")
+	}
+
+	tx_bytes, err := hex.DecodeString(tx_hex)
+	if err != nil {
+		return true, uint64(0)
+	}
+	ctx, err := hex.DecodeString(ctx_hex)
+	if err != nil || len(ctx) == 0 || len(ctx)%99 != 0 {
+		return true, uint64(0) // malformed context -> 0
+	}
+	n := len(ctx) / 99
+
+	var tx transaction.Transaction
+	if err := tx.Deserialize(tx_bytes); err != nil {
+		return true, uint64(0) // malformed tx -> 0, never panic
+	}
+
+	if int(idx) >= len(tx.Payloads) {
+		return true, uint64(0) // index out of range
+	}
+	if n != int(tx.Payloads[idx].Statement.RingSize) {
+		return true, uint64(0) // context ring size mismatch -> 0
+	}
+
+	// splice the contract-supplied expanded statement material into the
+	// deserialized statement (serialization carries only C/D/pointers)
+	stmt := &tx.Payloads[idx].Statement
+	// Roothash bind: statement tree MUST equal the executing block's BLID.
+	// Without this a contract can be fed a statement that verifies against
+	// an arbitrary tree. When Chain_inputs is unset (unit tests), skip so
+	// existing vectors still run.
+	if dvm.State != nil && dvm.State.Chain_inputs != nil {
+		if stmt.Roothash != dvm.State.Chain_inputs.BLID {
+			return true, uint64(0)
+		}
+	}
+	stmt.Publickeylist = nil
+	stmt.CLn = nil
+	stmt.CRn = nil
+	for i := 0; i < n; i++ {
+		off := i * 99
+		var pk, cl, cr bn256.G1
+		if err := pk.DecodeCompressed(ctx[off : off+33]); err != nil {
+			return true, uint64(0)
+		}
+		if err := cl.DecodeCompressed(ctx[off+33 : off+66]); err != nil {
+			return true, uint64(0)
+		}
+		if err := cr.DecodeCompressed(ctx[off+66 : off+99]); err != nil {
+			return true, uint64(0)
+		}
+		stmt.Publickeylist = append(stmt.Publickeylist, &pk)
+		stmt.CLn = append(stmt.CLn, &cl)
+		stmt.CRn = append(stmt.CRn, &cr)
+	}
+
+	// same call pattern as blockchain/transaction_verify.go:482
+	valid := tx.Payloads[idx].Proof.Verify(
+		tx.Payloads[idx].SCID,
+		int(idx),
+		stmt,
+		tx.GetHash(),
+		tx.Payloads[idx].BurnValue,
+	)
+	if valid {
+		return true, uint64(1)
+	}
 	return true, uint64(0)
 }
