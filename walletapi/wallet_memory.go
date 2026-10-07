@@ -16,6 +16,7 @@
 
 package walletapi
 
+import "context"
 import "fmt"
 import "time"
 import "crypto/rand"
@@ -84,7 +85,36 @@ type Wallet_Memory struct {
 	//sync.Mutex  // used to syncronise access
 	sync.RWMutex
 
-	sync_in_progress sync.Mutex // whether sync is in progress
+	sync_in_progress     sync.Mutex // protects history-sync scheduling state
+	sync_history_running map[crypto.Hash]bool
+	sync_history_pending map[crypto.Hash]bool
+
+	sync_loop_mu     sync.Mutex
+	sync_loop_stop   chan struct{}
+	sync_loop_done   chan struct{}
+	sync_context_mu  sync.RWMutex
+	sync_loop_ctx    context.Context
+	sync_loop_cancel context.CancelFunc
+
+	// Native sync progress is session state, not persisted wallet snapshot data.
+	native_sync_mu         sync.RWMutex
+	native_sync_height     int64
+	native_sync_topoheight int64
+	native_sync_generation uint64
+}
+
+func (w *Wallet_Memory) markNativeSync(height, topoheight int64) {
+	w.native_sync_mu.Lock()
+	w.native_sync_height = height
+	w.native_sync_topoheight = topoheight
+	w.native_sync_generation = getConnectionGeneration()
+	w.native_sync_mu.Unlock()
+}
+
+func (w *Wallet_Memory) nativeSyncHeights() (height, topoheight int64, generation uint64) {
+	w.native_sync_mu.RLock()
+	defer w.native_sync_mu.RUnlock()
+	return w.native_sync_height, w.native_sync_topoheight, w.native_sync_generation
 }
 
 // when smart contracts are implemented, each will have it's own universe to track and maintain transactions
@@ -315,7 +345,10 @@ func (w *Wallet_Memory) Get_Encrypted_Wallet() []byte {
 // close the wallet
 // note that w is still valid and can be used to obtaine encrypted copy of data
 func (w *Wallet_Memory) Close_Encrypted_Wallet() {
-	time.Sleep(time.Second) // give goroutines some time to quit
+	if w == nil {
+		return
+	}
+	w.SetOfflineMode()
 	w.Save_Wallet()
 }
 
@@ -337,11 +370,27 @@ func (w *Wallet_Memory) GetAccount() *Account {
 	return w.account
 }
 
+func (w *Wallet_Memory) getTrackRecentBlocks() int64 {
+	w.RLock()
+	defer w.RUnlock()
+	return w.account.TrackRecentBlocks
+}
+
+func (w *Wallet_Memory) shouldSave() bool {
+	w.RLock()
+	defer w.RUnlock()
+	return w.account.lastsaved.IsZero() || time.Since(w.account.lastsaved) > w.account.SaveChangesEvery
+}
+
 func (w *Wallet_Memory) save_if_disk() {
-	if w == nil || w.wallet_disk == nil {
+	if w == nil {
 		return
 	}
-	if runtime.GOARCH != "wasm" {
-		w.wallet_disk.Save_Wallet()
+	w.RLock()
+	disk := w.wallet_disk
+	w.RUnlock()
+	if disk == nil || runtime.GOARCH == "wasm" {
+		return
 	}
+	disk.Save_Wallet()
 }

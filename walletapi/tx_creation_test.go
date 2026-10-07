@@ -42,6 +42,11 @@ import "github.com/deroproject/derohe/transaction"
 import "github.com/deroproject/derohe/cryptography/crypto"
 import "github.com/deroproject/derohe/cryptography/bn256"
 
+// Keep this independent from blockchain production constants: this fixture
+// protects the wallet's expected simulator-credit invariant from changing in
+// lockstep with the implementation under test.
+const expectedSimulatorRegistrationBalance uint64 = 100000000
+
 func init() {
 	globals.InitializeLog(io.Discard, io.Discard)
 	GenerateProoffuncptr = generate_proof_trampoline
@@ -97,6 +102,9 @@ func simulator_chain_start() (*blockchain.Blockchain, *derodrpc.RPCServer, map[s
 	}
 
 	params["chain"] = chain
+	// Publish the daemon endpoint before RPCServer_Start launches its Run
+	// goroutine; Run reads globals.Arguments during initialization.
+	globals.Arguments["--daemon-address"] = rpcport
 
 	rpcserver, _ := derodrpc.RPCServer_Start(params)
 	return chain, rpcserver, params
@@ -181,12 +189,16 @@ func Test_Creation_TX(t *testing.T) {
 	config.Mainnet.Genesis_Block_Hash = genesis_block.GetHash()
 
 	chain, rpcserver, params := simulator_chain_start()
-	defer simulator_chain_stop(chain, rpcserver)
+	defer func() {
+		wgenesis.Close_Encrypted_Wallet()
+		wsrc.Close_Encrypted_Wallet()
+		wdst.Close_Encrypted_Wallet()
+		simulator_chain_stop(chain, rpcserver)
+	}()
 	_ = params
 
-	globals.Arguments["--daemon-address"] = rpcport
-
-	go Keep_Connectivity()
+	connectivity := Start_Connectivity()
+	defer connectivity.Stop()
 
 	t.Logf("src %s\n", wsrc.GetAddress())
 	t.Logf("dst %s\n", wdst.GetAddress())

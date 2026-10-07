@@ -657,7 +657,7 @@ func (x *XSWD) handleMessage(app *ApplicationData, request *jrpc2.Request) inter
 				}
 
 				x.logger.V(2).Info("requesting daemon with", "method", request.Method(), "param", request.ParamString())
-				result, err := walletapi.GetRPCClient().RPC.Call(context.Background(), request.Method(), params)
+				result, err := walletapi.GetRPCClient().CallResponseWithContext(context.Background(), request.Method(), params)
 				if err != nil {
 					x.logger.V(1).Error(err, "Error on daemon call")
 					return ResponseWithError(request, jrpc2.Errorf(code.InvalidRequest, "Error on daemon call: %q", err.Error()))

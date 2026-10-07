@@ -27,7 +27,6 @@ import (
 	"github.com/deroproject/derohe/blockchain"
 	"github.com/deroproject/derohe/config"
 	"github.com/deroproject/derohe/cryptography/crypto"
-	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/transaction"
 )
@@ -75,16 +74,16 @@ func Test_Payload_TX(t *testing.T) {
 	_ = params
 
 	defer func() {
-		simulator_chain_stop(chain, rpcserver)
 		wsrc.Close_Encrypted_Wallet()
 		wdst.Close_Encrypted_Wallet()
+		wgenesis.Close_Encrypted_Wallet()
+		simulator_chain_stop(chain, rpcserver)
 		os.Remove(wsrc_temp_db) // cleanup after test
 		os.Remove(wdst_temp_db)
 	}()
 
-	globals.Arguments["--daemon-address"] = rpcport
-
-	go Keep_Connectivity()
+	connectivity := Start_Connectivity()
+	defer connectivity.Stop()
 
 	t.Logf("src %s\n", wsrc.GetAddress())
 	t.Logf("dst %s\n", wdst.GetAddress())
@@ -134,6 +133,7 @@ func Test_Payload_TX(t *testing.T) {
 	}
 
 	expectedTransfers := 8
+	expectedSenderBalance := expectedSimulatorRegistrationBalance
 
 	for i := 0; i < expectedTransfers; i++ {
 		wsrc.Sync_Wallet_Memory_With_Daemon()
@@ -148,6 +148,7 @@ func Test_Payload_TX(t *testing.T) {
 
 		var dtx transaction.Transaction
 		dtx.Deserialize(tx.Serialize())
+		expectedSenderBalance -= 90000 + tx.Fees()
 
 		simulator_chain_mineblock(chain, wgenesis.GetAddress(), t) // mine a block at tip
 		wsrc.Sync_Wallet_Memory_With_Daemon()
@@ -164,12 +165,13 @@ func Test_Payload_TX(t *testing.T) {
 	wdst.Sync_Wallet_Memory_With_Daemon()
 	wsrc.Sync_Wallet_Memory_With_Daemon()
 
-	if wdst.account.Balance_Mature != 1520000 {
-		t.Fatalf("Failed receiver balance check, expected 1520000 actual %d", wdst.account.Balance_Mature)
+	expectedReceiverBalance := expectedSimulatorRegistrationBalance + uint64(expectedTransfers)*90000
+	if wdst.account.Balance_Mature != expectedReceiverBalance {
+		t.Fatalf("Failed receiver balance check, expected %d actual %d", expectedReceiverBalance, wdst.account.Balance_Mature)
 	}
 
-	if wsrc.account.Balance_Mature != 0 {
-		t.Fatalf("Failed sender balance check, expected 0 actual %d", wsrc.account.Balance_Mature)
+	if wsrc.account.Balance_Mature != expectedSenderBalance {
+		t.Fatalf("Failed sender balance check, expected %d actual %d", expectedSenderBalance, wsrc.account.Balance_Mature)
 	}
 
 	time.Sleep(time.Second)
