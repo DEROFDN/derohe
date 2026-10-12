@@ -125,6 +125,14 @@ func (chain *Blockchain) process_miner_transaction(bl *block.Block, genesis bool
 	// general coin base transaction
 	base_reward := CalcBlockReward(uint64(height))
 	full_reward := base_reward + fees
+	// overflow / invariant guard (supply hard-cap hardening): a legitimate
+	// reward is bounded by CalcBlockReward at this height (max BaseReward
+	// ~= 1.23 DERO) and fees are bounded by total supply, so full_reward can
+	// never realistically approach 2^64. If it does, the emission curve has
+	// regressed — reject rather than silently mint on wraparound.
+	if full_reward < base_reward || full_reward > config.MAX_SUPPLY {
+		panic(fmt.Errorf("coinbase reward overflow/invariant: base_reward=%d fees=%d full_reward=%d exceeds MAX_SUPPLY=%d", base_reward, fees, full_reward, config.MAX_SUPPLY))
+	}
 
 	//full_reward is divided into equal parts for all miner blocks + miner address
 	// since perfect division is not possible, ( see money handling)

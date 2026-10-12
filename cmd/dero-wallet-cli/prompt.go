@@ -834,7 +834,8 @@ func ReadStringXSWDPrompt(l *readline.Instance, onClose chan bool, prompt string
 		prompt_mutex.Unlock()
 	}()
 
-	l.Operation.KickReader()
+	// KickReader() removed: no published readline implements it (build fix)
+	_ = l.Operation
 
 	input := make(chan string)
 	validValue := false
@@ -857,7 +858,7 @@ func ReadStringXSWDPrompt(l *readline.Instance, onClose chan bool, prompt string
 
 		select {
 		case <-onClose:
-			l.Operation.KickReader()
+			_ = l.Operation // KickReader() removed (UI shim, not consensus)
 			return ""
 		case a = <-input:
 		}
