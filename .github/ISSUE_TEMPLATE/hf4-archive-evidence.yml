@@ -1,0 +1,159 @@
+name: HF4 archive evidence
+description: Submit one publicly shareable archive bundle for independent HF3 supply replay review.
+title: "[HF4 archive evidence] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for **one archive bundle per issue**. Two bundles from independently operated sources are required to support a full-history supply result. Read [the public evidence review notes](https://github.com/DEROFDN/derohe/blob/community-dev/docs/hf4-public-review.md) and [the technical specification](https://github.com/DEROFDN/derohe/blob/community-dev/docs/hf4-supply-checkpoint.md) first.
+
+        Submissions are untrusted candidates until hashes, signatures, source identity, coverage, chain anchor, and replay are independently verified. A public key posted here is not an approved trust pin.
+
+        **Never post private keys, seeds, passwords, RPC credentials, authenticated URLs, private endpoints, internal IP addresses, or personal identifying information.**
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      description: Identify the exact chain; include the chain ID in the notes or manifest.
+      options:
+        - DERO mainnet
+        - DERO testnet
+        - Other (specify below)
+    validations:
+      required: true
+  - type: input
+    id: source_id
+    attributes:
+      label: Source ID
+      description: Stable, non-identifying ID matching the signed manifest.
+      placeholder: source-a
+    validations:
+      required: true
+  - type: input
+    id: operator_id
+    attributes:
+      label: Operator ID
+      description: Stable pseudonymous ID matching the manifest; do not use a real name or contact detail.
+      placeholder: operator-a
+    validations:
+      required: true
+  - type: input
+    id: node_commit
+    attributes:
+      label: Node software commit
+      description: Full source commit used to collect/validate this archive.
+      placeholder: 40-character commit hash
+    validations:
+      required: true
+  - type: input
+    id: genesis_id
+    attributes:
+      label: Genesis block ID
+      description: Exact genesis identifier for the archived chain.
+    validations:
+      required: true
+  - type: textarea
+    id: coverage
+    attributes:
+      label: Archive coverage
+      description: State inclusive start/end topological heights and whether coverage is complete from genesis. A non-genesis start is diagnostic only unless maintainers identify a previously approved, fully verified anchor; none is currently approved for mainnet.
+      placeholder: Genesis through topological height ...
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: anchor_topoheight
+    attributes:
+      label: Common anchor topological height
+      description: The exact anchor height recorded in the manifest.
+    validations:
+      required: true
+  - type: input
+    id: anchor_block_id
+    attributes:
+      label: Anchor block ID
+      description: Exact block ID at the stated anchor height.
+    validations:
+      required: true
+  - type: input
+    id: anchor_state_root
+    attributes:
+      label: Anchor state root
+      description: Exact state root at the same anchor.
+    validations:
+      required: true
+  - type: textarea
+    id: collection
+    attributes:
+      label: Collection command and method
+      description: Give the reproducible command/method and any relevant collection notes. Do not include credentials, private endpoints, or local machine paths.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: bundle_url
+    attributes:
+      label: Public bundle URL
+      description: Durable, unauthenticated download URL; never place an access token in the URL.
+      placeholder: https://...
+    validations:
+      required: true
+  - type: input
+    id: bundle_sha256
+    attributes:
+      label: Downloaded bundle SHA-256
+      description: Lowercase SHA-256 of the exact downloadable archive file. If hosted as a directory, link a checksum manifest covering the same files.
+      placeholder: 64 lowercase hexadecimal characters
+    validations:
+      required: true
+  - type: input
+    id: manifest_sha256
+    attributes:
+      label: manifest.json SHA-256
+      description: Hash of the exact canonical manifest bytes.
+      placeholder: 64 lowercase hexadecimal characters
+    validations:
+      required: true
+  - type: input
+    id: blocks_sha256
+    attributes:
+      label: blocks.jsonl SHA-256
+      description: Hash of the exact file bytes, including LF separators.
+      placeholder: 64 lowercase hexadecimal characters
+    validations:
+      required: true
+  - type: input
+    id: bodies_sha256
+    attributes:
+      label: bodies.jsonl SHA-256
+      description: Hash of the exact file bytes, including LF separators.
+      placeholder: 64 lowercase hexadecimal characters
+    validations:
+      required: true
+  - type: input
+    id: public_key
+    attributes:
+      label: Candidate Ed25519 public key
+      description: 32-byte lowercase-hex public key that verifies manifest.sig. This is a candidate key only; do not post a private signing key.
+      placeholder: 64 lowercase hexadecimal characters
+    validations:
+      required: true
+  - type: textarea
+    id: findings
+    attributes:
+      label: Reproduction notes or findings
+      description: Include any independently reproduced checks, discrepancies, or limitations. Separate observed facts from estimates.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: attestations
+    attributes:
+      label: Required attestations
+      options:
+        - label: I confirm this bundle contains only public chain data and no private keys, seeds, passwords, RPC credentials, private endpoints, internal IPs, or personal identifying information.
+          required: true
+        - label: I attest that this archive was collected independently and was not copied from another submitter's bundle or signing key.
+          required: true
+        - label: I understand that the manifest signature and key posted here are untrusted until independently authenticated, and that a second independent archive is required for a full-history result.
+          required: true
