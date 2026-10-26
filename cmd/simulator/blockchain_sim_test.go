@@ -22,6 +22,7 @@ import "fmt"
 import "time"
 import "testing"
 import "bytes"
+import "sync/atomic"
 
 //import "crypto/rand"
 import "path/filepath"
@@ -62,9 +63,20 @@ Options:
   --rpc-bind=<127.0.0.1:9999>    daemon RPC listens on this ip:port
   `
 
-const rpcport_test = "127.0.0.1:26001"
+// Each test gets a unique simulator RPC port and data directory so tests can
+// run serially in one process without colliding on a fixed port or directory.
+var simPortCounter uint64
+var simDirCounter uint64
 
-var tmpdirectory = "/tmp/dsimulator"
+func nextSimPort() string {
+	n := atomic.AddUint64(&simPortCounter, 1)
+	return fmt.Sprintf("127.0.0.1:%d", 26000+n) // 26001, 26002, ...
+}
+
+func nextSimDir() string {
+	n := atomic.AddUint64(&simDirCounter, 1)
+	return filepath.Join(os.TempDir(), fmt.Sprintf("dsimulator_%d", n))
+}
 
 // start a chain in simulator mode
 func simulator_chain_start() (*blockchain.Blockchain, *derodrpc.RPCServer, map[string]interface{}) {
@@ -72,12 +84,15 @@ func simulator_chain_start() (*blockchain.Blockchain, *derodrpc.RPCServer, map[s
 	params := map[string]interface{}{}
 	params["--simulator"] = true
 
+	rpcport := nextSimPort()
+	tmpdirectory := nextSimDir()
+
 	parser := &docopt.Parser{
 		HelpHandler:  docopt.PrintHelpOnly,
 		OptionsFirst: true,
 	}
 
-	globals.Arguments, err = parser.ParseArgs(command_line_test, []string{"--data-dir", tmpdirectory, "--rpc-bind", rpcport_test, "--testnet"}, config.Version.String())
+	globals.Arguments, err = parser.ParseArgs(command_line_test, []string{"--data-dir", tmpdirectory, "--rpc-bind", rpcport, "--testnet"}, config.Version.String())
 	if err != nil {
 		//log.Fatalf("Error while parsing options err: %s\n", err)
 		return nil, nil, nil
@@ -94,6 +109,7 @@ func simulator_chain_start() (*blockchain.Blockchain, *derodrpc.RPCServer, map[s
 	}
 
 	params["chain"] = chain
+	params["rpcport"] = rpcport // caller uses it for SetDaemonAddress
 	rpcserver, _ := derodrpc.RPCServer_Start(params)
 	return chain, rpcserver, params
 }
@@ -174,10 +190,11 @@ func Test_Creation_TX(t *testing.T) {
 	config.Testnet.Genesis_Block_Hash = genesis_block.GetHash()
 	config.Mainnet.Genesis_Block_Hash = genesis_block.GetHash()
 
-	chain, rpcserver, _ := simulator_chain_start()
+	chain, rpcserver, params := simulator_chain_start()
 	defer simulator_chain_stop(chain, rpcserver)
+	rpcport := params["rpcport"].(string)
 
-	globals.Arguments["--daemon-address"] = rpcport_test
+	globals.Arguments["--daemon-address"] = rpcport
 
 	go walletapi.Keep_Connectivity()
 
@@ -209,7 +226,8 @@ func Test_Creation_TX(t *testing.T) {
 	}
 
 	// here we are collecting proofs for later on bennhcmarking
-	for j := 2; j <= 128; j = j * 2 {
+	// Start at 4: the HF4 privacy floor rejects NORMAL/BURN ring sizes below 4.
+	for j := 4; j <= 128; j = j * 2 {
 		wsrc.SetRingSize(j)
 		tx, err := wsrc.TransferPayload0([]rpc.Transfer{rpc.Transfer{Destination: wdst.GetAddress().String(), Amount: 1}}, 0, false, rpc.Arguments{}, 0, false)
 		if err != nil {
@@ -224,8 +242,8 @@ func Test_Creation_TX(t *testing.T) {
 		}
 	}
 
-	wsrc.SetRingSize(2)
-	wdst.SetRingSize(2)
+	wsrc.SetRingSize(4)
+	wdst.SetRingSize(4)
 
 	// accounts are reversed
 	reverse_tx, err := wdst.TransferPayload0([]rpc.Transfer{rpc.Transfer{Destination: wsrc.GetAddress().String(), Amount: 1}}, 0, false, rpc.Arguments{}, 0, false)

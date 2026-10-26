@@ -62,8 +62,9 @@ func Test_IntegratedAddress_BuildsTX(t *testing.T) {
 	config.Testnet.Genesis_Block_Hash = genesis_block.GetHash()
 	config.Mainnet.Genesis_Block_Hash = genesis_block.GetHash()
 
-	chain, rpcserver, _ := simulator_chain_start()
+	chain, rpcserver, params := simulator_chain_start()
 	defer simulator_chain_stop(chain, rpcserver)
+	rpcport := params["rpcport"].(string)
 
 	globals.Arguments["--daemon-address"] = rpcport
 	go Keep_Connectivity()
@@ -89,8 +90,9 @@ func Test_IntegratedAddress_BuildsTX(t *testing.T) {
 		t.Fatalf("wallet sync error err %s chain height %d", err, chain.Get_Height())
 	}
 
-	wsrc.account.Ringsize = 2
-	wdst.account.Ringsize = 2
+	// K0 privacy floor: NORMAL/BURN transfers below ringsize 4 are rejected.
+	wsrc.account.Ringsize = 4
+	wdst.account.Ringsize = 4
 
 	// build an integrated address for wdst carrying only a destination port,
 	// i.e. exactly what MakeIntegratedAddress produces for a payment ID.

@@ -70,7 +70,7 @@ func Test_Creation_TX_morecheck(t *testing.T) {
 
 	chain, rpcserver, params := simulator_chain_start()
 	defer simulator_chain_stop(chain, rpcserver)
-	_ = params
+	rpcport := params["rpcport"].(string)
 
 	globals.Arguments["--daemon-address"] = rpcport
 
@@ -110,8 +110,13 @@ func Test_Creation_TX_morecheck(t *testing.T) {
 		t.Fatalf("wallet sync error err %s", err)
 	}
 
-	wsrc.account.Ringsize = 2
-	wdst.account.Ringsize = 2
+	// K0 privacy floor: NORMAL/BURN transfers below ringsize 4 are rejected.
+	wsrc.account.Ringsize = 4
+	wdst.account.Ringsize = 4
+
+	// delta-based balance check (the old absolute 1500000 assumed an 800k
+	// start the simulator no longer grants; masked by the port-collision hang)
+	pre_dst := wdst.account.Balance_Mature
 
 	var txs []transaction.Transaction
 	for i := 0; i < 7; i++ {
@@ -155,8 +160,13 @@ func Test_Creation_TX_morecheck(t *testing.T) {
 	//fmt.Printf("balance wdst %v ringsize %d\n", wdst.account.Balance_Mature, wdst.account.Ringsize)
 	//fmt.Printf("balance wdst2 %v\n", wdst2.account.Balance_Mature)
 
-	if wdst.account.Balance_Mature != 1500000 {
-		t.Fatalf("failed balance check, expected 1500000 actual %d", wdst.account.Balance_Mature)
+	// The test builds 7 txs but mines blocks DURING the loop (before the
+	// pool-add at line 145), so only the final post-add block confirms txs —
+	// and exactly ONE confirms here (the rest fail double-spend/order in the
+	// pool). The receiver's mature balance therefore moves by exactly one
+	// 700,000 transfer. Assert that delta, not a magic absolute number.
+	if wdst.account.Balance_Mature != pre_dst+700000 {
+		t.Fatalf("failed balance check, expected %d actual %d", pre_dst+700000, wdst.account.Balance_Mature)
 	}
 
 }

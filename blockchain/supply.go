@@ -1,6 +1,9 @@
 package blockchain
 
-import "github.com/deroproject/derohe/config"
+import (
+	"github.com/deroproject/derohe/config"
+	"github.com/deroproject/derohe/forensicsupply"
+)
 
 func CalcSupply(height uint64) uint64 {
 	supply := config.PREMINE
@@ -25,9 +28,19 @@ func CalcSupply(height uint64) uint64 {
 	return supply
 }
 
-func SpendableSupply(height uint64) uint64 {
-	var supply uint64
-	supply = 2388651730000 // additional spendable supply from exploit in August 2026 (~23.8 million Dero)
+// SpendableSupplyForNetwork reports the height-based supply estimate. On
+// mainnet it adds the pinned net-created floor only at or after HF3. This is
+// reporting logic only; CalcSupply and consensus issuance remain unchanged.
+func SpendableSupplyForNetwork(height uint64, network string, simulator bool, hf3Height int64) uint64 {
+	supply := CalcSupply(height)
+	if !forensicsupply.IsActive(network, simulator, height, hf3Height) {
+		return supply
+	}
+	return supply + forensicsupply.NetCreatedFloorAtomicUnits
+}
 
-	return CalcSupply(height) + supply
+// SpendableSupply retains the legacy mainnet-oriented helper for callers that
+// lack network context. It reports the supplied height, not the next block.
+func SpendableSupply(height uint64) uint64 {
+	return SpendableSupplyForNetwork(height, forensicsupply.MainnetNetworkName, false, config.Mainnet.MAJOR_HF3_HEIGHT)
 }

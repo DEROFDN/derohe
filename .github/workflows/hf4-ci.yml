@@ -1,0 +1,112 @@
+name: HF4 CI
+
+on:
+  pull_request:
+    paths:
+      - "block/**"
+      - "blockchain/**"
+      - "cmd/derod/**"
+      - "cmd/explorer/**"
+      - "cmd/simulator/**"
+      - "config/**"
+      - "dvm/**"
+      - "forensicsupply/**"
+      - "p2p/**"
+      - "rpc/**"
+      - "walletapi/**"
+      - ".github/workflows/hf4-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and targeted tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        # dvm and blockchain carry pre-existing findings (unreachable code and
+        # unkeyed test literals) that are outside this PR's scope.
+        run: |
+          go vet \
+            ./forensicsupply/... \
+            ./block/... \
+            ./cmd/derod/rpc/... \
+            ./rpc/... \
+            ./walletapi/rpcserver/... \
+            ./cmd/simulator/... \
+            ./cmd/explorer/...
+
+      - name: Consensus, migration, supply, wallet, and simulator tests
+        run: |
+          go test -count=1 -p 1 -timeout 20m \
+            ./forensicsupply/... \
+            ./block/... \
+            ./blockchain/... \
+            ./cmd/derod/rpc/... \
+            ./rpc/... \
+            ./dvm/... \
+            ./walletapi/... \
+            ./cmd/simulator/... \
+            ./cmd/explorer/...
+
+  race:
+    name: Race detector (core packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - name: Race tests
+        run: |
+          go test -race -count=1 -p 1 -timeout 10m \
+            ./forensicsupply/... \
+            ./block/... \
+            ./blockchain/... \
+            ./rpc/...
+
+  gofmt:
+    name: Formatting (new HF4 files)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+
+      - name: gofmt (HF4 files)
+        run: |
+          unformatted=$(gofmt -l \
+            block/transaction_commitment.go \
+            block/transaction_commitment_test.go \
+            blockchain/transaction_verification_context.go \
+            blockchain/transaction_verification_context_test.go \
+            blockchain/supply.go \
+            blockchain/supply_test.go \
+            forensicsupply \
+            rpc/forensic_supply.go \
+            rpc/forensic_supply_test.go \
+            cmd/derod/rpc/rpc_dero_getinfo.go)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi

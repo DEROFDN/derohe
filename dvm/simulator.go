@@ -107,7 +107,11 @@ func (s *Simulator) SCInstall(sc_code string, incoming_values map[crypto.Hash]ui
 
 	var meta SC_META_DATA
 	if _, ok := sc.Functions["InitializePrivate"]; ok {
-		meta.Type = 1
+		meta.Type = SC_META_TYPE_PRIVATE
+	}
+	// K0 Fix B2 (mirror of the chain install path): auto-detect SIGNER() usage.
+	if !ContractUsesSigner(sc) {
+		meta.SetNoSigner()
 	}
 
 	w_sc_data_tree := Wrapped_tree(s.cache, s.ss, scid)
@@ -116,7 +120,7 @@ func (s *Simulator) SCInstall(sc_code string, incoming_values map[crypto.Hash]ui
 	w_sc_tree.Put(SC_Meta_Key(scid), meta.MarshalBinary())
 
 	entrypoint := "Initialize"
-	if meta.Type == 1 { // if its a a private SC
+	if meta.IsPrivate() { // if its a a private SC (masks the B2 NoSigner bit)
 		entrypoint = "InitializePrivate"
 	}
 
@@ -180,10 +184,17 @@ func (s *Simulator) common(w_sc_tree, w_sc_data_tree *Tree_Wrapper, scid crypto.
 	// we must commit all the changes
 	// check whether we are not overflowing/underflowing, means SC is not over sending
 	if err == nil {
-		err = SanityCheckExternalTransfers(w_sc_data_tree, s.balance_tree, scid)
+		if scid == rpc.SeamlessMigrationSCID() {
+			err = SanityCheckNoExternalTransfers(w_sc_data_tree)
+		} else {
+			err = SanityCheckExternalTransfers(w_sc_data_tree, s.balance_tree, scid)
+		}
 	}
 
 	if err != nil { // error occured, give everything to SC, since we may not have information to send them back
+		if scid == rpc.SeamlessMigrationSCID() {
+			return
+		}
 		var zeroaddress [33]byte
 		if signer != zeroaddress { // if we can identify sender, return funds to him
 			ErrorRevert(s.ss, s.cache, s.balance_tree, signer, scid, incoming_values)
@@ -244,6 +255,19 @@ func SanityCheckExternalTransfers(w_sc_data_tree *Tree_Wrapper, balance_tree *gr
 	}
 
 	return
+}
+
+// SanityCheckNoExternalTransfers is used by the stateless migration marker.
+// Its value is already transferred privately by the base-layer proof, so the
+// DVM must not create a second, clear-value external transfer.
+func SanityCheckNoExternalTransfers(w_sc_data_tree *Tree_Wrapper) error {
+	if w_sc_data_tree == nil {
+		return fmt.Errorf("migration execution has no DVM data tree")
+	}
+	if len(w_sc_data_tree.Transfere) != 0 {
+		return fmt.Errorf("migration contract must not emit DVM external transfers")
+	}
+	return nil
 }
 
 // any error during this will panic

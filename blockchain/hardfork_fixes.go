@@ -21,7 +21,6 @@ type HF3_Tx_Data struct {
 	Bl_Tips   string
 	Height    uint64
 	Tx_Parity bool
-	Parity    bool
 }
 
 var HF3_Affected_Txs = map[string]*HF3_Tx_Data{

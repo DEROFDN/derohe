@@ -19,6 +19,7 @@ package blockchain
 // this file implements a filesystem store which is used to store blocks/transactions directly in the file system
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -284,12 +285,14 @@ func (s *storefs) WriteBlock(h [32]byte, data []byte, difficulty *big.Int, ss_ve
 }
 
 func (s *storefs) ReadTX(h [32]byte) ([]byte, error) {
-	{ // legacy code
-		dir := s.getpath(h)
-		file := filepath.Join(dir, fmt.Sprintf("%x.tx", h[:]))
-		if data, err := ioutil.ReadFile(file); err == nil {
-			return data, nil
-		}
+	legacyDir := s.getpath(h)
+	legacyFile := filepath.Join(legacyDir, fmt.Sprintf("%x.tx", h[:]))
+	data, err := ioutil.ReadFile(legacyFile)
+	if err == nil {
+		return data, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read legacy tx %x: %w", h[:], err)
 	}
 
 	dir := s.getpathtx(h)
@@ -297,7 +300,10 @@ func (s *storefs) ReadTX(h [32]byte) ([]byte, error) {
 	res, err := ioutil.ReadFile(file)
 	if err != nil {
 		logger.V(4).Info("cannot read tx", "tx", fmt.Sprintf("%x", h), "err", err)
-		return nil, fmt.Errorf("tx %x not found", h[:])
+		if os.IsNotExist(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("read tx %x: %w", h[:], err)
 	}
 
 	return res, nil
@@ -312,6 +318,52 @@ func (s *storefs) WriteTX(h [32]byte, data []byte) (err error) {
 	}
 
 	return ioutil.WriteFile(file, data, 0600)
+}
+
+func (s *storefs) getpathblocktx(blockID [32]byte) string {
+	return filepath.Join(s.basedir, "block_txs", fmt.Sprintf("%02x", blockID[0]), fmt.Sprintf("%02x", blockID[1]))
+}
+
+func (s *storefs) txBlockFile(blockID [32]byte, index uint64) string {
+	return filepath.Join(s.getpathblocktx(blockID), fmt.Sprintf("%x_%d.tx", blockID[:], index))
+}
+
+func (s *storefs) ReadTXForBlock(blockID [32]byte, index uint64) ([]byte, error) {
+	return ioutil.ReadFile(s.txBlockFile(blockID, index))
+}
+
+func (s *storefs) WriteTXForBlock(blockID [32]byte, index uint64, data []byte) error {
+	dir := s.getpathblocktx(blockID)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	file := s.txBlockFile(blockID, index)
+	fd, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err == nil {
+		_, writeErr := fd.Write(data)
+		closeErr := fd.Close()
+		if writeErr != nil {
+			_ = os.Remove(file)
+			return writeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return nil
+	}
+	if !os.IsExist(err) {
+		return fmt.Errorf("create transaction body for block %x index %d: %w", blockID[:], index, err)
+	}
+
+	stored, err := ioutil.ReadFile(file)
+	if err != nil {
+		return fmt.Errorf("read existing transaction body for block %x index %d: %w", blockID[:], index, err)
+	}
+	if bytes.Equal(stored, data) {
+		return nil
+	}
+	return fmt.Errorf("conflicting transaction body for block %x index %d", blockID[:], index)
 }
 
 func (s *storefs) DeleteTX(h [32]byte) (err error) {

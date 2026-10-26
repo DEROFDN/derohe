@@ -337,6 +337,16 @@ func handle_prompt_command(l *readline.Instance, line string) {
 				break
 			}
 
+			// K0 guard: surface the ringsize-2 privacy warning, if raised,
+			// and require explicit confirmation before dispatch.
+			if wallet.LastRingSizeWarning != "" {
+				fmt.Fprintf(l.Stderr(), color_red+"PRIVACY WARNING: %s\n"+color_normal, wallet.LastRingSizeWarning)
+				if !ConfirmYesNoDefaultNo(l, "This transaction exposes the sender on-chain. Broadcast anyway (y/N)") {
+					logger.Info("Transaction cancelled due to privacy warning")
+					break
+				}
+			}
+
 			if err = wallet.SendTransaction(tx); err != nil {
 				logger.Error(err, "Error while dispatching Transaction")
 				return
@@ -834,7 +844,9 @@ func ReadStringXSWDPrompt(l *readline.Instance, onClose chan bool, prompt string
 		prompt_mutex.Unlock()
 	}()
 
-	l.Operation.KickReader()
+	// KickReader() removed: no published readline implements it
+	// (wallet-only UI read-unblock helper, not consensus)
+	_ = l.Operation
 
 	input := make(chan string)
 	validValue := false
@@ -857,7 +869,7 @@ func ReadStringXSWDPrompt(l *readline.Instance, onClose chan bool, prompt string
 
 		select {
 		case <-onClose:
-			l.Operation.KickReader()
+			_ = l.Operation // KickReader() removed (UI shim, not consensus)
 			return ""
 		case a = <-input:
 		}

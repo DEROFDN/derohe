@@ -391,7 +391,6 @@ func readline_loop(l *readline.Instance, chain *blockchain.Blockchain, logger lo
 
 	}()
 
-restart_loop:
 	for {
 		line, err := l.Readline()
 		if err == io.EOF {
@@ -605,26 +604,10 @@ restart_loop:
 				continue
 			}
 
-			var cbl *block.Complete_Block
-
-			bl, err := chain.Load_BL_FROM_ID(hash)
+			cbl, err := chain.Load_Complete_Block(hash)
 			if err != nil {
-				fmt.Printf("Err %s\n", err)
+				fmt.Printf("Err loading complete block %s\n", err)
 				continue
-			}
-			cbl = &block.Complete_Block{Bl: bl}
-			for _, txid := range bl.Tx_hashes {
-
-				var tx transaction.Transaction
-				if tx_bytes, err := chain.Store.Block_tx_store.ReadTX(txid); err != nil {
-					fmt.Printf("err while reading txid err %s\n", err)
-					continue restart_loop
-				} else if err = tx.Deserialize(tx_bytes); err != nil {
-					fmt.Printf("err deserializing tx err %s\n", err)
-					continue restart_loop
-				}
-				cbl.Txs = append(cbl.Txs, &tx)
-
 			}
 
 			cbl_bytes := p2p.Convert_CBL_TO_P2PCBL(cbl, true)

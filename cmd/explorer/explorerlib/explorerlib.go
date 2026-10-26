@@ -972,6 +972,14 @@ func fill_common_info(data map[string]interface{}, extra_data bool) error {
 	data["fee_per_kb"] = float64(info.Dynamic_fee_per_kb) / 1000000000000
 	data["median_block_size"] = fmt.Sprintf("%.02f", float32(info.Median_Block_Size)/1024)
 	data["total_supply"] = info.Total_Supply
+	data["has_forensic_supply_record"] = false
+	if info.ForensicSupply != nil {
+		record := info.ForensicSupply
+		data["has_forensic_supply_record"] = true
+		data["forensic_created_supply_net_dero"] = globals.FormatMoneyPrecision(record.NetCreatedFloorAtomicUnits, 1)
+		data["forensic_created_supply_gross_dero"] = globals.FormatMoneyPrecision(record.GrossCreatedFloorAtomicUnits, 1)
+		data["forensic_verified_burn_dero"] = globals.FormatMoneyPrecision(record.VerifiedBurnAtomicUnits, 1)
+	}
 	data["averageblocktime50"] = info.AverageBlockTime50
 
 	return nil

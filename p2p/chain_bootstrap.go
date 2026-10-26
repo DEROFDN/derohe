@@ -17,6 +17,7 @@
 package p2p
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -308,29 +309,50 @@ func (connection *Connection) bootstrap_chain() error {
 
 		}
 
-		// complete the txs
-		for j := range response.CBlocks[i].Txs {
+		// Complete and validate the ordered transaction bodies before storing them.
+		if len(bl.Tx_hashes) != len(response.CBlocks[i].Txs) {
+			connection.logger.Error(fmt.Errorf("block transaction count mismatch"), "invalid bootstrap block")
+			connection.exit()
+			return nil
+		}
+		serializedTransactions := make([][]byte, len(response.CBlocks[i].Txs))
+		for j, txBytes := range response.CBlocks[i].Txs {
 			var tx transaction.Transaction
-			err = tx.Deserialize(response.CBlocks[i].Txs[j])
-			if err != nil { // we have a tx which could not be deserialized ban peer
+			err = tx.Deserialize(txBytes)
+			if err != nil {
 				connection.logger.Error(err, "Error Incoming TX could not be deserialized")
 				connection.exit()
 				return nil
 			}
 			if bl.Tx_hashes[j] != tx.GetHash() {
-				connection.logger.Error(err, "Error Incoming TX has mismatch.")
+				connection.logger.Error(fmt.Errorf("transaction ID mismatch at index %d", j), "invalid bootstrap block")
 				connection.exit()
 				return nil
 			}
-
+			serialized := tx.Serialize()
+			if bl.Major_Version >= 4 && !bytes.Equal(txBytes, serialized) {
+				connection.logger.Error(fmt.Errorf("non-canonical transaction serialization at index %d", j), "invalid bootstrap block")
+				connection.exit()
+				return nil
+			}
+			serializedTransactions[j] = serialized
 			cbl.Txs = append(cbl.Txs, &tx)
 		}
+		if bl.Major_Version >= 4 && block.SerializedTransactionsCommitment(serializedTransactions) != bl.Proof {
+			connection.logger.Error(fmt.Errorf("v4 transaction-body commitment mismatch"), "invalid bootstrap block")
+			connection.exit()
+			return nil
+		}
 
-		{ // first lets save all the txs, together with their link to this block as height
-			for i := 0; i < len(cbl.Txs); i++ {
-				if err = chain.Store.Block_tx_store.WriteTX(bl.Tx_hashes[i], cbl.Txs[i].Serialize()); err != nil {
+		for txIndex := range cbl.Txs {
+			serialized := serializedTransactions[txIndex]
+			if bl.Major_Version >= 4 {
+				if err = chain.Store.Block_tx_store.WriteTXForBlock(bl.GetHash(), uint64(txIndex), serialized); err != nil {
 					panic(err)
 				}
+			}
+			if err = chain.Store.Block_tx_store.WriteTX(bl.Tx_hashes[txIndex], serialized); err != nil {
+				panic(err)
 			}
 		}
 

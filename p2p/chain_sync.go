@@ -350,11 +350,11 @@ func (connection *Connection) process_object_response(response Objects, sent int
 			}
 			cbl.Txs = append(cbl.Txs, &tx)
 
-			// apply HF3 fixes to allow stuck nodes to catch up
-			if bl.Height < uint64(globals.Config.MAJOR_HF3_HEIGHT) {
-				if t, ok := blockchain.HF3_Affected_Txs[tx.GetHash().String()]; ok {
-					chain.Verify_Transaction_NonCoinbase(&tx)
-					t.Parity = (bl.Height > t.Height) == t.Tx_Parity
+			// Prime the legacy HF3 cache exception only in its historical block
+			// context. Parity correction itself is computed during execution.
+			if globals.Config.MAJOR_HF3_HEIGHT >= 0 && bl.Height < uint64(globals.Config.MAJOR_HF3_HEIGHT) {
+				if _, ok := blockchain.HF3_Affected_Txs[tx.GetHash().String()]; ok {
+					_ = chain.Verify_Transaction_NonCoinbaseAtHeight(&tx, bl.Height)
 				}
 			}
 		}

@@ -367,6 +367,25 @@ func (chain *Blockchain) Shutdown() {
 	logger.Info("Stopped Blockchain")
 }
 
+// hf4ActiveAtHeight treats a negative activation height as explicitly unscheduled.
+func hf4ActiveAtHeight(height uint64, activationHeight int64) bool {
+	return activationHeight >= 0 && height >= uint64(activationHeight)
+}
+
+// registrationPoWValid preserves the legacy pre-HF4 rule and applies the
+// three-leading-zero-byte rule only at/after the configured HF4 activation.
+func registrationPoWValid(hash crypto.Hash, height uint64, activationHeight int64, simulator bool) bool {
+	if simulator {
+		return true
+	}
+	if hf4ActiveAtHeight(height, activationHeight) {
+		return hash[0] == 0 && hash[1] == 0 && hash[2] == 0
+	}
+	// This is the exact legacy block-validation predicate: accept if either
+	// of the first two bytes is zero. Do not retroactively change old blocks.
+	return hash[0] == 0 || hash[1] == 0
+}
+
 // this is the only entrypoint for new / old blocks even for genesis block
 // this will add the entire block atomically to the chain
 // this is the only function which can add blocks to the chain
@@ -519,7 +538,7 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 	// hard fork 4 will not allow any block to be mined with tips older than stable limit
 	// a block which extends the chain height rewrites the topo history back to the common point (see "fixed loop" below)
 	// make sure this rewind never goes deeper than the stable limit
-	if bl.Height >= uint64(globals.Config.MAJOR_HF4_HEIGHT) {
+	if hf4ActiveAtHeight(bl.Height, globals.Config.MAJOR_HF4_HEIGHT) {
 		if block_height > chain.Get_Height() && len(bl.Tips) == 1 {
 			if depth, err := chain.calculate_rewind_depth(bl.Tips[0], block_height-1); err != nil {
 				block_logger.Error(err, "Block rejected, rewind depth cannot be determined")
@@ -661,6 +680,10 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 		}
 
 		for i, tx := range cbl.Txs {
+			if tx == nil {
+				block_logger.Error(fmt.Errorf("nil TX body"), "Incomplete block", "index", i)
+				return errormsg.ErrInvalidBlock, false
+			}
 			if tx.Height >= bl.Height {
 				block_logger.Error(fmt.Errorf("Invalid TX Height"), "TX height cannot be more than block", "txid", cbl.Txs[i].GetHash().String())
 				return errormsg.ErrInvalidBlock, false
@@ -669,21 +692,46 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 
 		// now lets loop through complete block, matching each tx
 		// detecting any duplicates using txid hash
-		for i := 0; i < len(cbl.Txs); i++ {
-			tx_hash := cbl.Txs[i].GetHash()
+		for i, tx := range cbl.Txs {
+			if tx == nil {
+				block_logger.Error(fmt.Errorf("nil TX body"), "Incomplete block", "index", i)
+				return errormsg.ErrInvalidBlock, false
+			}
+			tx_hash := tx.GetHash()
+			if bl.Tx_hashes[i] != tx_hash {
+				block_logger.Error(fmt.Errorf("TX body/hash order mismatch"), "Incomplete block", "index", i, "listed_txid", bl.Tx_hashes[i], "body_txid", tx_hash)
+				return errormsg.ErrInvalidBlock, false
+			}
 			if _, ok := tx_checklist[tx_hash]; !ok {
 				// tx is NOT found in map, RED alert reject the block
 				block_logger.Error(fmt.Errorf("Missing TX"), "TX missing", "txid", tx_hash.String())
 				return errormsg.ErrInvalidBlock, false
 			}
-			// Hark-Fork 3: check if TX is already stored
-			if bl.Height >= uint64(globals.Config.MAJOR_HF3_HEIGHT) {
-				if tx_data, err := chain.Store.Block_tx_store.ReadTX(tx_hash); err == nil {
-					if !bytes.Equal(tx_data, cbl.Txs[i].Serialize()) {
+
+			// Preserve the legacy duplicate-body guard through v3. V4 binds the
+			// exact body into the block ID and stores it per block instead.
+			if hf3ActiveAtHeight(bl.Height) && bl.Major_Version < 4 {
+				tx_data, readErr := chain.Store.Block_tx_store.ReadTX(tx_hash)
+				if readErr == nil {
+					if !bytes.Equal(tx_data, tx.Serialize()) {
 						block_logger.Error(fmt.Errorf("TX data mismatch"), "Duplicate TX", "txid", tx_hash.String())
 						return errormsg.ErrInvalidBlock, false
 					}
+				} else if !os.IsNotExist(readErr) {
+					block_logger.Error(readErr, "stored TX cannot be read; rejecting block", "txid", tx_hash.String())
+					return errormsg.ErrInvalidBlock, false
 				}
+			}
+		}
+
+		if bl.Major_Version >= 4 {
+			serializedTransactions := make([][]byte, len(cbl.Txs))
+			for i, tx := range cbl.Txs {
+				serializedTransactions[i] = tx.Serialize()
+			}
+			if block.SerializedTransactionsCommitment(serializedTransactions) != bl.Proof {
+				block_logger.Error(fmt.Errorf("v4 transaction-body commitment mismatch"), "rejecting block", "height", bl.Height)
+				return errormsg.ErrInvalidBlock, false
 			}
 		}
 	}
@@ -724,11 +772,7 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 				}
 
 				tx_hash := cbl.Txs[i].GetHash()
-				if chain.simulator == false && tx_hash[0] != 0 && tx_hash[1] != 0 {
-					// hard fork 4: check first 3 bytes of txid
-					if bl.Height >= uint64(globals.Config.MAJOR_HF4_HEIGHT) && tx_hash[2] != 0 {
-						return fmt.Errorf("Registration TX has not solved PoW"), false
-					}
+				if !registrationPoWValid(tx_hash, bl.Height, globals.Config.MAJOR_HF4_HEIGHT, chain.simulator) {
 					return fmt.Errorf("Registration TX has not solved PoW"), false
 				}
 
@@ -842,7 +886,7 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 				if atomic.LoadInt32(&fail_count) >= 1 { // fail fast
 					return
 				}
-				if err := chain.Verify_Transaction_NonCoinbase_CheckNonce_Tips(hf_version, cbl.Txs[j], bl.Tips); err != nil { // transaction verification failed
+				if err := chain.Verify_Transaction_NonCoinbase_CheckNonce_TipsAtHeight(hf_version, cbl.Txs[j], bl.Tips, bl.Height); err != nil { // transaction verification failed
 					atomic.AddInt32(&fail_count, 1) // increase fail count by 1
 					block_logger.Error(err, "tx nonce verification failed", "txid", cbl.Txs[j].GetHash())
 				}
@@ -874,7 +918,7 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 				if atomic.LoadInt32(&fail_count) >= 1 { // fail fast
 					return
 				}
-				if err := chain.Verify_Transaction_NonCoinbase(cbl.Txs[j]); err != nil { // transaction verification failed
+				if err := chain.Verify_Transaction_NonCoinbaseAtHeight(cbl.Txs[j], bl.Height); err != nil { // transaction verification failed
 					atomic.AddInt32(&fail_count, 1) // increase fail count by 1
 					block_logger.Error(err, "tx verification failed", "txid", cbl.Txs[j].GetHash())
 				}
@@ -925,9 +969,15 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 
 	// save all the txs
 	// and then save the block
-	{ // first lets save all the txs, together with their link to this block as height
+	{ // save the body by transaction ID and, from v4 onward, by block/index
 		for i := 0; i < len(cbl.Txs); i++ {
-			if err = chain.Store.Block_tx_store.WriteTX(bl.Tx_hashes[i], cbl.Txs[i].Serialize()); err != nil {
+			serializedTX := cbl.Txs[i].Serialize()
+			if bl.Major_Version >= 4 {
+				if err = chain.Store.Block_tx_store.WriteTXForBlock(block_hash, uint64(i), serializedTX); err != nil {
+					panic(err)
+				}
+			}
+			if err = chain.Store.Block_tx_store.WriteTX(bl.Tx_hashes[i], serializedTX); err != nil {
 				panic(err)
 			}
 		}
@@ -1011,36 +1061,52 @@ func (chain *Blockchain) Add_Complete_Block(cbl *block.Complete_Block) (err erro
 				panic(err)
 			}
 
-			for _, txhash := range bl_current.Tx_hashes { // execute all the transactions
-				if tx_bytes, err := chain.Store.Block_tx_store.ReadTX(txhash); err != nil {
-					panic(err)
-				} else {
-					var tx transaction.Transaction
-					if err = tx.Deserialize(tx_bytes); err != nil {
-						panic(err)
-					}
-					for t := range tx.Payloads {
-						if !tx.Payloads[t].SCID.IsZero() {
-							if _, ok := sc_change_cache[tx.Payloads[t].SCID]; !ok || bl_current.Height < uint64(globals.Config.MAJOR_HF3_HEIGHT) {
-								tree, _ := ss.GetTree(string(tx.Payloads[t].SCID[:]))
-								sc_change_cache[tx.Payloads[t].SCID] = tree
-							}
-						}
-					}
-					// we have loaded a tx successfully, now lets execute it
-					tx_fees := chain.process_transaction(sc_change_cache, tx, balance_tree, bl_current.Height)
+			completeBlock, loadErr := chain.Load_Complete_Block(bl_current_hash)
+			if loadErr != nil {
+				panic(loadErr)
+			}
+			if len(completeBlock.Txs) != len(bl_current.Tx_hashes) {
+				panic(fmt.Errorf("stored block transaction count mismatch"))
+			}
 
-					//fmt.Printf("transaction %s type %s data %+v\n", txhash, tx.TransactionType, tx.SCDATA)
-					if tx.TransactionType == transaction.SC_TX {
-						tx_fees, err = chain.process_transaction_sc(sc_change_cache, ss, bl_current.Height, uint64(current_topo_block), bl_current.Timestamp/1000, bl_current_hash, tx, balance_tree, sc_meta)
-
-						//fmt.Printf("Processsing sc err %s\n", err)
-						if err == nil { // TODO process gasg here
-
-						}
-					}
-					fees_collected += tx_fees
+			for txIndex, txPointer := range completeBlock.Txs { // execute the exact bodies committed by this block
+				txhash := bl_current.Tx_hashes[txIndex]
+				if txPointer == nil {
+					panic(fmt.Errorf("nil stored transaction body at index %d", txIndex))
 				}
+				tx := *txPointer
+				if tx.GetHash() != txhash {
+					panic(fmt.Errorf("stored transaction ID mismatch at index %d", txIndex))
+				}
+				for t := range tx.Payloads {
+					if !tx.Payloads[t].SCID.IsZero() {
+						if _, ok := sc_change_cache[tx.Payloads[t].SCID]; !ok || bl_current.Height < uint64(globals.Config.MAJOR_HF3_HEIGHT) {
+							tree, _ := ss.GetTree(string(tx.Payloads[t].SCID[:]))
+							sc_change_cache[tx.Payloads[t].SCID] = tree
+						}
+					}
+				}
+				// Consensus-check the migration payload before process_transaction spends its source input.
+				if migrationErr := validateSeamlessMigrationCall(tx, bl_current.Height, balance_tree); migrationErr != nil {
+					block_logger.Error(migrationErr, "invalid seamless migration transaction", "txid", txhash)
+					return errormsg.ErrInvalidTX, false
+				}
+
+				// we have loaded a tx successfully, now lets execute it
+				tx_fees := chain.process_transaction(sc_change_cache, tx, balance_tree, bl_current.Height)
+
+				//fmt.Printf("transaction %s type %s data %+v\n", txhash, tx.TransactionType, tx.SCDATA)
+				if tx.TransactionType == transaction.SC_TX {
+					var scErr error
+					tx_fees, scErr = chain.process_transaction_sc(sc_change_cache, ss, bl_current.Height, uint64(current_topo_block), bl_current.Timestamp/1000, bl_current_hash, tx, balance_tree, sc_meta)
+					if scErr != nil {
+						block_logger.Error(scErr, "SC transaction execution returned error", "txid", txhash)
+						if isSeamlessMigrationCall(tx) {
+							return errormsg.ErrInvalidTX, false
+						}
+					}
+				}
+				fees_collected += tx_fees
 			}
 
 			// at this point, we must commit all the SCs, so entire tree hash is interlinked
@@ -1427,7 +1493,23 @@ func (chain *Blockchain) precheck_SC_TX(tx *transaction.Transaction) error {
 		}
 	}
 
-	chain_height := uint64(chain.Get_Height())
+	currentHeight := chain.Get_Height()
+	candidateHeight := uint64(0)
+	if currentHeight >= 0 {
+		candidateHeight = uint64(currentHeight + 1)
+	}
+	if err = validateSeamlessMigrationCall(*tx, candidateHeight, balance_tree); err != nil {
+		return fmt.Errorf("migration precheck failed: %w", err)
+	}
+	if isSeamlessMigrationCall(*tx) {
+		if activationHeight, scheduled := seamlessMigrationActivationHeight(); scheduled && candidateHeight == activationHeight {
+			// HF4 installs the hardcoded contract before executing this block's transactions.
+			// It is intentionally absent from the parent snapshot used by mempool precheck.
+			return nil
+		}
+	}
+
+	chain_height := uint64(currentHeight)
 	topo_height := uint64(chain.Load_TOPO_HEIGHT())
 	timestamp := uint64(globals.Time().UTC().Unix())
 	top_id := chain.Get_Top_ID()

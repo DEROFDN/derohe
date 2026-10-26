@@ -181,6 +181,7 @@ func main() {
 
 	params := map[string]interface{}{}
 	params["--simulator"] = true
+	params["--rpc-bind"] = rpcport
 	globals.Arguments["--p2p-bind"] = ":0"
 
 	logger.V(0).Info("", "MODE", globals.Config.Name)

@@ -20,10 +20,12 @@ package blockchain
 
 import _ "embed"
 
+import "fmt"
 import "github.com/deroproject/graviton"
 import "github.com/deroproject/derohe/dvm"
 import "github.com/deroproject/derohe/globals"
 import "github.com/deroproject/derohe/cryptography/crypto"
+import "github.com/deroproject/derohe/rpc"
 
 //go:embed hardcoded_sc/nameservice.bas
 var source_nameservice string
@@ -58,6 +60,21 @@ func (chain *Blockchain) install_hardcoded_contracts(cache map[crypto.Hash]*grav
 		name[31] = 1
 		if err = chain.install_hardcoded_sc(cache, ss, balance_tree, sc_tree, source_nameservice_updateable, name); err != nil {
 			panic(err)
+		}
+	}
+
+	if hf4 := globals.Config.MAJOR_HF4_HEIGHT; hf4 >= 0 && height == uint64(hf4) {
+		parsed, _, parseErr := dvm.ParseSmartContract(dvm.SeamlessMigrationContract)
+		if parseErr != nil {
+			return fmt.Errorf("parse hardcoded seamless migration contract: %w", parseErr)
+		}
+		if dvm.ContractUsesSigner(parsed) {
+			return fmt.Errorf("hardcoded seamless migration contract must not call SIGNER")
+		}
+		meta := dvm.SC_META_DATA{}
+		meta.SetNoSigner()
+		if err = chain.install_hardcoded_sc_with_meta(cache, ss, balance_tree, sc_tree, dvm.SeamlessMigrationContract, rpc.SeamlessMigrationSCID(), meta); err != nil {
+			return fmt.Errorf("install hardcoded seamless migration contract: %w", err)
 		}
 	}
 
@@ -96,4 +113,21 @@ func (chain *Blockchain) install_hardcoded_sc(cache map[crypto.Hash]*graviton.Tr
 	}
 
 	return nil
+}
+
+// install_hardcoded_sc_with_meta adds consensus metadata for a newly introduced
+// hardcoded contract without changing the legacy install format for existing contracts.
+func (chain *Blockchain) install_hardcoded_sc_with_meta(cache map[crypto.Hash]*graviton.Tree, ss *graviton.Snapshot, balance_tree *graviton.Tree, sc_tree *graviton.Tree, source string, scid crypto.Hash, meta dvm.SC_META_DATA) error {
+	if err := chain.install_hardcoded_sc(cache, ss, balance_tree, sc_tree, source, scid); err != nil {
+		return err
+	}
+	tree, ok := cache[scid]
+	if !ok || tree == nil {
+		return fmt.Errorf("hardcoded contract data tree missing for %s", scid)
+	}
+	var err error
+	if meta.DataHash, err = tree.Hash(); err != nil {
+		return fmt.Errorf("hash hardcoded contract data for %s: %w", scid, err)
+	}
+	return sc_tree.Put(dvm.SC_Meta_Key(scid), meta.MarshalBinaryGood())
 }

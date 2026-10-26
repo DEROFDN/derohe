@@ -1,5 +1,7 @@
 package rpc
 
+import "github.com/deroproject/derohe/cryptography/crypto"
+
 // definitions related to SC
 
 type SC_ACTION uint64 // sc actions are coded as follow
@@ -19,3 +21,21 @@ const SCSIGNC = "SC_SIGNC"   // the sign C component
 const SCSIGNS = "SC_SIGNS"   // the sign S component
 
 const SCID = "SC_ID" // SCID
+
+// SCENTRYPOINT names the called function in an SC_TX.
+const SCENTRYPOINT = "entrypoint"
+
+// SCREFUND is retained for RPC compatibility; the confidential migration path rejects it.
+const SCREFUND = "refund"
+
+// Seamless migration uses an ordinary confidential transfer, not BurnValue.
+// Keep a 16-member ring minimum so both source and receiver ambiguity match
+// the wallet's normal default instead of permitting a tiny anonymity set.
+const SeamlessMigrationMinRingSize uint64 = 16
+const SeamlessMigrationEntrypoint = "Migrate"
+
+// SeamlessMigrationSCID is a reserved hardcoded contract ID (32-byte value 2).
+func SeamlessMigrationSCID() (id crypto.Hash) {
+	id[31] = 2
+	return
+}

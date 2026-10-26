@@ -82,6 +82,23 @@ func (w *Wallet_Memory) TransferPayload0(transfers []rpc.Transfer, ringsize uint
 		}
 	}
 
+	// K0 guard (spec §9 K0 / k0-fix-design.md Fix A): ringsize 2 provides
+	// NO anonymity — the ring IS the two participants, and Extract_signer
+	// (blockchain/transaction_execute.go:429) recovers the sender by design
+	// at ringsize 2. Warn loudly; the CLI surfaces this and requires explicit
+	// confirmation. Consensus enforcement (Fix B) is a separate hard fork.
+	// NOTE: SC invocations that call SIGNER() currently require ringsize 2 —
+	// forcing a higher ring here would break owner-gated contracts until the
+	// signature-check intrinsic (Fix C) lands. Warn, do not force.
+	w.LastRingSizeWarning = ""
+	if ringsize == 2 {
+		w.LastRingSizeWarning = "ringsize 2 provides NO anonymity: the ring is sender+receiver only, and the signer is exposed on-chain (K0). Use ringsize >= 4 unless an SC entrypoint requires SIGNER()."
+		logger.V(1).Info("PRIVACY WARNING", "msg", w.LastRingSizeWarning)
+	} else if ringsize < 4 {
+		w.LastRingSizeWarning = fmt.Sprintf("ringsize %d is a small anonymity set; consider ringsize >= 4.", ringsize)
+		logger.V(1).Info("PRIVACY WARNING", "msg", w.LastRingSizeWarning)
+	}
+
 	//ringsize = 2
 
 	// if wallet is online,take the fees from the network itself

@@ -22,6 +22,7 @@ import "fmt"
 import "time"
 import "testing"
 import "bytes"
+import "sync/atomic"
 
 //import "crypto/rand"
 import "path/filepath"
@@ -65,15 +66,30 @@ Options:
  
   `
 
-const rpcport = "127.0.0.1:26000"
+// Each test gets a UNIQUE simulator RPC port + data dir so the tests can
+// run serially in one process (they used to share 127.0.0.1:26000 and a
+// fixed /tmp dir, which made the second+ test hang on a port collision).
+var simPortCounter uint64
+var simDirCounter uint64
 
-var tmpdirectory = "/tmp/dsimulatorwalletapi"
+func nextSimPort() string {
+	n := atomic.AddUint64(&simPortCounter, 1)
+	return fmt.Sprintf("127.0.0.1:%d", 26000+n) // 26001, 26002, ...
+}
+
+func nextSimDir() string {
+	n := atomic.AddUint64(&simDirCounter, 1)
+	return filepath.Join(os.TempDir(), fmt.Sprintf("dsimulatorwalletapi_%d", n))
+}
 
 // start a chain in simulator mode
 func simulator_chain_start() (*blockchain.Blockchain, *derodrpc.RPCServer, map[string]interface{}) {
 	var err error
 	params := map[string]interface{}{}
 	params["--simulator"] = true
+
+	rpcport := nextSimPort()
+	tmpdirectory := nextSimDir()
 
 	parser := &docopt.Parser{
 		HelpHandler:  docopt.PrintHelpOnly,
@@ -97,6 +113,7 @@ func simulator_chain_start() (*blockchain.Blockchain, *derodrpc.RPCServer, map[s
 	}
 
 	params["chain"] = chain
+	params["rpcport"] = rpcport // unique per test; caller uses it for SetDaemonAddress
 
 	rpcserver, _ := derodrpc.RPCServer_Start(params)
 	return chain, rpcserver, params
@@ -182,7 +199,7 @@ func Test_Creation_TX(t *testing.T) {
 
 	chain, rpcserver, params := simulator_chain_start()
 	defer simulator_chain_stop(chain, rpcserver)
-	_ = params
+	rpcport := params["rpcport"].(string)
 
 	globals.Arguments["--daemon-address"] = rpcport
 
@@ -216,8 +233,9 @@ func Test_Creation_TX(t *testing.T) {
 	}
 
 	// here we are collecting proofs for later on bennhcmarking
-	for j := 2; j <= 128; j = j * 2 {
-		wsrc.account.Ringsize = j
+	// Start at 4: the K0 privacy floor rejects NORMAL/BURN ring sizes below 4.
+	for j := 4; j <= 128; j = j * 2 {
+		wsrc.SetRingSize(j)
 		tx, err := wsrc.TransferPayload0([]rpc.Transfer{rpc.Transfer{Destination: wdst.GetAddress().String(), Amount: 1}}, 0, false, rpc.Arguments{}, 0, false)
 		if err != nil {
 			t.Fatalf("Cannot create transaction, err %s", err)
@@ -231,8 +249,9 @@ func Test_Creation_TX(t *testing.T) {
 		}
 	}
 
-	wsrc.account.Ringsize = 2
-	wdst.account.Ringsize = 2
+	// K0 privacy floor: NORMAL/BURN transfers below ringsize 4 are rejected.
+	wsrc.SetRingSize(4)
+	wdst.SetRingSize(4)
 
 	// accounts are reversed
 	wdst.Sync_Wallet_Memory_With_Daemon()

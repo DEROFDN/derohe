@@ -16,6 +16,7 @@
 
 package blockchain
 
+import "bytes"
 import "fmt"
 import "math/big"
 import "path/filepath"
@@ -340,18 +341,38 @@ func (chain *Blockchain) Load_Complete_Block(blid crypto.Hash) (cbl *block.Compl
 		return
 	}
 
-	for _, txid := range cbl.Bl.Tx_hashes {
-		var tx_bytes []byte
-		if tx_bytes, err = chain.Store.Block_tx_store.ReadTX(txid); err != nil {
-			return
+	serializedTransactions := make([][]byte, len(cbl.Bl.Tx_hashes))
+	for index, txid := range cbl.Bl.Tx_hashes {
+		var txBytes []byte
+		if cbl.Bl.Major_Version >= 4 {
+			txBytes, err = chain.Store.Block_tx_store.ReadTXForBlock(blid, uint64(index))
 		} else {
-			var tx transaction.Transaction
-			if err = tx.Deserialize(tx_bytes); err != nil {
-				return
-			}
-			cbl.Txs = append(cbl.Txs, &tx)
+			txBytes, err = chain.Store.Block_tx_store.ReadTX(txid)
+		}
+		if err != nil {
+			return
 		}
 
+		var tx transaction.Transaction
+		if err = tx.Deserialize(txBytes); err != nil {
+			return
+		}
+		if tx.GetHash() != txid {
+			err = fmt.Errorf("stored tx ID mismatch in block %s at index %d", blid, index)
+			return
+		}
+		serialized := tx.Serialize()
+		if cbl.Bl.Major_Version >= 4 && !bytes.Equal(txBytes, serialized) {
+			err = fmt.Errorf("non-canonical tx serialization in block %s at index %d", blid, index)
+			return
+		}
+		serializedTransactions[index] = serialized
+		cbl.Txs = append(cbl.Txs, &tx)
+	}
+
+	if cbl.Bl.Major_Version >= 4 && block.SerializedTransactionsCommitment(serializedTransactions) != cbl.Bl.Proof {
+		err = fmt.Errorf("stored v4 transaction-body commitment mismatch for block %s", blid)
+		return
 	}
 	return
 }

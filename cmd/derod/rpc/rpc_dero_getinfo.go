@@ -24,10 +24,33 @@ import (
 
 	"github.com/deroproject/derohe/blockchain"
 	"github.com/deroproject/derohe/config"
+	"github.com/deroproject/derohe/forensicsupply"
 	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/p2p"
 	"github.com/deroproject/derohe/rpc"
 )
+
+func getInfoForensicSupply(configName string, simulator bool, height, hf3Height int64) (*rpc.ForensicSupplyRecord, error) {
+	return rpc.ForensicSupplyForNetwork(configName, simulator, height, hf3Height)
+}
+
+// getInfoSupplyFields computes the supply values at the current chain height
+// and applies the same network gate used for the optional forensic record.
+func getInfoSupplyFields(configName string, simulator bool, height, hf3Height int64) (totalSupply, spendableSupply uint64, forensicSupply *rpc.ForensicSupplyRecord, err error) {
+	if height < 0 {
+		return 0, 0, nil, fmt.Errorf("negative chain height %d", height)
+	}
+
+	supplyHeight := uint64(height)
+	unitsPerDERO := forensicsupply.AtomicUnitsPerDERO
+	totalSupply = blockchain.CalcSupply(supplyHeight) / unitsPerDERO
+	spendableSupply = blockchain.SpendableSupplyForNetwork(supplyHeight, configName, simulator, hf3Height) / unitsPerDERO
+	forensicSupply, err = getInfoForensicSupply(configName, simulator, height, hf3Height)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	return totalSupply, spendableSupply, forensicSupply, nil
+}
 
 func GetInfo(ctx context.Context) (result rpc.GetInfo_Result, err error) {
 
@@ -81,14 +104,20 @@ func GetInfo(ctx context.Context) (result rpc.GetInfo_Result, err error) {
 	//result.Dynamic_fee_per_kb = config.FEE_PER_KB
 	//result.Median_Block_Size = config.CRYPTONOTE_MAX_BLOCK_SIZE
 
-	result.Total_Supply = blockchain.CalcSupply(uint64(chain.Get_Height())) / 100000 // only give deros remove fractional part
-	result.Spendable_Supply = blockchain.SpendableSupply(uint64(chain.Get_Height())) / 100000
+	simulator := globals.IsSimulator()
+	totalSupply, spendableSupply, forensicSupply, supplyErr := getInfoSupplyFields(globals.Config.Name, simulator, result.Height, globals.Config.MAJOR_HF3_HEIGHT)
+	if supplyErr != nil {
+		return rpc.GetInfo_Result{}, supplyErr
+	}
+	result.Total_Supply = totalSupply
+	result.Spendable_Supply = spendableSupply
+	result.ForensicSupply = forensicSupply
 
 	if globals.Config.Name != config.Mainnet.Name { // anything other than mainnet is testnet at this point in time
 		result.Testnet = true
 	}
 
-	if globals.IsSimulator() {
+	if simulator {
 		result.Network = "Simulator"
 	}
 

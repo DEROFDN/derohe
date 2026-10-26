@@ -23,7 +23,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
-	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -240,9 +239,10 @@ func (chain *Blockchain) process_transaction(changed map[crypto.Hash]*graviton.T
 
 				nb.Balance = nb.Balance.Add(echanges) // homomorphic addition of changes
 
-				// apply HF3 fixes: use reverse parity
-				if t, ok := HF3_Affected_Txs[tx.GetHash().String()]; ok {
-					parity = t.Parity
+				// Historical HF3 parity corrections are derived from the block
+				// being executed; never mutate or read a shared cache value.
+				if correctedParity, ok := hf3AffectedParity(tx.GetHash(), height); ok {
+					parity = correctedParity
 				}
 
 				if (i%2 == 0) == parity { // this condition is well thought out and works good enough
@@ -281,12 +281,10 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 	txhash := tx.GetHash()
 	scid := txhash
 
-	defer func() {
-		if r := recover(); r != nil {
-			logger.V(2).Error(nil, "Recover while executing SC ", "txid", txhash, "error", r, "stack", fmt.Sprintf("%s", string(debug.Stack())))
-
-		}
-	}()
+	// Do not recover here. Add_Complete_Block owns the canonical recovery
+	// boundary and rejects the block on an internal SC-processing panic. A
+	// local recovery would turn a panic into a successful zero-value result
+	// and could commit partially mutated state.
 
 	if !tx.SCDATA.Has(rpc.SCACTION, rpc.DataUint64) { //  tx doesn't have sc action
 		return tx.Fees(), nil
@@ -297,7 +295,7 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 		incoming_value[payload.SCID] = payload.BurnValue
 	}
 
-	chain.Expand_Transaction_NonCoinbase(&tx)
+	chain.Expand_Transaction_NonCoinbaseAtHeight(&tx, bl_height)
 
 	signer, err := Extract_signer(&tx)
 	if err != nil { // allow anonymous SC transactions with condition that SC will not call Signer
@@ -330,7 +328,13 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 
 		meta := dvm.SC_META_DATA{}
 		if _, ok := sc.Functions["InitializePrivate"]; ok {
-			meta.Type = 1
+			meta.Type = dvm.SC_META_TYPE_PRIVATE
+		}
+		// K0 Fix B2: if the contract never calls SIGNER(), mark it NoSigner so
+		// ringsize-2 SC_TX to it is rejected at consensus (auto-detection; no
+		// contract-author change needed).
+		if !dvm.ContractUsesSigner(sc) {
+			meta.SetNoSigner()
 		}
 
 		w_sc_data_tree = dvm.Wrapped_tree(cache, ss, scid)
@@ -340,7 +344,7 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 		w_sc_tree.Put(dvm.SC_Meta_Key(scid), meta.MarshalBinary())
 
 		entrypoint := "Initialize"
-		if meta.Type == 1 { // if its a a private SC
+		if meta.IsPrivate() { // if its a a private SC (masks the B2 NoSigner bit)
 			entrypoint = "InitializePrivate"
 		}
 
@@ -396,20 +400,26 @@ func (chain *Blockchain) process_transaction_sc(cache map[crypto.Hash]*graviton.
 	// we must commit all the changes
 	// check whether we are not overflowing/underflowing, means SC is not over sending
 	if err == nil {
-		err = dvm.SanityCheckExternalTransfers(w_sc_data_tree, balance_tree, scid)
+		if scid == rpc.SeamlessMigrationSCID() {
+			err = dvm.SanityCheckNoExternalTransfers(w_sc_data_tree)
+		} else {
+			err = dvm.SanityCheckExternalTransfers(w_sc_data_tree, balance_tree, scid)
+		}
 	}
 
-	if err != nil { // error occured, give everything to SC, since we may not have information to send them back
+	if err != nil {
 		if chain.simulator {
 			logger.Error(err, "error executing sc", "txid", txhash)
 		}
 
-		if signer, err1 := Extract_signer(&tx); err1 == nil { // if we can identify sender, return funds to him
-			dvm.ErrorRevert(ss, cache, balance_tree, signer, scid, incoming_value)
-		} else { //  we could not extract signer, we burn all the funds
-			dvm.ErrorRevert(ss, cache, balance_tree, signer, scid, incoming_value)
+		if scid == rpc.SeamlessMigrationSCID() {
+			// Migration value is an ordinary confidential transfer, not incoming
+			// DVM value. Propagate failure so consensus rejects the whole tx; do
+			// not attempt a public-value refund or let the transfer partially land.
+			return
 		}
-
+		signer, _ := Extract_signer(&tx)
+		dvm.ErrorRevert(ss, cache, balance_tree, signer, scid, incoming_value)
 		return
 	}
 	dvm.ProcessExternal(ss, cache, balance_tree, signer, scid, w_sc_data_tree, w_sc_tree)

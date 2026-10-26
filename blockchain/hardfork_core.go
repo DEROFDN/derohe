@@ -44,13 +44,25 @@ type Hard_fork struct {
 }
 
 // current mainnet_hard_forks
+// The mainnet schedule contains only consensus-approved activation heights.
+// HF4 is appended only after its activation height is explicitly configured.
 var mainnet_hard_forks = []Hard_fork{
-	// {1, 0,0,0,0,true}, // dummy entry so as we can directly use the fork index into this entry
-	{1, 0, 0, 0, 0, true}, // version 1 hard fork where genesis block landed and chain migration occurs
-	// version 1 has difficulty hardcoded to 1
+	{1, 0, 0, 0, 0, true},                               // version 1 hard fork where genesis block landed and chain migration occurs
 	{2, config.Mainnet.MAJOR_HF2_HEIGHT, 0, 0, 0, true}, // version 2 hard fork where PoW gets changed
 	{3, config.Mainnet.MAJOR_HF3_HEIGHT, 0, 0, 0, true}, // version 3 hard fork where add/change consensus rules
-	{4, config.Mainnet.MAJOR_HF4_HEIGHT, 0, 0, 0, true}, // version 4 hard fork where add/change consensus rules
+}
+
+// mainnetHardForkSchedule reads the active runtime config shared by HF4 validation and installation.
+func mainnetHardForkSchedule() []Hard_fork {
+	return mainnetHardForkScheduleForHeight(globals.Config.MAJOR_HF4_HEIGHT)
+}
+
+func mainnetHardForkScheduleForHeight(hf4Height int64) []Hard_fork {
+	forks := append([]Hard_fork(nil), mainnet_hard_forks...)
+	if hf4Height >= 0 {
+		forks = append(forks, Hard_fork{4, hf4Height, 0, 0, 0, true})
+	}
+	return forks
 }
 
 // current testnet_hard_forks
@@ -58,8 +70,22 @@ var testnet_hard_forks = []Hard_fork{
 	{1, 0, 0, 0, 0, true},                               // version 1 hard fork where genesis block landed
 	{2, config.Testnet.MAJOR_HF2_HEIGHT, 0, 0, 0, true}, // version 2 hard fork where PoW gets changed
 	{3, config.Testnet.MAJOR_HF3_HEIGHT, 0, 0, 0, true}, // version 3 hard fork where add/change consensus rules
-	{4, config.Testnet.MAJOR_HF4_HEIGHT, 0, 0, 0, true}, // version 3 hard fork where add/change consensus rules
+	{4, config.Testnet.MAJOR_HF4_HEIGHT, 0, 0, 0, true}, // version 4 hard fork where add/change consensus rules
 	//{4, 3, 0, 0, 0, true}, // version 4 hard fork where we change mining algorithm it's mandatory
+}
+
+// testnetHardForkSchedule keeps HF4 fork-version gating on the same active height as migration rules.
+func testnetHardForkSchedule() []Hard_fork {
+	forks := make([]Hard_fork, 0, len(testnet_hard_forks))
+	for _, fork := range testnet_hard_forks {
+		if fork.Version != 4 {
+			forks = append(forks, fork)
+		}
+	}
+	if height := globals.Config.MAJOR_HF4_HEIGHT; height >= 0 {
+		forks = append(forks, Hard_fork{4, height, 0, 0, 0, true})
+	}
+	return forks
 }
 
 // current simulation_hard_forks
@@ -82,10 +108,10 @@ func init_hard_forks(params map[string]interface{}) {
 		logger.Info("simulator hardforks are online")
 	} else {
 		if globals.IsMainnet() {
-			current_hard_forks = mainnet_hard_forks
+			current_hard_forks = mainnetHardForkSchedule()
 			logger.V(1).Info("mainnet hardforks are online")
 		} else {
-			current_hard_forks = testnet_hard_forks
+			current_hard_forks = testnetHardForkSchedule()
 			logger.V(1).Info("testnet hardforks are online")
 		}
 	}

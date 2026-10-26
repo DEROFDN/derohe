@@ -68,6 +68,11 @@ type Wallet_Memory struct {
 	wallet_online_mode bool // set whether the mode is online or offline
 	// an offline wallet can be converted to online mode, calling.
 	// SetOffline() and vice versa using SetOnline
+
+	// LastRingSizeWarning holds the most recent privacy warning raised by
+	// TransferPayload0 (e.g. ringsize 2 = K0 signer exposure). Surfaced to
+	// CLI/RPC callers for explicit confirmation. NOT persisted.
+	LastRingSizeWarning string `json:"-"`
 	// used to create transaction with this fee rate,
 	//if this is lower than network, then created transaction will be rejected by network
 	dynamic_fees_per_kb uint64

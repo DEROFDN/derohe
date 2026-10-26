@@ -72,7 +72,7 @@ func Test_Payload_TX(t *testing.T) {
 	config.Mainnet.Genesis_Block_Hash = genesis_block.GetHash()
 
 	chain, rpcserver, params := simulator_chain_start()
-	_ = params
+	rpcport := params["rpcport"].(string)
 
 	defer func() {
 		simulator_chain_stop(chain, rpcserver)
@@ -117,8 +117,14 @@ func Test_Payload_TX(t *testing.T) {
 		t.Fatalf("Wallet sync error err %s", err)
 	}
 
-	wsrc.account.Ringsize = 2
-	wdst.account.Ringsize = 2
+	// K0 privacy floor: NORMAL/BURN transfers below ringsize 4 are rejected.
+	wsrc.account.Ringsize = 4
+	wdst.account.Ringsize = 4
+
+	// The simulator now grants a 100 DERO genesis balance, so assert deltas
+	// rather than the old absolute 800k-based balances.
+	pre_src := wsrc.account.Balance_Mature
+	pre_dst := wdst.account.Balance_Mature
 
 	var testPayload = rpc.Arguments{
 		{
@@ -164,12 +170,16 @@ func Test_Payload_TX(t *testing.T) {
 	wdst.Sync_Wallet_Memory_With_Daemon()
 	wsrc.Sync_Wallet_Memory_With_Daemon()
 
-	if wdst.account.Balance_Mature != 1520000 {
-		t.Fatalf("Failed receiver balance check, expected 1520000 actual %d", wdst.account.Balance_Mature)
+	wantReceived := uint64(expectedTransfers * 90000)
+	if wdst.account.Balance_Mature < pre_dst {
+		t.Fatalf("receiver balance decreased: pre=%d post=%d", pre_dst, wdst.account.Balance_Mature)
+	}
+	if delta := wdst.account.Balance_Mature - pre_dst; delta != wantReceived {
+		t.Fatalf("receiver balance delta = %d, want %d (pre=%d post=%d)", delta, wantReceived, pre_dst, wdst.account.Balance_Mature)
 	}
 
-	if wsrc.account.Balance_Mature != 0 {
-		t.Fatalf("Failed sender balance check, expected 0 actual %d", wsrc.account.Balance_Mature)
+	if wsrc.account.Balance_Mature >= pre_src {
+		t.Fatalf("sender balance did not decrease: pre=%d post=%d", pre_src, wsrc.account.Balance_Mature)
 	}
 
 	time.Sleep(time.Second)

@@ -273,7 +273,7 @@ func (chain *Blockchain) Create_new_miner_block(miner_address rpc.Address) (cbl 
 				}
 
 				if height-int64(tx.Height) < TX_VALIDITY_HEIGHT {
-					if nil == chain.Verify_Transaction_NonCoinbase_CheckNonce_Tips(hf_version, tx, bl.Tips) {
+					if nil == chain.Verify_Transaction_NonCoinbase_CheckNonce_TipsAtHeight(hf_version, tx, bl.Tips, uint64(height)) {
 						if nil == pre_check.check(tx, false) {
 							pre_check.check(tx, true)
 							sizeoftxs += tx_hash_list_sorted[i].Size
@@ -322,6 +322,18 @@ func (chain *Blockchain) Create_new_miner_block(miner_address rpc.Address) (cbl 
 
 	for i := range tx_hash_list_included {
 		bl.Tx_hashes = append(bl.Tx_hashes, tx_hash_list_included[i])
+	}
+
+	if bl.Major_Version >= 4 {
+		serializedTransactions := make([][]byte, len(cbl.Txs))
+		for i, tx := range cbl.Txs {
+			if tx == nil {
+				err = fmt.Errorf("nil transaction selected for v4 block")
+				return
+			}
+			serializedTransactions[i] = tx.Serialize()
+		}
+		bl.Proof = block.SerializedTransactionsCommitment(serializedTransactions)
 	}
 
 	// lets fill in the miniblocks, list is already sorted

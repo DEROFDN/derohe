@@ -26,6 +26,7 @@ import (
 	"github.com/deroproject/derohe/config"
 	"github.com/deroproject/derohe/cryptography/bn256"
 	"github.com/deroproject/derohe/cryptography/crypto"
+	"github.com/deroproject/derohe/dvm"
 	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/transaction"
@@ -70,6 +71,10 @@ func (chain *Blockchain) Verify_Transaction_Coinbase(cbl *block.Complete_Block, 
 
 // this checks the nonces of a tx agains the current chain state, this basically does a comparision of state trees in limited form
 func (chain *Blockchain) Verify_Transaction_NonCoinbase_CheckNonce_Tips(hf_version int64, tx *transaction.Transaction, tips []crypto.Hash) (err error) {
+	return chain.Verify_Transaction_NonCoinbase_CheckNonce_TipsAtHeight(hf_version, tx, tips, nextCandidateHeight(chain))
+}
+
+func (chain *Blockchain) Verify_Transaction_NonCoinbase_CheckNonce_TipsAtHeight(hf_version int64, tx *transaction.Transaction, tips []crypto.Hash, validationHeight uint64) (err error) {
 	var tx_hash crypto.Hash
 	defer func() { // safety so if anything wrong happens, verification fails
 		if r := recover(); r != nil {
@@ -87,7 +92,8 @@ func (chain *Blockchain) Verify_Transaction_NonCoinbase_CheckNonce_Tips(hf_versi
 		return fmt.Errorf("no tips provided, cannot verify")
 	}
 
-	tips_string := tx_hash.String()
+	cache_tx_hash := transactionValidationCacheKey(tx, validationHeight)
+	tips_string := cache_tx_hash.String()
 	for _, tip := range tips {
 		tips_string += fmt.Sprintf("%s", tip.String())
 	}
@@ -198,11 +204,56 @@ func (chain *Blockchain) Verify_Transaction_NonCoinbase_CheckNonce_Tips(hf_versi
 	return nil
 }
 
+// k0RingSizeFloorReject implements the K0 Fix B1 decision rule (spec §9 K0,
+// k0-fix-design.md): from config.K0_MIN_RING4_HEIGHT onward, NORMAL/BURN
+// txs with ringsize < 4 are rejected. Ringsize 2 exposes the signer by
+// design (Extract_signer / transaction_execute.go), so the privacy floor
+// is 4 — sender + receiver + 2 decoys. SC_TX / coinbase / registration /
+// premine are exempt (they have their own auth model; SC owner auth moves
+// to verify_sig — K0 Fix C).
+func k0RingSizeFloorReject(height uint64, txtype transaction.TransactionType, ringsize uint64) bool {
+	floor := uint64(globals.Config.K0_MIN_RING4_HEIGHT)
+	if height < floor {
+		return false // pre-fork txs unaffected
+	}
+	if txtype != transaction.NORMAL && txtype != transaction.BURN_TX {
+		return false // SC_TX / coinbase / registration / premine exempt
+	}
+	return ringsize < 4
+}
+
+// k0SCInstallRing2Reject implements the K0 Fix B2 rule for SC_INSTALL at
+// ringsize 2: if the contract being installed never calls SIGNER(), the
+// install itself has no legitimate reason to expose the signer at ringsize
+// 2 — reject it. A contract that genuinely uses SIGNER() (owner-gated
+// entrypoints) still installs at ringsize 2 until the verify_sig migration
+// (K0 Fix C) removes that need.
+func k0SCInstallRing2Reject(tx *transaction.Transaction) error {
+	if code, ok := tx.SCDATA.Value(rpc.SCCODE, rpc.DataString).(string); ok && code != "" {
+		sc, _, err := dvm.ParseSmartContract(code)
+		if err != nil {
+			return fmt.Errorf("K0 B2: could not parse SC code for SIGNER() scan: %v", err)
+		}
+		if !dvm.ContractUsesSigner(sc) {
+			return fmt.Errorf("K0 B2: ringsize-2 SC_INSTALL rejected — contract never calls SIGNER() (privacy floor; use ringsize >= 4)")
+		}
+	}
+	return nil
+}
+
 func (chain *Blockchain) Verify_Transaction_NonCoinbase(tx *transaction.Transaction) (err error) {
-	return chain.verify_Transaction_NonCoinbase_internal(false, tx)
+	return chain.Verify_Transaction_NonCoinbaseAtHeight(tx, nextCandidateHeight(chain))
+}
+
+func (chain *Blockchain) Verify_Transaction_NonCoinbaseAtHeight(tx *transaction.Transaction, validationHeight uint64) (err error) {
+	return chain.verify_Transaction_NonCoinbase_internal(false, tx, validationHeight)
 }
 func (chain *Blockchain) Expand_Transaction_NonCoinbase(tx *transaction.Transaction) (err error) {
-	return chain.verify_Transaction_NonCoinbase_internal(true, tx)
+	return chain.Expand_Transaction_NonCoinbaseAtHeight(tx, nextCandidateHeight(chain))
+}
+
+func (chain *Blockchain) Expand_Transaction_NonCoinbaseAtHeight(tx *transaction.Transaction, validationHeight uint64) (err error) {
+	return chain.verify_Transaction_NonCoinbase_internal(true, tx, validationHeight)
 }
 
 // all non miner tx must be non-coinbase tx
@@ -212,7 +263,7 @@ func (chain *Blockchain) Expand_Transaction_NonCoinbase(tx *transaction.Transact
 // if the transaction has passed the check it can be added to mempool, relayed or added to blockchain
 // the transaction has already been deserialized thats it
 // It also expands the transactions, using the repective state trie
-func (chain *Blockchain) verify_Transaction_NonCoinbase_internal(skip_proof bool, tx *transaction.Transaction) (err error) {
+func (chain *Blockchain) verify_Transaction_NonCoinbase_internal(skip_proof bool, tx *transaction.Transaction, validationHeight uint64) (err error) {
 
 	var tx_hash crypto.Hash
 	defer func() { // safety so if anything wrong happens, verification fails
@@ -227,14 +278,18 @@ func (chain *Blockchain) verify_Transaction_NonCoinbase_internal(skip_proof bool
 	}
 
 	tx_hash = tx.GetHash()
+	tx_cache := transactionValidationCacheKey(tx, validationHeight)
 
-	// apply HF3 fixes: add TX to cache
-	if t, ok := HF3_Affected_Txs[tx_hash.String()]; ok {
-		transaction_valid_cache.Store(tx_hash, time.Now())
+	// Preserve the legacy HF3 exceptions only while validating pre-HF3 blocks.
+	// They must never seed a proofless cache entry after the fork.
+	if !hf3ActiveAtHeight(validationHeight) {
+		if t, ok := HF3_Affected_Txs[tx_hash.String()]; ok && t != nil {
+			transaction_valid_cache.Store(tx_hash, time.Now())
 
-		tips_string := tx_hash.String()
-		tips_string += fmt.Sprintf("%s", t.Bl_Tips)
-		chain.cache_IsNonceValidTips.Add(tips_string, true)
+			tips_string := tx_hash.String()
+			tips_string += fmt.Sprintf("%s", t.Bl_Tips)
+			chain.cache_IsNonceValidTips.Add(tips_string, true)
+		}
 	}
 
 	if tx.TransactionType == transaction.REGISTRATION {
@@ -301,6 +356,49 @@ func (chain *Blockchain) verify_Transaction_NonCoinbase_internal(skip_proof bool
 			return fmt.Errorf("RingSize for %d statement cannot be less than 2 actual %d", t, tx.Payloads[t].Statement.RingSize)
 		}
 
+		// K0 Fix B1 (spec §9 K0, k0-fix-design.md): from K0_MIN_RING4_HEIGHT
+		// onward, NORMAL/BURN txs with ringsize < 4 are rejected. Ringsize 2
+		// exposes the signer by design (parity selects the sender position);
+		// the privacy floor is 4. SC_TX / coinbase / registration / premine
+		// exempt until the verify_sig migration (K0 Fix C).
+		//
+		// The floor is keyed to the candidate block's validated height, never
+		// tx.Height (an attacker-controlled reference height) or a stale tip.
+		// Mempool callers pass tip+1; block validation passes the block height.
+		//
+		// HARDENING 2 (wargame): an "SC_TX" with no SCACTION in SCDATA is not
+		// invoking any contract — process_transaction_sc returns immediately
+		// for empty/SCACTION-less SCDATA (transaction_execute.go:267,291), so
+		// it is a NORMAL transfer stamped SC_TX in the header (the type field
+		// is attacker-settable, transaction.go:316). That would dodge the SC_TX
+		// exemption for free. Treat any SC_TX that does not actually carry an
+		// SC action as NORMAL for the floor. The real SC_TX exemption (real
+		// contracts that need SIGNER()) is closed properly by K0 Fix B2.
+		txtype := tx.TransactionType
+		if txtype == transaction.SC_TX && !tx.SCDATA.Has(rpc.SCACTION, rpc.DataUint64) {
+			txtype = transaction.NORMAL // SC_TX-without-an-action is a NORMAL tx in disguise
+		}
+		if k0RingSizeFloorReject(validationHeight, txtype, tx.Payloads[t].Statement.RingSize) {
+
+			return fmt.Errorf("K0: ringsize %d < 4 rejected for NORMAL/BURN txs from height %d (privacy floor; use ringsize >= 4)",
+				tx.Payloads[t].Statement.RingSize, globals.Config.K0_MIN_RING4_HEIGHT)
+		}
+
+		// K0 Fix B2 (spec k0-fix-design.md): a ringsize-2 SC_TX is only
+		// legitimate if the contract genuinely calls SIGNER() (owner-gated
+		// entrypoints). If it does not, ringsize 2 exposes the signer for no
+		// reason. SC_INSTALL is checked here from the code in SCDATA (no
+		// snapshot needed); SC_CALL is checked after the snapshot loads by
+		// reading the stored NoSigner meta bit for the called SCID.
+		if txtype == transaction.SC_TX && tx.Payloads[t].Statement.RingSize == 2 && tx.SCDATA.Has(rpc.SCACTION, rpc.DataUint64) {
+			action := rpc.SC_ACTION(tx.SCDATA.Value(rpc.SCACTION, rpc.DataUint64).(uint64))
+			if action == rpc.SC_INSTALL {
+				if err := k0SCInstallRing2Reject(tx); err != nil {
+					return err
+				}
+			}
+		}
+
 		if tx.Payloads[t].Statement.RingSize > 128 { // ring size current limited to 128
 			return fmt.Errorf("RingSize for %d statement cannot be more than 128.Actual %d", t, tx.Payloads[t].Statement.RingSize)
 		}
@@ -358,6 +456,33 @@ func (chain *Blockchain) verify_Transaction_NonCoinbase_internal(skip_proof bool
 
 	var zerohash crypto.Hash
 	trees[zerohash] = balance_tree // initialize main tree by default
+
+	// K0 Fix B2: a ringsize-2 SC_CALL to a contract that does not call
+	// SIGNER() is rejected — the contract was auto-marked NoSigner at
+	// install (transaction_execute.go), and ringsize 2 exposes the signer
+	// with no legitimate need. Read the contract's stored meta bit from the
+	// SC_META tree at the same snapshot the tx references.
+	if tx.TransactionType == transaction.SC_TX && tx.SCDATA.Has(rpc.SCACTION, rpc.DataUint64) {
+		action := rpc.SC_ACTION(tx.SCDATA.Value(rpc.SCACTION, rpc.DataUint64).(uint64))
+		if action == rpc.SC_CALL && tx.SCDATA.Has(rpc.SCID, rpc.DataHash) {
+			scid := tx.SCDATA.Value(rpc.SCID, rpc.DataHash).(crypto.Hash)
+			sc_meta_tree, err := ss.GetTree(config.SC_META)
+			if err != nil {
+				return fmt.Errorf("K0 B2: cannot load SC_META tree: %v", err)
+			}
+			if meta_raw, err := sc_meta_tree.Get(dvm.SC_Meta_Key(scid)); err == nil {
+				var meta dvm.SC_META_DATA
+				if meta.UnmarshalBinary(meta_raw) == nil && meta.NoSigner() {
+					// find the ringsize for the SCID payload (if any)
+					for t := range tx.Payloads {
+						if tx.Payloads[t].Statement.RingSize == 2 {
+							return fmt.Errorf("K0 B2: ringsize-2 SC_CALL to NoSigner contract %s rejected (contract never calls SIGNER(); use ringsize >= 4)", scid)
+						}
+					}
+				}
+			}
+		}
+	}
 
 	for t := range tx.Payloads {
 		tx.Payloads[t].Statement.Publickeylist_compressed = tx.Payloads[t].Statement.Publickeylist_compressed[:0]
@@ -428,11 +553,6 @@ func (chain *Blockchain) verify_Transaction_NonCoinbase_internal(skip_proof bool
 			tree.Put(key_compressed, nb.Serialize()) // reserialize and store temporarily, tree will be discarded after verification
 
 		}
-	}
-
-	tx_cache := tx_hash
-	if tx.Height >= uint64(globals.Config.MAJOR_HF3_HEIGHT) {
-		tx_cache = crypto.Keccak256(tx.Serialize())
 	}
 
 	if _, ok := transaction_valid_cache.Load(tx_cache); ok {

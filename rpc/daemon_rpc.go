@@ -276,30 +276,31 @@ type (
 type (
 	GetInfo_Params struct{} // no params
 	GetInfo_Result struct {
-		Alt_Blocks_Count           uint64  `json:"alt_blocks_count"`
-		Difficulty                 uint64  `json:"difficulty"`
-		Grey_PeerList_Size         uint64  `json:"grey_peerlist_size"`
-		Height                     int64   `json:"height"`
-		StableHeight               int64   `json:"stableheight"`
-		TopoHeight                 int64   `json:"topoheight"`
-		PrunedHeight               int64   `json:"prunedheight"`
-		Merkle_Balance_TreeHash    string  `json:"treehash"`
-		AverageBlockTime50         float32 `json:"averageblocktime50"`
-		Incoming_connections_count uint64  `json:"incoming_connections_count"`
-		Outgoing_connections_count uint64  `json:"outgoing_connections_count"`
-		Target                     uint64  `json:"target"`
-		Target_Height              uint64  `json:"target_height"`
-		Testnet                    bool    `json:"testnet"`
-		Network                    string  `json:"network"`
-		Top_block_hash             string  `json:"top_block_hash"`
-		Tx_count                   uint64  `json:"tx_count"`
-		Tx_pool_size               uint64  `json:"tx_pool_size"`
-		Dynamic_fee_per_kb         uint64  `json:"dynamic_fee_per_kb"`
-		Total_Supply               uint64  `json:"total_supply"`
-		Spendable_Supply           uint64  `json:"spendable_supply"`
-		Median_Block_Size          uint64  `json:"median_block_size"`
-		White_peerlist_size        uint64  `json:"white_peerlist_size"`
-		Version                    string  `json:"version"`
+		Alt_Blocks_Count           uint64                `json:"alt_blocks_count"`
+		Difficulty                 uint64                `json:"difficulty"`
+		Grey_PeerList_Size         uint64                `json:"grey_peerlist_size"`
+		Height                     int64                 `json:"height"`
+		StableHeight               int64                 `json:"stableheight"`
+		TopoHeight                 int64                 `json:"topoheight"`
+		PrunedHeight               int64                 `json:"prunedheight"`
+		Merkle_Balance_TreeHash    string                `json:"treehash"`
+		AverageBlockTime50         float32               `json:"averageblocktime50"`
+		Incoming_connections_count uint64                `json:"incoming_connections_count"`
+		Outgoing_connections_count uint64                `json:"outgoing_connections_count"`
+		Target                     uint64                `json:"target"`
+		Target_Height              uint64                `json:"target_height"`
+		Testnet                    bool                  `json:"testnet"`
+		Network                    string                `json:"network"`
+		Top_block_hash             string                `json:"top_block_hash"`
+		Tx_count                   uint64                `json:"tx_count"`
+		Tx_pool_size               uint64                `json:"tx_pool_size"`
+		Dynamic_fee_per_kb         uint64                `json:"dynamic_fee_per_kb"`
+		Total_Supply               uint64                `json:"total_supply"`
+		Spendable_Supply           uint64                `json:"spendable_supply"`
+		ForensicSupply             *ForensicSupplyRecord `json:"created_supply_floor,omitempty"`
+		Median_Block_Size          uint64                `json:"median_block_size"`
+		White_peerlist_size        uint64                `json:"white_peerlist_size"`
+		Version                    string                `json:"version"`
 
 		Miners               int `json:"connected_miners"`
 		Miniblocks_In_Memory int `json:"miniblocks_in_memory"`

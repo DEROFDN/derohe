@@ -750,6 +750,14 @@ document.addEventListener('DOMContentLoaded', function() {
                     <div class="stat-label">Total Supply</div>
                     <div class="stat-value">{{ .total_supply }}</div>
                 </div>
+                {{if .has_forensic_supply_record}}
+                <div class="stat-item" title="Gross created-supply floor less the chain-verified same-era burn. Burn attribution to exploit wallets is unproven; this arithmetic is not an estimate of exploit coins still outstanding, a balance census, or circulating supply.">
+                    <div class="stat-label">Forensic created-supply floor (net)</div>
+                    <div class="stat-value">{{ .forensic_created_supply_net_dero }} DERO</div>
+                    <div class="stat-label">Gross {{ .forensic_created_supply_gross_dero }}; verified burn {{ .forensic_verified_burn_dero }}</div>
+                    <div class="stat-label">Not outstanding or circulating supply; burn attribution unproven</div>
+                </div>
+                {{end}}
                 <div class="stat-item">
                     <div class="stat-label">Mempool</div>
                     <div class="stat-value"><a href="/txpool">{{ .txpool_size }} TXs</a></div>

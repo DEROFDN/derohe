@@ -39,7 +39,7 @@ type Block struct {
 	Height        uint64                  `json:"height"`
 	Miner_TX      transaction.Transaction `json:"miner_tx"`
 
-	Proof      [32]byte      `json:"-"` // proof is being used to record balance root hash
+	Proof      [32]byte      `json:"-"` // v4 commits to ordered serialized transaction bodies; legacy versions retain their wire value
 	Tips       []crypto.Hash `json:"tips"`
 	MiniBlocks []MiniBlock   `json:"miniblocks"`
 	Tx_hashes  []crypto.Hash `json:"tx_hashes"`

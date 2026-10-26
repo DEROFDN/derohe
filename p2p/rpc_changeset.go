@@ -60,14 +60,14 @@ func (c *Connection) ChangeSet(request ChangeList, response *Changes) (err error
 			return err
 		}
 
-		bl, _ := chain.Load_BL_FROM_ID(blid)
+		complete, err := chain.Load_Complete_Block(blid)
+		if err != nil {
+			return err
+		}
+		bl := complete.Bl
 		cbl.Block = bl.Serialize()
-		for j := range bl.Tx_hashes {
-			var tx_bytes []byte
-			if tx_bytes, err = chain.Store.Block_tx_store.ReadTX(bl.Tx_hashes[j]); err != nil {
-				return err
-			}
-			cbl.Txs = append(cbl.Txs, tx_bytes) // append all the txs
+		for _, tx := range complete.Txs {
+			cbl.Txs = append(cbl.Txs, tx.Serialize())
 		}
 
 		cbl.Difficulty = chain.Load_Block_Difficulty(blid).String()

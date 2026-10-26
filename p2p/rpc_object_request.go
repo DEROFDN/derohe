@@ -40,18 +40,13 @@ func (connection *Connection) GetObject(request ObjectList, response *Objects) e
 
 	for i := range request.Block_list { // find the block
 		var cbl Complete_Block
-		bl, err := chain.Load_BL_FROM_ID(request.Block_list[i])
+		complete, err := chain.Load_Complete_Block(request.Block_list[i])
 		if err != nil {
 			return err
 		}
-		cbl.Block = bl.Serialize()
-		for j := range bl.Tx_hashes {
-			var tx_bytes []byte
-			if tx_bytes, err = chain.Store.Block_tx_store.ReadTX(bl.Tx_hashes[j]); err != nil {
-				return err
-			}
-			cbl.Txs = append(cbl.Txs, tx_bytes) // append all the txs
-
+		cbl.Block = complete.Bl.Serialize()
+		for _, tx := range complete.Txs {
+			cbl.Txs = append(cbl.Txs, tx.Serialize())
 		}
 		response.CBlocks = append(response.CBlocks, cbl)
 	}
