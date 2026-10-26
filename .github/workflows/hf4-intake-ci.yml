@@ -1,0 +1,56 @@
+name: HF4 evidence intake
+
+on:
+  pull_request:
+    paths:
+      - "hf4archive/**"
+      - "cmd/hf4-archive-verify/**"
+      - "cmd/hf4-archive-collect/**"
+      - "docs/hf4-evidence-intake.md"
+      - "docs/hf4-evidence-index.md"
+      - ".github/workflows/hf4-intake-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build and test archive verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - name: Build
+        run: go build ./hf4archive/... ./cmd/hf4-archive-verify/ ./cmd/hf4-archive-collect/
+
+      - name: Vet
+        run: go vet ./hf4archive/... ./cmd/hf4-archive-verify/ ./cmd/hf4-archive-collect/
+
+      - name: Tests
+        run: go test -count=1 -p 1 -timeout 5m ./hf4archive/...
+
+      - name: Race tests
+        run: go test -race -count=1 -p 1 -timeout 5m ./hf4archive/...
+
+      - name: CLI canonicalization smoke test
+        run: |
+          go run ./cmd/hf4-archive-verify template > /tmp/manifest-template.json
+          go run ./cmd/hf4-archive-verify canonicalize -manifest /tmp/manifest-template.json > /tmp/manifest-1.json
+          go run ./cmd/hf4-archive-verify canonicalize -manifest /tmp/manifest-1.json > /tmp/manifest-2.json
+          cmp /tmp/manifest-1.json /tmp/manifest-2.json
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l hf4archive/*.go cmd/hf4-archive-verify/*.go cmd/hf4-archive-collect/*.go)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
